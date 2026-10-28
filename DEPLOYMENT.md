@@ -13,7 +13,9 @@ DATA_DIR=/home/router-panel/data
 
 ## 1. 系统要求
 
-目标系统为 Debian 13（x86_64）最小化安装，并使用 systemd、apt 和 NetworkManager。本分支只支持有线组网，不安装 `iw`、`wpasupplicant`、`hostapd` 或 `iptables`。
+目标系统为 Debian 13（x86_64）最小化安装，使用 systemd 与 **systemd-networkd**。
+本分支只支持有线组网，不安装 `iw`、`wpasupplicant`、`hostapd`、`iptables`，
+也不再使用 NetworkManager 或 dhcpcd。
 
 安装依赖：
 
@@ -23,28 +25,23 @@ sudo apt-get install -y --no-install-recommends \
   python3 \
   python3-flask \
   gunicorn \
-  network-manager \
   dnsmasq \
   nftables \
   iproute2 \
   udev \
+  ppp \
   curl \
   ca-certificates
-```
-
-需要「运营商 PD 自动」模式时再补一个包（其余模式不需要）：
-
-```bash
-sudo apt-get install -y --no-install-recommends dhcpcd
 ```
 
 组件用途：
 
 - `python3-flask`、`gunicorn`：运行 Web 服务；
-- `network-manager`：管理有线接口、WAN 的 DHCP 客户端与 LAN 的静态地址；
-- `dnsmasq`：为 LAN 提供 DHCPv4、RA、DHCPv6 与 DNS；
-- `nftables`：提供 NAT 与 forward 规则（内核侧 `nf_tables`/`nf_nat` 由 Debian 内核自带）；
-- `iproute2`、`udev`：系统网络和硬件信息查询。
+- `systemd-networkd`（systemd 自带）：WAN 的 DHCP/SLAAC、LAN 静态地址、IPv6 RA/RDNSS、DHCPv6 前缀委派；
+- `ppp`：PPPoE 拨号（`pppd` + `rp-pppoe.so`），只有 PPPoE 模式才真正用到；
+- `dnsmasq`：为 LAN 提供 DHCPv4 与 DNS（IPv6 由 networkd 负责）；
+- `nftables`：NAT 与 forward 规则（内核侧 `nf_tables`/`nf_nat` 由 Debian 内核自带）；
+- `iproute2`、`udev`：网络状态查询、CAKE 限速（`tc`）与硬件信息。
 
 项目不要求目标设备安装 Git。安装器和手动部署都可以使用源码目录或 GitHub 源码压缩包。
 
@@ -106,57 +103,42 @@ sudo find "$DATA_DIR" -type f -exec chmod 0600 {} +
 
 如果未设置 `LINUX_ROUTER_INITIAL_PASSWORD`，开发环境默认密码为 `password`。生产部署应显式设置初始密码并在首次登录后立即修改。
 
-## 4. 配置 NetworkManager 和 netplan
+## 4. 配置 systemd-networkd
 
-启用 NetworkManager：
+网络后端是 **systemd-networkd**（Debian 13 自带），PPPoE 由 `pppd` 建会话。
+NetworkManager、dhcpcd、ifupdown 都不要再管理同一批网卡。
 
-```bash
-sudo systemctl enable --now NetworkManager.service
-```
-
-确认传统接口由 NetworkManager 管理。`/etc/NetworkManager/NetworkManager.conf` 至少应包含：
-
-```ini
-[ifupdown]
-managed=true
-```
-
-如果系统使用 netplan，应将 renderer 设置为 `NetworkManager`。建议先备份现有配置：
+启用服务：
 
 ```bash
-sudo cp -a /etc/netplan "/etc/netplan.backup.$(date +%Y%m%d%H%M%S)"
+sudo systemctl enable --now systemd-networkd.service
+sudo systemctl enable --now systemd-resolved.service
 ```
 
-项目生成的最小配置示例：
+> `systemd-resolved` 负责把 WAN 侧 DHCP 下发的 DNS 写进 `/etc/resolv.conf`；
+> dnsmasq 只绑定 LAN 地址，不会和它的 127.0.0.53 冲突。
 
-```yaml
-network:
-  version: 2
-  renderer: NetworkManager
-```
+配置文件由面板生成（`/etc/systemd/network/`）：
 
-保存后，在本地控制台或维护窗口执行：
+| 文件 | 内容 |
+| --- | --- |
+| `10-linux-router-wan.network` | WAN 的 DHCP/SLAAC（PPPoE 模式不生成） |
+| `20-linux-router-lan.network` | LAN 静态 IPv4、IPv6 地址、RA/RDNSS、`DHCPPrefixDelegation` |
+| `30-linux-router-ppp.network` | 只匹配 `ppp0`，`DHCP=ipv6` + `WithoutRA=solicit` |
+| `/etc/ppp/peers/linux-router` | PPPoE 会话参数（`plugin rp-pppoe.so`、账号、MTU 1492） |
+| `/etc/ppp/chap-secrets`、`pap-secrets` | 宽带账号口令，权限 0600 |
+
+手工检查：
 
 ```bash
-sudo netplan generate
-sudo netplan apply
-sudo systemctl restart NetworkManager.service
+networkctl list
+networkctl status <网卡> --no-pager
+ip -br addr
 ```
 
-检查 renderer 和网卡状态：
-
-```bash
-grep -R "^[[:space:]]*renderer:" /etc/netplan 2>/dev/null
-nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status
-```
-
-如果系统使用 `dhcpcd` 管理同一批接口，应在维护窗口确认后停止并禁用：
-
-```bash
-sudo systemctl disable --now dhcpcd.service
-```
-
-不要让 `dhcpcd`、`systemd-networkd` 和 NetworkManager 同时管理同一接口。
+如果这台机器之前用 ifupdown 管过网卡，`/etc/network/interfaces` 里的 `iface <网卡> inet dhcp`
+必须先注释掉（面板应用配置时会自动注释并备份为 `interfaces.linux-router.bak`），
+否则开机时 `ifup` 会先抢走网卡。
 
 ## 5. 配置 IPv4/IPv6 转发
 
@@ -297,56 +279,40 @@ IPv6 模式说明：
 - `全局前缀`：把运营商分配或自行委派得到的 /64 填进去，不做 NAT66，只做转发；
 - `关闭`：dnsmasq 不发 RA，`lr_nat6` 表会被删除。
 
-### PD 模式相关文件
+### PD 模式说明
 
-| 路径 | 作用 |
-| --- | --- |
-| `/etc/linux-router/dhcpcd.conf` | 只做 PD 的 dhcpcd 配置（`noipv4`、`noipv6rs`、`ia_pd`） |
-| `/usr/lib/dhcpcd/dhcpcd-hooks/99-linux-router` | dhcpcd 事件 hook，被 `dhcpcd-run-hooks` source |
-| `/etc/systemd/system/linux-router-pd.service` | 独立 dhcpcd 实例，不占用发行版 `dhcpcd.service` |
-| `$DATA_DIR/pd.json` | 当前委派前缀、触发事件、上次同步时间与错误 |
-| `/opt/linux-router/pd_hook.py` | hook 的入口，重算 LAN /64 并重写 dnsmasq |
+前缀委派由 systemd-networkd 的 `DHCPPrefixDelegation=` 完成（systemd ≥ 250），不再有
+`linux-router-pd.service` 或 dhcpcd hook：
 
-PD 模式会把 LAN 的 NetworkManager 连接设为 `ipv6.method ignore`，让 dhcpcd 独占 IPv6 地址；IPv4 仍由 NetworkManager 管理。
+- LAN 的 `.network` 里 `DHCPPrefixDelegation=yes` + `IPv6SendRA=yes`
+- `ppp0` 的 `.network` 里 `[DHCPv6] WithoutRA=solicit`（PPP 链路上没有 RA）
+- 前缀变化由 networkd 自己处理，没有 hook、不需要重启服务
 
-### 网络栈归属（ifupdown / NetworkManager / dhcpcd）
+```bash
+networkctl status <LAN> --no-pager | sed -n '/Address/,+6p'
+ip -6 addr show dev <LAN> scope global
+```
 
-一台 Debian 上可能同时存在三套东西，先看清谁在管哪块网卡，否则会出现"面板改了没反应"：
+### 网络栈归属
+
+一台机器上可能同时存在 systemd-networkd、NetworkManager、dhcpcd、ifupdown，先看清谁在管哪块网卡：
 
 | 组件 | 判断方法 |
 | --- | --- |
+| systemd-networkd | `networkctl status <网卡>` 里有 `Network File: /etc/systemd/network/...` |
+| NetworkManager | `nmcli device status` 里出现该网卡，且 `systemctl is-active NetworkManager` |
+| dhcpcd | `ls /run/dhcpcd/*.pid`（每接口实例）与 `/run/dhcpcd/pid` |
 | ifupdown | `/etc/network/interfaces` 里有 `iface <网卡> inet dhcp`；`systemctl status ifup@<网卡>` |
-| NetworkManager | `nmcli -t -f DEVICE,STATE,CONNECTION device status`，连接名不是 `Ifupdown (xxx)` |
-| dhcpcd | `ls /run/dhcpcd/*.pid`（每接口实例）与 `/run/dhcpcd/pid`（管理器实例） |
 
-关键点：**`dhcpcd.service` 处于 inactive 并不代表没有 dhcpcd 在跑**。Debian netinst 会写
-`iface ens3 inet dhcp`，ifupdown 启动时就会拉起一个只针对 ens3 的 dhcpcd 实例
-（`/run/dhcpcd/ens3.pid`），而 NetworkManager 因为 `[ifupdown] managed=false` 并不接管这块网卡。
-这时面板对 WAN 的 IPv6 / MTU 设置写了也不生效，PD 模式会直接拒绝启动（否则会杀掉这个实例、断掉 WAN 的 IPv4 地址）。
+`dhcpcd.service` 处于 inactive 并不代表没有 dhcpcd 在跑：ifupdown 启动时会拉起一个
+只针对单块网卡的实例（`/run/dhcpcd/<网卡>.pid`）。
 
-移交某块网口给 NetworkManager：
+面板的「依赖」页有「遗留网络栈」与「WAN 接管情况」两项检查；点「切换到 networkd」会：
 
-```bash
-sudo cp /etc/network/interfaces /etc/network/interfaces.bak
-sudo sed -i 's/^allow-hotplug ens3/# allow-hotplug ens3/; s/^iface ens3 inet dhcp/# iface ens3 inet dhcp/' /etc/network/interfaces
-sudo systemctl stop ifup@ens3.service
-sudo systemctl restart NetworkManager
-nmcli -t -f DEVICE,STATE,CONNECTION device status   # 连接名不应再是 Ifupdown (ens3)
-```
-
-> ⚠️ 该网口会短暂断网，从 WAN 侧 SSH 操作会掉线；请从 LAN 侧或本地控制台执行。
-
-确认 PD 实例没有和别人抢网卡：
-
-```bash
-systemctl status linux-router-pd --no-pager
-ls -l /run/dhcpcd/
-ps -o pid,args -C dhcpcd
-```
-
-正常情况下只有一个 dhcpcd 进程，命令行形如
-`dhcpcd -6 -B -q -f /etc/linux-router/dhcpcd.conf <WAN> <LAN>`。
-如果还看到发行版的 `dhcpcd: <网卡> [ip4] [ip6]`，说明有另一套在管 IPv4，先按上表定位来源。
+1. 写入 `/etc/systemd/network/*.network`
+2. 停掉 `NetworkManager.service`、`dhcpcd.service` 和对应的 `ifup@<网卡>`
+3. 注释 `/etc/network/interfaces` 中这些网口（备份 `.linux-router.bak`）
+4. 重启 `systemd-networkd` 并 `networkctl reconfigure`
 
 ## 10. 常见故障排查
 
@@ -411,18 +377,19 @@ nmcli -g ipv4.addresses,ipv4.never-default connection show linux-router-lan
 ### PD 拿不到前缀
 
 ```bash
-systemctl status linux-router-pd --no-pager
-journalctl -u linux-router-pd -n 80 --no-pager
-cat /var/lib/linux-router/pd.json
-sudo tcpdump -i <WAN接口> -nv 'ip6 and (port 546 or port 547)'
+networkctl status <WAN> --no-pager | sed -n '/Delegated/,+4p'
+networkctl status <LAN> --no-pager | sed -n '/Address/,+6p'
+journalctl -u systemd-networkd -n 80 --no-pager
+sudo tcpdump -i <WAN> -nv 'ip6 and (port 546 or port 547)'
 ```
 
 依次确认：
 
-1. WAN 选的是逻辑接口（PPPoE 是 `ppp0`，不是 `enp1s0`）；
+1. WAN 选的是逻辑接口（PPPoE 是 `ppp0`，不是物理网卡），且 `30-linux-router-ppp.network` 已生成；
 2. 抓包里 Advertise 是否带 `IA_PD`（不带就是运营商没给前缀，只能用 ULA + NAT66）；
-3. `pd.json` 里 `delegated` 有值但 `prefix` 为空，说明 hook 没跑或 LAN 没拿到地址，看 `journalctl -u linux-router-pd` 与 `ip -6 addr show dev <LAN>`；
-4. 光猫是否真的是桥接（路由模式下前缀会被光猫吃掉）。
+3. 光猫是否真的桥接（路由模式下前缀会被光猫吃掉）；
+4. `networkctl status <LAN>` 里没有 `2408:...` 说明 LAN 的 `.network` 没拿到前缀，
+   看 `journalctl -u systemd-networkd` 里的 DHCPv6 日志。
 
 ### IPv6 不通
 

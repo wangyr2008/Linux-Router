@@ -19,7 +19,7 @@
 | 转发后端 | `iptables` + NetworkManager `ipv4.method shared` | **nftables**（Debian 13 默认），规则由面板生成 |
 | IPv6 | 无 | **双栈**：WAN 自动 SLAAC/DHCPv6，LAN 支持 **运营商 PD 自动**、ULA+NAT66 或全局前缀 |
 | DHCP/DNS | dnsmasq-base（仅热点用） | `dnsmasq` 独立服务，提供 DHCPv4、RA、DHCPv6 与 LAN DNS |
-| 依赖 | `iptables`、`iw`、`wpasupplicant`、`hostapd` 相关 | 去掉以上全部，仅保留 Flask/Gunicorn/NetworkManager/dnsmasq/nftables |
+| 依赖 | `iptables`、`iw`、`wpasupplicant`、`hostapd` 相关 | 去掉以上全部，仅保留 Flask/Gunicorn/systemd-networkd/dnsmasq/nftables/ppp |
 | 页面 | 概览 / 依赖 / 有线 / 无线 / 热点 / 工具 / 设备 / 设置 | 概览 / 依赖 / 有线 / **路由** / 设备 / 工具 / 设置 |
 
 ## 功能
@@ -35,12 +35,12 @@
 
 - x86_64 工控机，至少两块有线网卡（WAN / LAN）
 - Debian 13（trixie）最小化安装 + systemd + apt
-- NetworkManager 管理网卡（安装器会启用）
+- 网卡由 **systemd-networkd** 管理（Debian 自带，安装器会启用；不再需要 NetworkManager）
 
 安装器只会安装这些包，其余全部使用 Debian 自带组件：
 
 ```text
-python3 python3-flask gunicorn network-manager dnsmasq nftables iproute2 udev curl tar ca-certificates
+python3 python3-flask gunicorn dnsmasq nftables iproute2 udev ppp curl tar ca-certificates
 ```
 
 > 内核侧的 `nf_tables`、`nf_nat`、`nft_chain_nat` 是 Debian 内核自带模块，不需要额外安装或编译。
@@ -53,8 +53,7 @@ python3 python3-flask gunicorn network-manager dnsmasq nftables iproute2 udev cu
 # 在设备上，源码目录例如 /root/Linux-Router
 sudo bash /root/Linux-Router/install.sh install --source-dir /root/Linux-Router
 
-# 需要公网 IPv6（PD 模式）时顺便装上 dhcpcd
-sudo bash /root/Linux-Router/install.sh install --source-dir /root/Linux-Router --with-pd
+# PPPoE 拨号所需的 ppp 包会一起装上
 ```
 
 方式二：从 GitHub 分支安装（先把本分支推到你自己的仓库/分支）：
@@ -75,7 +74,7 @@ sudo bash /tmp/linux-router-install.sh install
 4. 写入 `net.ipv4.ip_forward=1` 与 `net.ipv6.conf.all.forwarding=1`；
 5. 准备 `/etc/nftables.d/90-linux-router.nft` 与 `/etc/dnsmasq.d/linux-router.conf` 的占位文件，并确保
    `/etc/nftables.conf`、`/etc/dnsmasq.conf` 引入了对应目录；
-6. 启用 `nftables.service`、`dnsmasq.service`、NetworkManager 和两个面板服务；
+6. 启用 `nftables.service`、`dnsmasq.service`、`systemd-networkd`、`systemd-resolved` 和两个面板服务；
 7. 如检测到 `systemd-resolved` 占用 53 端口，会停用并禁用（卸载时恢复）。
 
 默认位置：
@@ -91,7 +90,7 @@ sudo bash /tmp/linux-router-install.sh install
 
 安装器不会猜你的网口用途，进面板后到 **路由** 页面完成一次性配置：
 
-1. **WAN 上行接口**：接光猫/上级路由的网口（IPv4 由 NetworkManager 的该连接决定，DHCP 或静态都行）
+1. **WAN 连接方式**：DHCP（选接光猫/上级路由的网口）或 PPPoE（选桥接光猫的网口并填宽带账号）
 2. **LAN 局域网接口**：接交换机的网口，面板会为它创建 `linux-router-lan` 连接，地址固定为网段第一个可用地址
 3. **LAN IPv4 网段**：默认 `192.168.50.0/24`
 4. **DHCP 地址池 / 租期**：留空自动取网段后半段
@@ -115,69 +114,45 @@ PPPoE 拨号时 WAN 要选 **ppp0**（逻辑接口），不是物理网卡。
 
 ### PD 模式怎么工作
 
-NetworkManager 至今不支持 DHCPv6-PD，所以 PD 模式用一个只做前缀委派的 `dhcpcd` 实例补上这一环：
+前缀委派由 **systemd-networkd 自己完成**，不需要额外守护进程：
 
 ```text
-WAN(ppp0) --DHCPv6-PD--> dhcpcd --ia_pd--> 拿到 2408:...:2f00::/60
-                                            └─ 第一个 /64 配到 LAN(enp2s0)
-                                               └─ hook 重写 dnsmasq 的 RA 前缀并重启
+WAN(ppp0) --DHCPv6-PD--> networkd --IA_PD--> 拿到 2408:...:2f00::/60
+                                              └─ LAN 的 .network 上开 DHCPPrefixDelegation=yes
+                                                 └─ 前缀内取地址 + 通过 RA 通告给内网
 ```
 
-- 依赖只多一个 `dhcpcd`（Debian 13 自带仓库，约 300KB），安装时加 `--with-pd`，或在面板“依赖”页点“安装 PD 客户端”
-- `dhcpcd` 用独立配置 `/etc/linux-router/dhcpcd.conf` 和独立服务 `linux-router-pd.service`，**不改** `/etc/dhcpcd.conf`
-- 配置里 `noipv4` + `noipv6rs` + `nohook resolv.conf, hostname`：IPv4、WAN 地址、DNS 仍归 NetworkManager，dhcpcd 只负责要前缀
-- LAN 的 IPv6 地址由 dhcpcd 分配，所以 NetworkManager 的 LAN 连接被设为 `ipv6.method ignore`，避免两边互相清地址
-- **前缀变化**：运营商换前缀时 dhcpcd 触发 `DELEGATED6`，hook 调 `pd_hook.py`，重新算 LAN /64、重写 dnsmasq、重启服务，内网设备收到新 RA 后自动换地址
-- 前缀丢了（`EXPIRE6`/`STOP6`）：清空 LAN 前缀并停发 RA，不会残留旧地址
-
-#### 为什么这里的 dhcpcd 不会和 NetworkManager 打架
-
-会打架的是**让 dhcpcd 当完整网络管理器**：它默认会抢 IPv4 地址、默认路由、`/etc/resolv.conf` 和 hostname，和 NetworkManager 两套状态互相覆盖。我们把它限制成"只做一件事"：
-
-| 手段 | 作用 |
-| --- | --- |
-| `noipv4` + 启动参数 `-6` | 完全不碰 IPv4，WAN 的 IPv4 地址仍由 NetworkManager 提供 |
-| `noipv6rs` + `nohook resolv.conf, hostname` | 不发/不收 RA，不改 DNS 和主机名（这也是 dhcpcd 手册对 `ia_pd` 的明确建议） |
-| 独立配置 + 独立 unit | 不读也不改 `/etc/dhcpcd.conf`，不占用发行版的 `dhcpcd.service` |
-| 命令行显式列出 `WAN LAN` | 只在指定网口上跑，`ia_pd` 要求"dhcpcd 必须在被委派的接口上运行" |
-| LAN 连接 `ipv6.method ignore` | LAN 的 IPv6 地址只由 dhcpcd 管，NetworkManager 不去清 |
-
-反过来，如果启动前发现别的 dhcpcd 实例已经占着 WAN/LAN，面板**拒绝启动 PD 并说明原因**，而不是把对方的地址抢掉。
-
-#### WAN 被 ifupdown 管着怎么办
-
-Debian netinst 安装时会写 `/etc/network/interfaces`：
-
-```text
-allow-hotplug ens3
-iface ens3 inet dhcp
-```
-
-而 NetworkManager 默认 `[ifupdown] managed=false`，**不接管这类网口**——它们由 ifupdown 启动的一个 dhcpcd 实例在管（`/run/dhcpcd/ens3.pid`，注意此时 `dhcpcd.service` 是 inactive，只看服务状态会漏掉）。后果是面板对 WAN 的设置（自动获取 IPv6、MTU、静态地址）写了也不生效，PD 模式也会被拒绝启动。
-
-路由页会在这种情况下直接给出提示，依赖页的「WAN 接口归属」也会标黄。移交办法：
-
-```bash
-sudo cp /etc/network/interfaces /etc/network/interfaces.bak
-sudo sed -i 's/^allow-hotplug ens3/# allow-hotplug ens3/; s/^iface ens3 inet dhcp/# iface ens3 inet dhcp/' /etc/network/interfaces
-sudo systemctl stop ifup@ens3.service     # 杀掉那个 dhcpcd 实例
-sudo systemctl restart NetworkManager     # NM 接管并重新 DHCP
-```
-
-> ⚠️ 这条命令会让该网口短暂断网。如果这台机器是你 SSH 的目标，从 WAN 侧操作会掉线；请从 LAN 侧或本地控制台执行。
+- LAN 的 `.network` 里 `DHCPPrefixDelegation=yes` + `IPv6SendRA=yes`：networkd 在委派前缀里取一个地址，
+  并把前缀通过 RA 下发，内网设备用 SLAAC 自动生成地址
+- PPPoE 上不会收到 RA，所以 `ppp0` 的 `.network` 写了 `[DHCPv6] WithoutRA=solicit`，
+  否则 DHCPv6 客户端会一直等 RA 而不发 SOLICIT
+- **前缀变化**：运营商换前缀时 networkd 直接换地址和 RA，没有 hook、没有重启服务
+- 前缀丢了：地址随租约过期移除，RA 随之停发
 
 验证：
 
 ```bash
-systemctl status linux-router-pd --no-pager
-dhcpcd --variables | grep -i prefix     # 或在 WAN 上抓包看 IA_PD
-ip -6 addr show dev <LAN> scope global  # 应该有 2408:...::1/64
-cat /var/lib/linux-router/pd.json        # 面板显示的委派前缀就来自这里
-journalctl -u linux-router-pd -n 50 --no-pager
+networkctl status <LAN> --no-pager        # 看 Address 里有没有 2408:...::1/64
+ip -6 addr show dev <LAN> scope global
+networkctl status <WAN> --no-pager        # 看有没有 Delegated Prefix
 ```
 
-> 前缀委派要求运营商真的给 PD（多数家宽给 /60 或 /56，桥接 + 自己拨号才拿得到）。
-> 如果光猫是路由模式，前缀会被光猫吃掉，这时只能用 ULA + NAT66。
+> PD 只在前缀真的能到达这台机器时才有用：光猫必须是桥接、由本机拨号。
+> 光猫路由模式下前缀在光猫手里，只能用 ULA + NAT66。
+
+#### 网络栈由谁负责
+
+| 组件 | 职责 |
+| --- | --- |
+| `systemd-networkd` | WAN 的 DHCP/SLAAC、LAN 的静态地址、IPv6 RA/RDNSS、PD |
+| `pppd`（`linux-router-pppoe.service`） | 只负责 PPPoE 会话，把 `ppp0` 建出来 |
+| `dnsmasq` | LAN 的 DHCPv4 与 DNS，只绑定 LAN 地址 |
+| `systemd-resolved` | 把 WAN 侧下发的 DNS 变成 `/etc/resolv.conf` |
+| `nftables` / CAKE | NAT、转发、入站过滤、限速 |
+
+NetworkManager、dhcpcd、ifupdown **都不再使用**。应用路由配置时会停掉它们，并把
+`/etc/network/interfaces` 里对应的网口注释掉（备份为 `interfaces.linux-router.bak`），
+否则开机时 ifup 会先一步抢走网卡。
 
 ## CAKE 限速（按带宽整形）
 
@@ -299,8 +274,8 @@ sudo bash /tmp/linux-router-install.sh uninstall --purge-data  # 一并删除
 ```
 
 卸载会删除两个服务、`/etc/nftables.d/90-linux-router.nft`、`/etc/dnsmasq.d/linux-router.conf`，
-恢复安装前的 `nftables.conf`、`dnsmasq.conf`、NetworkManager/netplan/sysctl 配置以及
-`dhcpcd`、`systemd-resolved` 的启停状态。
+恢复安装前的 `nftables.conf`、`dnsmasq.conf`、sysctl 配置以及
+`NetworkManager`、`dhcpcd`、`systemd-resolved` 的启停状态。
 
 ## 开发与测试
 
