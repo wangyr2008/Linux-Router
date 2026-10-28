@@ -19,7 +19,7 @@ from router_panel import dependencies
 from router_panel import firewall
 from router_panel import network
 from router_panel import network_parsers
-from router_panel import pd as pd_client
+from router_panel import networkd
 from router_panel import routing
 from router_panel import system
 from router_panel import web_general
@@ -215,25 +215,27 @@ class DnsmasqConfigTests(unittest.TestCase):
         assert error is None, error
         return config
 
-    def test_ipv4_and_ipv6_are_rendered(self):
+    def test_ipv4_is_served_and_ipv6_is_left_to_networkd(self):
         text = routing.build_dnsmasq_config(self.config())
         self.assertIn("interface=eth1", text)
-        self.assertIn("bind-dynamic", text)
+        self.assertIn("bind-interfaces", text)
         self.assertIn("dhcp-range=192.168.50.100,192.168.50.200,255.255.255.0,12h", text)
         self.assertIn("dhcp-option=option:router,192.168.50.1", text)
-        self.assertIn("enable-ra", text)
-        self.assertIn("dhcp-range=fd00:50::,ra-stateless", text)
-        self.assertIn("dhcp-option=option6:dns-server,[fd00:50::1]", text)
-
-    def test_ipv6_off_removes_ra(self):
-        text = routing.build_dnsmasq_config(self.config(ipv6_mode="off"))
+        # IPv6 addressing and RAs belong to systemd-networkd now.
         self.assertNotIn("enable-ra", text)
+        self.assertNotIn("ra-stateless", text)
         self.assertNotIn("option6", text)
+
+    def test_dns_binds_lan_addresses_only(self):
+        text = routing.build_dnsmasq_config(self.config())
+        self.assertIn("listen-address=192.168.50.1", text)
+        self.assertIn("listen-address=fe80::1", text)
+        self.assertIn("listen-address=fd00:50::1", text)
+        self.assertIn("server=127.0.0.53", text)
 
     def test_dhcp_disabled_removes_v4_range(self):
         text = routing.build_dnsmasq_config(self.config(dhcp_enabled="0"))
         self.assertNotIn("dhcp-range=192.168", text)
-        self.assertIn("enable-ra", text)
 
     def test_upstream_dns(self):
         text = routing.build_dnsmasq_config(self.config(dns_upstream="223.5.5.5 1.1.1.1"))
@@ -397,58 +399,6 @@ class ForwardingTests(unittest.TestCase):
         self.assertIn("net.ipv4.ip_forward=1", content)
         self.assertIn("net.ipv6.conf.all.forwarding=1", content)
         self.assertIn(["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"], calls)
-
-
-class LanConnectionTests(unittest.TestCase):
-    def test_creates_profile_when_missing(self):
-        config, error = routing.normalize_router_config(
-            {"wan_interface": "eth0", "lan_interface": "eth1", "ipv6_prefix": "fd00:50::/64"}
-        )
-        self.assertIsNone(error)
-        calls = []
-
-        def fake_run(command, timeout=8, env=None):
-            calls.append(command)
-            if command[:4] == ["nmcli", "-t", "-f", "NAME"]:
-                return ok("Wired connection 1")
-            return ok()
-
-        with patch.object(routing, "run_command", side_effect=fake_run):
-            result = routing.ensure_lan_connection(config)
-
-        self.assertTrue(result.ok)
-        add_command = calls[1]
-        self.assertEqual(add_command[:5], ["nmcli", "connection", "add", "type", "ethernet"])
-        self.assertIn("ipv4.addresses", add_command)
-        self.assertIn("192.168.50.1/24", add_command)
-        self.assertIn("ipv4.never-default", add_command)
-        self.assertIn("fd00:50::1/64", add_command)
-        self.assertEqual(calls[-1][:3], ["nmcli", "connection", "up"])
-
-    def test_modifies_existing_profile(self):
-        config, _ = routing.normalize_router_config(
-            {"wan_interface": "eth0", "lan_interface": "eth1", "ipv6_mode": "off"}
-        )
-        calls = []
-
-        def fake_run(command, timeout=8, env=None):
-            calls.append(command)
-            if command[:4] == ["nmcli", "-t", "-f", "NAME"]:
-                return ok(core.LAN_CONNECTION_NAME)
-            return ok()
-
-        with patch.object(routing, "run_command", side_effect=fake_run):
-            result = routing.ensure_lan_connection(config)
-
-        self.assertTrue(result.ok)
-        modify_command = calls[1]
-        self.assertEqual(
-            modify_command[:4], ["nmcli", "connection", "modify", core.LAN_CONNECTION_NAME]
-        )
-        self.assertIn("ipv6.method", modify_command)
-        self.assertEqual(modify_command[modify_command.index("ipv6.method") + 1], "disabled")
-
-
 class ApplyRouterTests(unittest.TestCase):
     def test_apply_reports_missing_binaries(self):
         config, _ = routing.normalize_router_config(
@@ -486,7 +436,7 @@ class ApplyRouterTests(unittest.TestCase):
             routing, "ROUTER_CONFIG_PATH", router_json
         ), patch.object(routing, "run_command", side_effect=fake_run), patch.object(
             routing, "apply_ruleset", return_value=ok("rules loaded")
-        ), patch.object(routing, "gather_wired_network_info", return_value={"devices": []}):
+        ), patch.object(routing, "ensure_network_backend", return_value=ok("networkd ready")), patch.object(routing, "apply_cake", return_value=ok("cake skipped")):
             result = routing.apply_router_config(config)
 
         self.assertTrue(result.ok, result.output)
@@ -820,309 +770,6 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(network.translate_ipv6_method("auto"), "自动 (SLAAC/DHCPv6)")
         self.assertEqual(network.translate_ipv4_method("manual"), "静态地址")
 
-
-
-class PrefixDelegationTests(unittest.TestCase):
-    def config(self, **overrides):
-        payload = {
-            "wan_interface": "ppp0",
-            "lan_interface": "enp2s0",
-            "lan_network": "192.168.50.0/24",
-            "ipv6_mode": "pd",
-        }
-        payload.update(overrides)
-        config, error = routing.normalize_router_config(payload)
-        assert error is None, error
-        return config
-
-    def test_pd_mode_disables_nat66_and_ignores_manual_prefix(self):
-        config = self.config(ipv6_prefix="fd00:1::/64", ipv6_nat="1")
-        self.assertEqual(config["ipv6_prefix"], "")
-        self.assertFalse(config["ipv6_nat"])
-
-    def test_dhcpcd_conf_is_pd_only(self):
-        text = pd_client.render_dhcpcd_conf(self.config())
-        self.assertIn("noipv4", text)
-        self.assertIn("noipv6rs", text)
-        self.assertIn("allowinterfaces ppp0 enp2s0", text)
-        self.assertIn("ia_pd 2/::/56 enp2s0/0/64", text)
-        self.assertIn("nohook resolv.conf, hostname", text)
-
-    def test_hook_script_never_exits(self):
-        text = pd_client.render_hook_script(self.config())
-        self.assertIn('if [ "$interface" = "ppp0" ]', text)
-        self.assertIn("DELEGATED6", text)
-        self.assertIn("pd_hook.py", text)
-        self.assertIn(f'LINUX_ROUTER_DATA_DIR="{core.DATA_DIR}"', text)
-        self.assertNotIn("\nexit", text)
-        self.assertNotIn("exec ", text)
-
-    def test_service_unit_runs_in_foreground(self):
-        with patch.object(pd_client, "dhcpcd_binary", return_value="/usr/sbin/dhcpcd"):
-            text = pd_client.render_service_unit(self.config())
-        self.assertIn("Type=simple", text)
-        self.assertIn("-B", text)
-        self.assertIn("-6", text)
-        self.assertIn("/etc/linux-router/dhcpcd.conf", text)
-
-    def test_service_unit_names_both_interfaces(self):
-        """ia_pd only delegates to interfaces dhcpcd is actually running on."""
-        with patch.object(pd_client, "dhcpcd_binary", return_value="/usr/sbin/dhcpcd"):
-            text = pd_client.render_service_unit(self.config())
-        exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart="))
-        self.assertTrue(exec_line.endswith("ppp0 enp2s0"), exec_line)
-        # -f, not --config after -c was reused for --script in dhcpcd 10
-        self.assertIn("-f /etc/linux-router/dhcpcd.conf", exec_line)
-
-    def test_pd_refuses_when_ifupdown_owns_the_wan(self):
-        """Taking the interface over would kill the DHCP client providing its IPv4."""
-        with patch.object(pd_client, "dhcpcd_binary", return_value="/usr/sbin/dhcpcd"), patch.object(
-            pd_client, "dhcpcd_instances", return_value={"ppp0": 644}
-        ), patch.object(
-            pd_client, "ifupdown_managed_interfaces", return_value={"ppp0": "dhcp"}
-        ), patch.object(pd_client, "run_command") as runner:
-            result = pd_client.enable_pd(self.config())
-
-        self.assertFalse(result.ok)
-        self.assertIn("ifupdown", result.output)
-        self.assertIn("DEPLOYMENT.md", result.output)
-        # Nothing may be written or started when we bail out.
-        for call in runner.call_args_list:
-            self.assertNotIn("restart", call.args[0])
-
-    def test_pd_stops_orphan_instances_on_its_own_interfaces(self):
-        workdir = Path(TEST_DATA_DIRECTORY.name) / "pd-orphan"
-        workdir.mkdir(exist_ok=True)
-        config_dir = workdir / "etc"
-        service_path = workdir / "linux-router-pd.service"
-        hook_path = workdir / "99-linux-router"
-
-        def fake_run(command, timeout=8, env=None):
-            return ok()
-
-        with patch.object(pd_client, "dhcpcd_binary", return_value="/usr/sbin/dhcpcd"), patch.object(
-            pd_client, "dhcpcd_instances", return_value={"enp2s0": 999}
-        ), patch.object(pd_client, "ifupdown_managed_interfaces", return_value={}), patch.object(
-            pd_client, "run_command", side_effect=fake_run
-        ) as runner, patch.object(
-            pd_client, "PD_CONFIG_DIR", config_dir
-        ), patch.object(
-            pd_client, "PD_DHCPCD_CONF_PATH", config_dir / "dhcpcd.conf"
-        ), patch.object(
-            pd_client, "PD_HOOK_PATH", hook_path
-        ), patch.object(
-            pd_client, "PD_SERVICE_PATH", service_path
-        ), patch.object(
-            pd_client, "PD_STATE_PATH", workdir / "pd.json"
-        ), patch.object(
-            pd_client, "is_service_active", return_value=False
-        ), patch.object(
-            pd_client, "is_service_enabled", return_value=False
-        ):
-            result = pd_client.enable_pd(self.config())
-
-        self.assertTrue(result.ok, result.output)
-        self.assertIn("enp2s0 上的 dhcpcd 实例", result.output)
-        exits = [call.args[0] for call in runner.call_args_list if "-x" in call.args[0]]
-        self.assertEqual(exits, [["/usr/sbin/dhcpcd", "-x", "enp2s0"]])
-        self.assertTrue(service_path.exists())
-
-    def test_first_lan_subnet_slices_delegations(self):
-        self.assertEqual(pd_client.first_lan_subnet("2408:8207:6a1c:2f00::/60"), "2408:8207:6a1c:2f00::/64")
-        self.assertEqual(pd_client.first_lan_subnet("2408:8207:6a1c:2f00::/56"), "2408:8207:6a1c:2f00::/64")
-        self.assertEqual(pd_client.first_lan_subnet("2408:8207:6a1c:2f00::/64"), "2408:8207:6a1c:2f00::/64")
-        self.assertEqual(pd_client.first_lan_subnet("2408:8207:6a1c:2f00::/72"), "")
-        self.assertEqual(pd_client.first_lan_subnet(""), "")
-        self.assertEqual(pd_client.first_lan_subnet("not-a-prefix"), "")
-
-    def test_first_lan_subnet_uses_second_64_of_a_slash_56(self):
-        self.assertEqual(
-            pd_client.first_lan_subnet("2408:8207:6a1c:2f00::/56"),
-            "2408:8207:6a1c:2f00::/64",
-        )
-
-    def test_derive_prefers_delegation_over_stale_interface_address(self):
-        stale = {"ipv6": ["2408:8207:6a1c:2f00::1/64"]}
-        with patch.object(pd_client, "get_interface_addresses", return_value=stale):
-            prefix = pd_client.derive_lan_prefix("enp2s0", "2408:8207:6a1c:2f10::/60")
-        self.assertEqual(prefix, "2408:8207:6a1c:2f10::/64")
-
-    def test_derive_falls_back_to_interface(self):
-        addresses = {"ipv6": ["fe80::1/64", "2408:8207:6a1c:2f20::1/64"]}
-        with patch.object(pd_client, "get_interface_addresses", return_value=addresses):
-            prefix = pd_client.derive_lan_prefix("enp2s0", "")
-        self.assertEqual(prefix, "2408:8207:6a1c:2f20::/64")
-
-    def test_sync_rewrites_dnsmasq_only_on_change(self):
-        workdir = Path(TEST_DATA_DIRECTORY.name) / "pd"
-        workdir.mkdir(exist_ok=True)
-        config_path = workdir / "router.json"
-        config_path.write_text(
-            json.dumps({"wan_interface": "ppp0", "lan_interface": "enp2s0", "ipv6_mode": "pd"}),
-            encoding="utf-8",
-        )
-        state_path = workdir / "pd.json"
-        dnsmasq_conf = workdir / "dnsmasq.conf"
-        dnsmasq_conf.write_text("conf-dir=/etc/dnsmasq.d/,*.conf\n", encoding="utf-8")
-        dnsmasq_rules = workdir / "linux-router.conf"
-        commands = []
-
-        def fake_run(command, timeout=8, env=None):
-            commands.append(command)
-            return ok()
-
-        with patch.object(routing, "ROUTER_CONFIG_PATH", config_path), patch.object(
-            pd_client, "PD_STATE_PATH", state_path
-        ), patch.object(routing, "DNSMASQ_CONFIG_PATH", dnsmasq_conf), patch.object(
-            routing, "DNSMASQ_CONF_DIR", workdir
-        ), patch.object(
-            pd_client, "get_interface_addresses", return_value={"ipv6": []}
-        ), patch.object(
-            pd_client, "run_command", side_effect=fake_run
-        ), patch.object(
-            pd_client, "atomic_write_text", side_effect=lambda path, content, mode=None: path.write_text(content, encoding="utf-8")
-        ), patch(
-            "router_panel.core.DNSMASQ_RULESET_PATH", dnsmasq_rules
-        ), patch.object(
-            routing, "run_command", side_effect=fake_run
-        ):
-            first = pd_client.sync_from_system("2408:8207:6a1c:2f00::/60", "DELEGATED6")
-            self.assertEqual(first, 0)
-            rendered = dnsmasq_rules.read_text(encoding="utf-8")
-            self.assertIn("dhcp-range=2408:8207:6a1c:2f00::,ra-stateless", rendered)
-            self.assertIn("2408:8207:6a1c:2f00::1", rendered)
-            restarts = [cmd for cmd in commands if cmd[:3] == ["systemctl", "restart", "dnsmasq.service"]]
-            self.assertEqual(len(restarts), 1)
-
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(state["prefix"], "2408:8207:6a1c:2f00::/64")
-
-            commands.clear()
-            pd_client.sync_from_system("2408:8207:6a1c:2f00::/60", "RENEW6")
-            restarts = [cmd for cmd in commands if cmd[:3] == ["systemctl", "restart", "dnsmasq.service"]]
-            self.assertEqual(restarts, [])
-
-    def test_sync_clears_prefix_when_delegation_is_lost(self):
-        workdir = Path(TEST_DATA_DIRECTORY.name) / "pd-lost"
-        workdir.mkdir(exist_ok=True)
-        config_path = workdir / "router.json"
-        config_path.write_text(
-            json.dumps({"wan_interface": "ppp0", "lan_interface": "enp2s0", "ipv6_mode": "pd"}),
-            encoding="utf-8",
-        )
-        state_path = workdir / "pd.json"
-        state_path.write_text(json.dumps({"prefix": "2408:8207:6a1c:2f00::/64", "dnsmasq_prefix": "2408:8207:6a1c:2f00::/64"}), encoding="utf-8")
-        dnsmasq_conf = workdir / "dnsmasq.conf"
-        dnsmasq_conf.write_text("conf-dir=/etc/dnsmasq.d/,*.conf\n", encoding="utf-8")
-        dnsmasq_rules = workdir / "linux-router.conf"
-
-        with patch.object(routing, "ROUTER_CONFIG_PATH", config_path), patch.object(
-            pd_client, "PD_STATE_PATH", state_path
-        ), patch.object(routing, "DNSMASQ_CONFIG_PATH", dnsmasq_conf), patch.object(
-            routing, "DNSMASQ_CONF_DIR", workdir
-        ), patch.object(
-            pd_client, "get_interface_addresses", return_value={"ipv6": ["2408:8207:6a1c:2f00::1/64"]}
-        ), patch.object(
-            pd_client, "run_command", return_value=ok()
-        ), patch.object(
-            pd_client, "atomic_write_text", side_effect=lambda path, content, mode=None: path.write_text(content, encoding="utf-8")
-        ), patch(
-            "router_panel.core.DNSMASQ_RULESET_PATH", dnsmasq_rules
-        ), patch.object(
-            routing, "run_command", return_value=ok()
-        ):
-            pd_client.sync_from_system("", "EXPIRE6")
-
-        rendered = dnsmasq_rules.read_text(encoding="utf-8")
-        self.assertNotIn("enable-ra", rendered)
-        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["prefix"], "")
-
-    def test_sync_is_noop_outside_pd_mode(self):
-        workdir = Path(TEST_DATA_DIRECTORY.name) / "pd-noop"
-        workdir.mkdir(exist_ok=True)
-        config_path = workdir / "router.json"
-        config_path.write_text(json.dumps({"ipv6_mode": "ula", "lan_interface": "enp2s0"}), encoding="utf-8")
-        with patch.object(routing, "ROUTER_CONFIG_PATH", config_path), patch.object(
-            pd_client, "_write_dnsmasq_for_prefix"
-        ) as writer:
-            self.assertEqual(pd_client.sync_from_system("2408::/60", "DELEGATED6"), 0)
-        writer.assert_not_called()
-
-    def test_lan_connection_ignores_ipv6_in_pd_mode(self):
-        config = self.config()
-        calls = []
-
-        def fake_run(command, timeout=8, env=None):
-            calls.append(command)
-            if command[:4] == ["nmcli", "-t", "-f", "NAME"]:
-                return ok("")
-            return ok()
-
-        with patch.object(routing, "run_command", side_effect=fake_run):
-            routing.ensure_lan_connection(config)
-
-        modify = calls[1]
-        self.assertEqual(modify[modify.index("ipv6.method") + 1], "ignore")
-        self.assertNotIn("ipv6.addresses", modify)
-
-    def test_pd_mode_has_no_nat66(self):
-        text = firewall.render_nftables_ruleset(self.config())
-        self.assertNotIn("table ip6 lr_nat6 {", text)
-
-    def test_load_config_injects_delegated_prefix(self):
-        workdir = Path(TEST_DATA_DIRECTORY.name) / "pd-load"
-        workdir.mkdir(exist_ok=True)
-        config_path = workdir / "router.json"
-        config_path.write_text(
-            json.dumps({"wan_interface": "ppp0", "lan_interface": "enp2s0", "ipv6_mode": "pd"}),
-            encoding="utf-8",
-        )
-        state_path = workdir / "pd.json"
-        state_path.write_text(json.dumps({"prefix": "2408:8207:6a1c:2f00::/64"}), encoding="utf-8")
-        with patch.object(routing, "ROUTER_CONFIG_PATH", config_path), patch.object(
-            pd_client, "PD_STATE_PATH", state_path
-        ):
-            config = routing.load_router_config()
-        self.assertEqual(config["ipv6_prefix"], "2408:8207:6a1c:2f00::/64")
-        self.assertEqual(str(routing.lan_ipv6_address(config)), "2408:8207:6a1c:2f00::1")
-
-    def test_dependency_rows_include_pd_checks(self):
-        config = self.config()
-        pd_status = {
-            "available": True,
-            "binary": "/usr/sbin/dhcpcd",
-            "service": "linux-router-pd.service",
-            "service_active": True,
-            "service_enabled": True,
-            "prefix": "2408:8207:6a1c:2f00::/64",
-            "delegated": "2408:8207:6a1c:2f00::/60",
-            "wan": "ppp0",
-            "lan": "enp2s0",
-            "reason": "DELEGATED6",
-            "updated_at": "2026-10-28T04:00:00+00:00",
-            "error": "",
-        }
-        with patch.object(dependencies, "load_router_config", return_value=config), patch.object(
-            dependencies, "get_pd_status", return_value=pd_status
-        ), patch.object(dependencies, "gather_wired_network_info", return_value={"devices": []}), patch.object(
-            dependencies, "get_router_nat_status", return_value={"level": "ok", "summary": "", "details": "", "action": ""}
-        ), patch.object(dependencies, "get_firewall_status", return_value={
-            "available": True, "service_active": True, "service_enabled": True,
-            "nat4": True, "nat6": False, "nat4_packets": 0, "nat6_packets": 0, "errors": [],
-        }), patch.object(dependencies, "_lan_has_address", return_value=True), patch.object(
-            dependencies, "get_ip_forward_status", return_value={"ipv4": "1", "ipv6": "1", "persistent": ""}
-        ), patch.object(dependencies, "get_netplan_renderer_summary", return_value={"ok": True, "level": "ok", "summary": "", "details": []}):
-            rows = dependencies.get_dependency_rows()
-
-        names = [row["name"] for row in rows]
-        self.assertIn("dhcpcd（PD 客户端）", names)
-        self.assertIn("已委派前缀", names)
-        prefix_row = next(row for row in rows if row["name"] == "已委派前缀")
-        self.assertIn("2408:8207:6a1c:2f00::/60", " ".join(prefix_row["extra_details"]))
-
-
-
-
 class AccessControlTests(unittest.TestCase):
     def config(self, **overrides):
         payload = {
@@ -1211,10 +858,7 @@ class AccessControlTests(unittest.TestCase):
         ), patch.object(
             dependencies, "get_netplan_renderer_summary",
             return_value={"ok": True, "level": "ok", "summary": "", "details": []},
-        ), patch.object(dependencies, "get_pd_status", return_value={
-            "available": True, "service_active": True, "service_enabled": True, "prefix": "",
-            "delegated": "", "updated_at": "", "reason": "", "error": "",
-        }):
+        ):
             rows = dependencies.get_dependency_rows()
 
         row = next(item for item in rows if item["name"] == "入站访问控制")
@@ -1235,10 +879,7 @@ class AccessControlTests(unittest.TestCase):
         ), patch.object(
             dependencies, "get_netplan_renderer_summary",
             return_value={"ok": True, "level": "ok", "summary": "", "details": []},
-        ), patch.object(dependencies, "get_pd_status", return_value={
-            "available": True, "service_active": True, "service_enabled": True, "prefix": "",
-            "delegated": "", "updated_at": "", "reason": "", "error": "",
-        }):
+        ):
             rows = dependencies.get_dependency_rows()
 
         row = next(item for item in rows if item["name"] == "入站访问控制")
@@ -1277,113 +918,6 @@ class PackageInstallTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("Unable to locate", result.output)
-
-
-
-
-class NetworkStackOwnershipTests(unittest.TestCase):
-    """The panel writes settings through nmcli, which is a no-op for ifupdown NICs."""
-
-    def config(self, **overrides):
-        payload = {
-            "wan_interface": "ens3",
-            "lan_interface": "ens4",
-            "lan_network": "192.168.50.0/24",
-            "wan_ipv6_auto": "1",
-        }
-        payload.update(overrides)
-        config, error = routing.normalize_router_config(payload)
-        assert error is None, error
-        return config
-
-    def test_parse_ifupdown_interfaces_ignores_manual(self):
-        content = (
-            "source /etc/network/interfaces.d/*\n"
-            "auto lo\n"
-            "iface lo inet loopback\n"
-            "allow-hotplug ens3\n"
-            "iface ens3 inet dhcp\n"
-            "# iface ens4 inet static\n"
-            "iface ens4 inet manual\n"
-        )
-        parsed = core.parse_ifupdown_interfaces(content)
-        self.assertEqual(parsed, {"lo": "loopback", "ens3": "dhcp"})
-        self.assertNotIn("ens4", parsed)
-
-    def test_ifupdown_managed_interfaces_reads_dir(self):
-        workdir = Path(TEST_DATA_DIRECTORY.name) / "ifupdown"
-        workdir.mkdir(exist_ok=True)
-        main = workdir / "interfaces"
-        main.write_text("iface ens3 inet dhcp\n", encoding="utf-8")
-        dropin = workdir / "interfaces.d"
-        dropin.mkdir(exist_ok=True)
-        (dropin / "lan").write_text("iface ens4 inet static\n", encoding="utf-8")
-        with patch.object(core, "IFUPDOWN_INTERFACES_PATH", main), patch.object(
-            core, "IFUPDOWN_INTERFACES_DIR", dropin
-        ):
-            managed = core.ifupdown_managed_interfaces()
-        self.assertEqual(managed, {"ens3": "dhcp", "ens4": "static"})
-
-    def test_dhcpcd_instances_reads_per_interface_pid_files(self):
-        workdir = Path(TEST_DATA_DIRECTORY.name) / "dhcpcd-run"
-        workdir.mkdir(exist_ok=True)
-        (workdir / "ens3.pid").write_text(str(os.getpid()), encoding="utf-8")
-        (workdir / "ens9.pid").write_text("4194303", encoding="utf-8")  # not running
-        with patch.object(core, "DHCPCD_RUN_DIR", workdir):
-            instances = core.dhcpcd_instances()
-        self.assertEqual(instances, {"ens3": os.getpid()})
-
-    def test_wan_ipv6_is_refused_for_ifupdown_interface(self):
-        with patch.object(routing, "ifupdown_managed_interfaces", return_value={"ens3": "dhcp"}), patch.object(
-            routing, "run_command"
-        ) as runner:
-            result = routing.ensure_wan_ipv6(self.config())
-        self.assertFalse(result.ok)
-        self.assertIn("ifupdown", result.output)
-        runner.assert_not_called()
-
-    def test_wan_ipv6_still_works_for_nm_interface(self):
-        config = self.config()
-        devices = [{"device": "ens3", "connection": "Wired connection 1", "profile": {"ipv6_method": "disabled"}}]
-        with patch.object(routing, "ifupdown_managed_interfaces", return_value={}), patch.object(
-            routing, "gather_wired_network_info", return_value={"devices": devices}
-        ), patch.object(routing, "run_command", return_value=ok()) as runner:
-            result = routing.ensure_wan_ipv6(config)
-        self.assertTrue(result.ok)
-        self.assertEqual(runner.call_args_list[0].args[0][:3], ["nmcli", "connection", "modify"])
-
-    def test_dependency_rows_report_wan_owner(self):
-        config = self.config()
-        with patch.object(dependencies, "load_router_config", return_value=config), patch.object(
-            dependencies, "gather_wired_network_info", return_value={"devices": []}
-        ), patch.object(
-            dependencies, "ifupdown_managed_interfaces", return_value={"ens3": "dhcp"}
-        ), patch.object(
-            dependencies, "dhcpcd_instances", return_value={"ens3": 644}
-        ), patch.object(
-            dependencies, "get_router_nat_status",
-            return_value={"level": "ok", "summary": "", "details": "", "action": ""},
-        ), patch.object(dependencies, "get_firewall_status", return_value={
-            "available": True, "service_active": True, "service_enabled": True,
-            "nat4": True, "nat6": False, "input_table": False, "nat4_packets": 0, "nat6_packets": 0, "errors": [],
-        }), patch.object(dependencies, "_lan_has_address", return_value=True), patch.object(
-            dependencies, "get_ip_forward_status", return_value={"ipv4": "1", "ipv6": "1", "persistent": ""}
-        ), patch.object(
-            dependencies, "get_netplan_renderer_summary",
-            return_value={"ok": True, "level": "ok", "summary": "", "details": []},
-        ):
-            rows = dependencies.get_dependency_rows()
-
-        owner = next(row for row in rows if row["name"] == "WAN 接口归属")
-        self.assertEqual(owner["level"], "warning")
-        self.assertIn("ifupdown", owner["status"])
-        self.assertIn("不会生效", owner["detail"])
-
-        busy = next(row for row in rows if row["name"] == "dhcpcd 重复管理")
-        self.assertEqual(busy["level"], "error")
-        self.assertIn("PID 644", " ".join(busy["extra_details"]))
-        self.assertIn("ifupdown", " ".join(busy["extra_details"]))
-
 
 
 class CakeShapingTests(unittest.TestCase):
@@ -1567,6 +1101,463 @@ class CakeShapingTests(unittest.TestCase):
         self.assertIn("CAKE 限速", body)
         self.assertIn('name="cake_upload_mbit"', body)
         self.assertIn("30 Mbit/s", body)
+
+
+class NetworkdBackendTests(unittest.TestCase):
+    def config(self, **overrides):
+        payload = {
+            "wan_interface": "eth0",
+            "lan_interface": "eth1",
+            "lan_network": "192.168.50.0/24",
+            "ipv6_mode": "ula",
+            "ipv6_prefix": "fd00:50::/64",
+        }
+        payload.update(overrides)
+        config, error = routing.normalize_router_config(payload)
+        assert error is None, error
+        return config
+
+    def test_lan_network_ula_owns_ra(self):
+        text = networkd.render_lan_network(self.config())
+        self.assertIn("Name=eth1", text)
+        self.assertIn("Address=192.168.50.1/24", text)
+        self.assertIn("Address=fd00:50::1/64", text)
+        self.assertIn("Address=fe80::1/64", text)
+        self.assertIn("IPv6SendRA=yes", text)
+        self.assertIn("EmitDNS=yes", text)
+        self.assertIn("IPForward=yes", text)
+        self.assertNotIn("DHCPPrefixDelegation", text)
+
+    def test_lan_network_pd_delegates(self):
+        text = networkd.render_lan_network(self.config(ipv6_mode="pd", ipv6_prefix=""))
+        self.assertIn("DHCPPrefixDelegation=yes", text)
+        self.assertIn("IPv6SendRA=yes", text)
+        self.assertIn("IPv6AcceptRA=no", text)
+        # The prefix is only known at runtime, so no static global address.
+        self.assertNotIn("Address=fd", text)
+        self.assertIn("Address=fe80::1/64", text)
+
+    def test_lan_network_ipv6_off(self):
+        text = networkd.render_lan_network(self.config(ipv6_mode="off", ipv6_prefix=""))
+        self.assertNotIn("IPv6SendRA", text)
+        self.assertNotIn("fe80::1", text)
+        self.assertIn("Address=192.168.50.1/24", text)
+
+    def test_wan_network_dhcp_dual_stack(self):
+        text = networkd.render_wan_network(self.config())
+        self.assertIn("Name=eth0", text)
+        self.assertIn("DHCP=yes", text)
+        self.assertIn("IPv6AcceptRA=yes", text)
+
+    def test_wan_network_ipv4_only_and_mtu(self):
+        text = networkd.render_wan_network(self.config(wan_ipv6_auto="", mtu="1492"))
+        self.assertIn("DHCP=ipv4", text)
+        self.assertIn("IPv6AcceptRA=no", text)
+        self.assertIn("MTUBytes=1492", text)
+
+    def test_ppp_network_requests_dhcpv6_without_ra(self):
+        text = networkd.render_ppp_network()
+        self.assertIn("Name=ppp0", text)
+        self.assertIn("DHCP=ipv6", text)
+        self.assertIn("WithoutRA=solicit", text)
+
+    def test_pppoe_peers_file(self):
+        config = self.config(wan_mode="pppoe", pppoe_nic="eth0", pppoe_username="adsl123", pppoe_password="s3cret")
+        text = networkd.render_pppoe_peers(config)
+        self.assertIn("plugin rp-pppoe.so", text)
+        self.assertIn("nic-eth0", text)
+        self.assertIn('user "adsl123"', text)
+        self.assertIn("noauth", text)
+        self.assertIn("defaultroute", text)
+        self.assertIn("mtu 1492", text)
+        self.assertIn("ipv6 ,", text)
+
+    def test_pppoe_secrets_are_quoted(self):
+        config = self.config(wan_mode="pppoe", pppoe_nic="eth0", pppoe_username="adsl123", pppoe_password="s3cret")
+        self.assertEqual(networkd.render_pppoe_secrets(config), '"adsl123" * "s3cret" *\n')
+
+    def test_pppoe_forces_ppp0_and_requires_credentials(self):
+        config = self.config(wan_mode="pppoe", pppoe_nic="eth0", pppoe_username="adsl123")
+        self.assertEqual(config["wan_interface"], "ppp0")
+        self.assertEqual(config["wan_mode"], "pppoe")
+
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "eth0", "lan_interface": "eth1", "wan_mode": "pppoe", "pppoe_nic": "eth0"}
+        )
+        self.assertIn("PPPoE 账号", error)
+
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "eth0", "lan_interface": "eth1", "wan_mode": "pppoe", "pppoe_username": "x"}
+        )
+        self.assertIn("物理网口", error)
+
+        _, error = routing.normalize_router_config(
+            {
+                "wan_interface": "eth0",
+                "lan_interface": "eth1",
+                "wan_mode": "pppoe",
+                "pppoe_username": "x",
+                "pppoe_nic": "eth1",
+            }
+        )
+        self.assertIn("不能和 LAN", error)
+
+    def test_apply_writes_networkd_files(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "networkd"
+        workdir.mkdir(exist_ok=True)
+        wan_path = workdir / "10-wan.network"
+        lan_path = workdir / "20-lan.network"
+        ppp_path = workdir / "30-ppp.network"
+        peer = workdir / "peers"
+        chap = workdir / "chap-secrets"
+        pap = workdir / "pap-secrets"
+        unit = workdir / "pppoe.service"
+        commands = []
+
+        def fake_run(command, timeout=8, env=None):
+            commands.append(command)
+            return ok()
+
+        config = self.config(wan_mode="pppoe", pppoe_nic="eth0", pppoe_username="adsl123", pppoe_password="pw")
+        with patch.object(networkd, "WAN_NETWORK_PATH", wan_path), patch.object(
+            networkd, "LAN_NETWORK_PATH", lan_path
+        ), patch.object(
+            networkd, "PPP_NETWORK_PATH", ppp_path
+        ), patch.object(
+            networkd, "PPPOE_PEER_PATH", peer
+        ), patch.object(
+            networkd, "PPPOE_CHAP_PATH", chap
+        ), patch.object(
+            networkd, "PPPOE_PAP_PATH", pap
+        ), patch.object(
+            networkd, "PPPOE_SERVICE_PATH", unit
+        ), patch.object(
+            networkd, "command_exists", return_value=True
+        ), patch.object(
+            networkd, "is_service_active", return_value=False
+        ), patch.object(
+            networkd, "is_service_enabled", return_value=False
+        ), patch.object(
+            networkd, "run_command", side_effect=fake_run
+        ):
+            result = networkd.apply_networkd(config)
+
+        self.assertTrue(result.ok, result.output)
+        self.assertTrue(lan_path.exists())
+        self.assertTrue(ppp_path.exists())
+        self.assertFalse(wan_path.exists())
+        self.assertIn('"adsl123"', chap.read_text(encoding="utf-8"))
+        self.assertEqual(chap.stat().st_mode & 0o777, 0o600)
+        flat = [" ".join(call) for call in commands]
+        self.assertTrue(any("enable systemd-networkd.service" in item for item in flat))
+        self.assertTrue(any("restart linux-router-pppoe.service" in item for item in flat))
+
+    def test_apply_dhcp_removes_ppp_files(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "networkd-dhcp"
+        workdir.mkdir(exist_ok=True)
+        wan_path = workdir / "10-wan.network"
+        lan_path = workdir / "20-lan.network"
+        ppp_path = workdir / "30-ppp.network"
+        ppp_path.write_text("[Match]\nName=ppp0\n", encoding="utf-8")
+
+        with patch.object(networkd, "WAN_NETWORK_PATH", wan_path), patch.object(
+            networkd, "LAN_NETWORK_PATH", lan_path
+        ), patch.object(
+            networkd, "PPP_NETWORK_PATH", ppp_path
+        ), patch.object(
+            networkd, "command_exists", return_value=True
+        ), patch.object(
+            networkd, "is_service_active", return_value=False
+        ), patch.object(
+            networkd, "is_service_enabled", return_value=False
+        ), patch.object(
+            networkd, "run_command", return_value=ok()
+        ):
+            result = networkd.apply_networkd(self.config())
+
+        self.assertTrue(result.ok, result.output)
+        self.assertTrue(wan_path.exists())
+        self.assertFalse(ppp_path.exists())
+        self.assertIn("DHCP=yes", wan_path.read_text(encoding="utf-8"))
+
+    def test_configured_methods_are_read_from_files(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "networkd-methods"
+        workdir.mkdir(exist_ok=True)
+        (workdir / "10-wan.network").write_text(
+            "[Match]\nName=eth0\n[Network]\nDHCP=yes\n", encoding="utf-8"
+        )
+        (workdir / "20-lan.network").write_text(
+            "[Match]\nName=eth1\n[Network]\nAddress=192.168.50.1/24\nIPv6SendRA=yes\n",
+            encoding="utf-8",
+        )
+        with patch.object(networkd, "NETWORKD_DIR", workdir):
+            methods = networkd.get_configured_methods()
+        self.assertEqual(methods["eth0"], ("auto", "auto"))
+        self.assertEqual(methods["eth1"], ("manual", "auto"))
+
+    def test_delegated_prefix_from_kernel(self):
+        payload = (
+            '[{"ifname":"eth1","addr_info":['
+            '{"family":"inet6","local":"2408:8207:6a1c:2f00::1","prefixlen":64},'
+            '{"family":"inet6","local":"fe80::1","prefixlen":64}]}]'
+        )
+        with patch.object(networkd, "run_command", return_value=ok(payload)):
+            self.assertEqual(
+                networkd.get_delegated_prefix("eth1"), "2408:8207:6a1c:2f00::/64"
+            )
+
+    def test_router_page_renders_wan_modes(self):
+        application.app.config["TESTING"] = True
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        status = {
+            "config": routing.load_router_config(),
+            "interfaces": [{"name": "eth1", "link_speed": "1 Gbps"}],
+            "wan_candidates": [{"name": "eth0", "state": "connected", "ipv4": ["192.168.9.7/24"]}],
+            "backend": {"service_active": True},
+            "wan": {}, "lan": {}, "ipv6": {}, "dhcp": {}, "firewall": {},
+            "forwarding": {}, "services": {}, "pd": {}, "errors": [],
+        }
+        with patch.object(web_routing, "query_agent", return_value=status):
+            body = client.get("/router").get_data(as_text=True)
+        self.assertIn('name="wan_mode"', body)
+        self.assertIn('name="pppoe_username"', body)
+        self.assertIn("PPPoE 账号", body)
+
+
+
+class NetworkdBackendTests(unittest.TestCase):
+    def config(self, **overrides):
+        payload = {
+            "wan_interface": "eth0",
+            "lan_interface": "eth1",
+            "lan_network": "192.168.50.0/24",
+            "ipv6_mode": "ula",
+            "ipv6_prefix": "fd00:50::/64",
+        }
+        payload.update(overrides)
+        config, error = routing.normalize_router_config(payload)
+        assert error is None, error
+        return config
+
+    def test_lan_network_ula_owns_ra(self):
+        text = networkd.render_lan_network(self.config())
+        self.assertIn("Name=eth1", text)
+        self.assertIn("Address=192.168.50.1/24", text)
+        self.assertIn("Address=fd00:50::1/64", text)
+        self.assertIn("Address=fe80::1/64", text)
+        self.assertIn("IPv6SendRA=yes", text)
+        self.assertIn("EmitDNS=yes", text)
+        self.assertIn("IPForward=yes", text)
+        self.assertNotIn("DHCPPrefixDelegation", text)
+
+    def test_lan_network_pd_delegates(self):
+        text = networkd.render_lan_network(self.config(ipv6_mode="pd", ipv6_prefix=""))
+        self.assertIn("DHCPPrefixDelegation=yes", text)
+        self.assertIn("IPv6SendRA=yes", text)
+        self.assertIn("IPv6AcceptRA=no", text)
+        # The prefix is only known at runtime, so no static global address.
+        self.assertNotIn("Address=fd", text)
+        self.assertIn("Address=fe80::1/64", text)
+
+    def test_lan_network_ipv6_off(self):
+        text = networkd.render_lan_network(self.config(ipv6_mode="off", ipv6_prefix=""))
+        self.assertNotIn("IPv6SendRA", text)
+        self.assertNotIn("fe80::1", text)
+        self.assertIn("Address=192.168.50.1/24", text)
+
+    def test_wan_network_dhcp_dual_stack(self):
+        text = networkd.render_wan_network(self.config())
+        self.assertIn("Name=eth0", text)
+        self.assertIn("DHCP=yes", text)
+        self.assertIn("IPv6AcceptRA=yes", text)
+
+    def test_wan_network_ipv4_only_and_mtu(self):
+        text = networkd.render_wan_network(self.config(wan_ipv6_auto="", mtu="1492"))
+        self.assertIn("DHCP=ipv4", text)
+        self.assertIn("IPv6AcceptRA=no", text)
+        self.assertIn("MTUBytes=1492", text)
+
+    def test_ppp_network_requests_dhcpv6_without_ra(self):
+        text = networkd.render_ppp_network()
+        self.assertIn("Name=ppp0", text)
+        self.assertIn("DHCP=ipv6", text)
+        self.assertIn("WithoutRA=solicit", text)
+
+    def test_pppoe_peers_file(self):
+        config = self.config(
+            wan_mode="pppoe", pppoe_nic="eth0", pppoe_username="adsl123", pppoe_password="testpass"
+        )
+        text = networkd.render_pppoe_peers(config)
+        self.assertIn("plugin rp-pppoe.so", text)
+        self.assertIn("nic-eth0", text)
+        self.assertIn('user "adsl123"', text)
+        self.assertIn("noauth", text)
+        self.assertIn("defaultroute", text)
+        self.assertIn("mtu 1492", text)
+        self.assertIn("ipv6 ,", text)
+
+    def test_pppoe_secrets_are_quoted(self):
+        config = self.config(
+            wan_mode="pppoe", pppoe_nic="eth0", pppoe_username="adsl123", pppoe_password="testpass"
+        )
+        self.assertEqual(networkd.render_pppoe_secrets(config), '"adsl123" * "testpass" *\n')
+
+    def test_pppoe_forces_ppp0_and_requires_credentials(self):
+        config = self.config(wan_mode="pppoe", pppoe_nic="eth0", pppoe_username="adsl123")
+        self.assertEqual(config["wan_interface"], "ppp0")
+        self.assertEqual(config["wan_mode"], "pppoe")
+
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "eth0", "lan_interface": "eth1", "wan_mode": "pppoe", "pppoe_nic": "eth0"}
+        )
+        self.assertIn("PPPoE 账号", error)
+
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "eth0", "lan_interface": "eth1", "wan_mode": "pppoe", "pppoe_username": "x"}
+        )
+        self.assertIn("物理网口", error)
+
+        _, error = routing.normalize_router_config(
+            {
+                "wan_interface": "eth0",
+                "lan_interface": "eth1",
+                "wan_mode": "pppoe",
+                "pppoe_username": "x",
+                "pppoe_nic": "eth1",
+            }
+        )
+        self.assertIn("不能和 LAN", error)
+
+    def test_apply_writes_networkd_files(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "networkd"
+        workdir.mkdir(exist_ok=True)
+        wan_path = workdir / "10-wan.network"
+        lan_path = workdir / "20-lan.network"
+        ppp_path = workdir / "30-ppp.network"
+        peer = workdir / "peers"
+        chap = workdir / "chap-secrets"
+        pap = workdir / "pap-secrets"
+        unit = workdir / "pppoe.service"
+        commands = []
+
+        def fake_run(command, timeout=8, env=None):
+            commands.append(command)
+            return ok()
+
+        config = self.config(
+            wan_mode="pppoe", pppoe_nic="eth0", pppoe_username="adsl123", pppoe_password="testpass"
+        )
+        with patch.object(networkd, "WAN_NETWORK_PATH", wan_path), patch.object(
+            networkd, "LAN_NETWORK_PATH", lan_path
+        ), patch.object(
+            networkd, "PPP_NETWORK_PATH", ppp_path
+        ), patch.object(
+            networkd, "PPPOE_PEER_PATH", peer
+        ), patch.object(
+            networkd, "PPPOE_CHAP_PATH", chap
+        ), patch.object(
+            networkd, "PPPOE_PAP_PATH", pap
+        ), patch.object(
+            networkd, "PPPOE_SERVICE_PATH", unit
+        ), patch.object(
+            networkd, "command_exists", return_value=True
+        ), patch.object(
+            networkd, "is_service_active", return_value=False
+        ), patch.object(
+            networkd, "is_service_enabled", return_value=False
+        ), patch.object(
+            networkd, "run_command", side_effect=fake_run
+        ):
+            result = networkd.apply_networkd(config)
+
+        self.assertTrue(result.ok, result.output)
+        self.assertTrue(lan_path.exists())
+        self.assertTrue(ppp_path.exists())
+        self.assertFalse(wan_path.exists())
+        self.assertIn('"adsl123"', chap.read_text(encoding="utf-8"))
+        self.assertEqual(chap.stat().st_mode & 0o777, 0o600)
+        flat = [" ".join(call) for call in commands]
+        self.assertTrue(any("enable systemd-networkd.service" in item for item in flat))
+        self.assertTrue(any("restart linux-router-pppoe.service" in item for item in flat))
+
+    def test_apply_dhcp_removes_ppp_files(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "networkd-dhcp"
+        workdir.mkdir(exist_ok=True)
+        wan_path = workdir / "10-wan.network"
+        lan_path = workdir / "20-lan.network"
+        ppp_path = workdir / "30-ppp.network"
+        ppp_path.write_text("[Match]\nName=ppp0\n", encoding="utf-8")
+
+        with patch.object(networkd, "WAN_NETWORK_PATH", wan_path), patch.object(
+            networkd, "LAN_NETWORK_PATH", lan_path
+        ), patch.object(
+            networkd, "PPP_NETWORK_PATH", ppp_path
+        ), patch.object(
+            networkd, "command_exists", return_value=True
+        ), patch.object(
+            networkd, "is_service_active", return_value=False
+        ), patch.object(
+            networkd, "is_service_enabled", return_value=False
+        ), patch.object(
+            networkd, "run_command", return_value=ok()
+        ):
+            result = networkd.apply_networkd(self.config())
+
+        self.assertTrue(result.ok, result.output)
+        self.assertTrue(wan_path.exists())
+        self.assertFalse(ppp_path.exists())
+        self.assertIn("DHCP=yes", wan_path.read_text(encoding="utf-8"))
+
+    def test_configured_methods_are_read_from_files(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "networkd-methods"
+        workdir.mkdir(exist_ok=True)
+        (workdir / "10-wan.network").write_text(
+            "[Match]\nName=eth0\n[Network]\nDHCP=yes\n", encoding="utf-8"
+        )
+        (workdir / "20-lan.network").write_text(
+            "[Match]\nName=eth1\n[Network]\nAddress=192.168.50.1/24\nIPv6SendRA=yes\n",
+            encoding="utf-8",
+        )
+        with patch.object(networkd, "NETWORKD_DIR", workdir):
+            methods = networkd.get_configured_methods()
+        self.assertEqual(methods["eth0"], ("auto", "auto"))
+        self.assertEqual(methods["eth1"], ("manual", "auto"))
+
+    def test_delegated_prefix_from_kernel(self):
+        payload = (
+            '[{"ifname":"eth1","addr_info":['
+            '{"family":"inet6","local":"2408:8207:6a1c:2f00::1","prefixlen":64},'
+            '{"family":"inet6","local":"fe80::1","prefixlen":64}]}]'
+        )
+        with patch.object(networkd, "run_command", return_value=ok(payload)):
+            self.assertEqual(
+                networkd.get_delegated_prefix("eth1"), "2408:8207:6a1c:2f00::/64"
+            )
+
+    def test_router_page_renders_wan_modes(self):
+        application.app.config["TESTING"] = True
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        status = {
+            "config": routing.load_router_config(),
+            "interfaces": [{"name": "eth1", "link_speed": "1 Gbps"}],
+            "wan_candidates": [{"name": "eth0", "state": "connected", "ipv4": ["192.168.9.7/24"]}],
+            "backend": {"service_active": True},
+            "wan": {}, "lan": {}, "ipv6": {}, "dhcp": {}, "firewall": {},
+            "forwarding": {}, "services": {}, "pd": {}, "errors": [],
+        }
+        with patch.object(web_routing, "query_agent", return_value=status):
+            body = client.get("/router").get_data(as_text=True)
+        self.assertIn('name="wan_mode"', body)
+        self.assertIn('name="pppoe_username"', body)
+        self.assertIn("PPPoE 账号", body)
 
 
 if __name__ == "__main__":

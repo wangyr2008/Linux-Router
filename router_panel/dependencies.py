@@ -30,13 +30,12 @@ from .core import (
 )
 from .firewall import apply_ruleset, get_firewall_status, render_nftables_ruleset
 from .network import gather_wired_network_info
-from .pd import PD_SERVICE_NAME, enable_pd, get_pd_status, install_pd_client
+from . import networkd
 from .routing import (
     IPV6_MODE_PD,
     build_dnsmasq_config,
     ensure_dnsmasq_include,
     ensure_forwarding,
-    ensure_lan_connection,
     lan_gateway_ipv4,
     lan_ipv6_address,
     lan_ipv6_network,
@@ -407,67 +406,79 @@ def install_missing_packages() -> CommandResult:
     return CommandResult(True, f"已安装: {', '.join(missing_packages)}{update_warning}")
 
 
+def install_package(package: str) -> CommandResult:
+    """Install one optional package (ppp, for example) on demand."""
+    if package_installed(package):
+        return CommandResult(True, f"{package} 已安装")
+
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    update = run_command(["apt-get", "update"], timeout=APT_TIMEOUT, env=env)
+    update_warning = "" if update.ok else "；apt-get update 有失败项，已忽略并继续"
+    install = run_command(
+        ["apt-get", "install", "-y", "--no-install-recommends", package],
+        timeout=APT_TIMEOUT,
+        env=env,
+    )
+    if not install.ok:
+        detail = install.output or f"安装 {package} 失败"
+        if not update.ok and update.output:
+            detail += f"（apt-get update：{update.output.splitlines()[0] if update.output else ''}）"
+        return CommandResult(False, detail)
+    return CommandResult(True, f"已安装 {package}{update_warning}")
+
+
 def get_dependency_rows() -> list[dict[str, Any]]:
     config = load_router_config()
     wired_info = gather_wired_network_info(config)
     wired_devices = wired_info.get("devices", [])
     unmanaged_wired = [device.get("device", "") for device in wired_devices if device.get("state") == "unmanaged"]
-    active_nm = is_service_active("NetworkManager")
-    enabled_nm = is_service_enabled("NetworkManager")
+    active_networkd = is_service_active(networkd.NETWORKD_SERVICE)
+    enabled_networkd = is_service_enabled(networkd.NETWORKD_SERVICE)
     active_panel = is_service_active("router-panel.service")
     enabled_panel = is_service_enabled("router-panel.service")
-    active_dhcpcd = is_service_active("dhcpcd.service")
     active_resolved = is_service_active("systemd-resolved.service")
     active_dnsmasq = is_service_active("dnsmasq.service")
     enabled_dnsmasq = is_service_enabled("dnsmasq.service")
-    nm_managed = get_networkmanager_managed_setting() == "true"
-    netplan = get_netplan_renderer_summary()
     forwarding = get_ip_forward_status()
     nat = get_router_nat_status()
     firewall = get_firewall_status()
     lan_configured = _lan_has_address(config)
     protected = str(config.get("firewall_mode", "")) == "protect"
     native_ipv6 = str(config.get("ipv6_mode", "")) in {IPV6_MODE_PD, "static"}
+    wan_mode = str(config.get("wan_mode", networkd.WAN_MODE_DHCP) or networkd.WAN_MODE_DHCP)
 
-    # Which stack actually owns each interface. ifupdown keeps a per-interface
-    # dhcpcd running (visible in /run/dhcpcd/<if>.pid) even when dhcpcd.service is
-    # inactive, so the service state alone says nothing.
+    # Anything from the previous stack that is still running will fight networkd.
     wan_name = str(config.get("wan_interface", "") or "")
     lan_name = str(config.get("lan_interface", "") or "")
     ifupdown_map = ifupdown_managed_interfaces()
     instances = dhcpcd_instances()
-    own_pd_active = is_service_active(PD_SERVICE_NAME)
-    per_interface = {name: pid for name, pid in instances.items() if name != "pid"}
-    stack_conflicts = {
-        name: pid for name, pid in per_interface.items() if name in {wan_name, lan_name}
-    }
-    dhcpcd_busy = bool(stack_conflicts) or (active_dhcpcd and not own_pd_active)
-    dhcpcd_details = [
-        (
-            f"{name}: PID {pid}，由 ifupdown 启动（{ifupdown_map[name]}）"
-            if name in ifupdown_map
-            else f"{name}: PID {pid}"
+    legacy_services = [
+        name
+        for name, active in (
+            ("NetworkManager.service", is_service_active("NetworkManager.service")),
+            ("dhcpcd.service", is_service_active("dhcpcd.service")),
         )
-        for name, pid in sorted(stack_conflicts.items())
+        if active
     ]
-    if active_dhcpcd and not own_pd_active:
-        dhcpcd_details.append("dhcpcd.service 正在运行，会与面板争用默认路由与 DNS")
-    wan_owner_ifupdown = wan_name in ifupdown_map
-    wan_owner_label = (
-        f"ifupdown（{ifupdown_map[wan_name]}）" if wan_owner_ifupdown else "NetworkManager"
+    legacy_ifupdown = sorted(
+        name for name in ifupdown_map if name in {wan_name, lan_name, str(config.get("pppoe_nic", ""))}
     )
-    wan_owner_details = []
-    if wan_owner_ifupdown:
-        wan_owner_details = [
-            f"/etc/network/interfaces: iface {wan_name} inet {ifupdown_map[wan_name]}",
-            "面板的「WAN 自动获取 IPv6」与 MTU 不会生效，PD 模式会被拒绝启动",
-            "移交步骤见 DEPLOYMENT.md「网络栈归属」",
-        ]
+    legacy_details = [f"服务仍在运行：{name}" for name in legacy_services]
+    legacy_details.extend(
+        f"/etc/network/interfaces 仍在配置 {name}（{ifupdown_map[name]}）" for name in legacy_ifupdown
+    )
+    legacy_details.extend(
+        f"{name}: dhcpcd PID {pid}" for name, pid in sorted(instances.items()) if name != "pid"
+    )
+    legacy_active = bool(legacy_services or legacy_ifupdown or instances)
+    wan_legacy = wan_name in ifupdown_map or (wan_name and wan_name in instances)
+    backend = networkd.get_networkd_status(config)
     package_details = {
         "python3-flask": "提供网页运行框架",
         "gunicorn": "运行网页服务",
-        "network-manager": "管理系统网络连接",
         "dnsmasq": "提供 LAN 的 DHCP / DNS / RA",
+        "systemd": "提供 systemd-networkd 网络后端",
         "nftables": "提供 NAT 与转发规则",
         "iproute2": "读取 IP 和路由",
         "udev": "读取硬件信息",
@@ -503,19 +514,19 @@ def get_dependency_rows() -> list[dict[str, Any]]:
         [
             {
                 "group": "服务状态",
-                "name": "NetworkManager",
-                "status": "无异常" if active_nm and enabled_nm else "有异常",
-                "level": "ok" if active_nm and enabled_nm else "error",
-                "detail": "管理系统网络连接",
-                "action": "repair_network_stack" if not (active_nm and enabled_nm) else "restart_networkmanager",
-                "action_label": "修复网络栈" if not (active_nm and enabled_nm) else "重启服务",
+                "name": "systemd-networkd",
+                "status": "无异常" if active_networkd and enabled_networkd else "有异常",
+                "level": "ok" if active_networkd and enabled_networkd else "error",
+                "detail": "管理系统网络连接（WAN / LAN / PPPoE）",
+                "action": "" if (active_networkd and enabled_networkd) else "switch_to_networkd",
+                "action_label": "启用 networkd",
             },
             {
                 "group": "服务状态",
                 "name": "dnsmasq.service",
                 "status": "无异常" if active_dnsmasq and enabled_dnsmasq else "有异常",
                 "level": "ok" if active_dnsmasq and enabled_dnsmasq else "error",
-                "detail": "为 LAN 提供 DHCP / DNS / RA",
+                "detail": "为 LAN 提供 DHCPv4 / DNS",
                 "action": "restart_dnsmasq" if not (active_dnsmasq and enabled_dnsmasq) else "",
                 "action_label": "启动服务",
             },
@@ -539,64 +550,38 @@ def get_dependency_rows() -> list[dict[str, Any]]:
             },
             {
                 "group": "网络接管",
-                "name": "NetworkManager ifupdown.managed",
-                "status": "已启用" if nm_managed else "未启用",
-                "level": "ok" if nm_managed else "error",
-                "detail": "接管传统网络接口",
-                "action": "fix_nm_managed" if not nm_managed else "",
-                "action_label": "写入配置",
+                "name": "遗留网络栈",
+                "status": "有残留" if legacy_active else "无残留",
+                "level": "error" if legacy_active else "ok",
+                "detail": "NetworkManager / dhcpcd / ifupdown 不应再管理这些网卡",
+                "extra_details": legacy_details,
+                "action": "switch_to_networkd" if legacy_active else "",
+                "action_label": "切换到 networkd",
             },
             {
                 "group": "网络接管",
-                "name": "dhcpcd 重复管理",
-                "status": "有异常" if dhcpcd_busy else "无异常",
-                "level": "error" if dhcpcd_busy else "ok",
-                "detail": "避免重复管理网卡",
-                "extra_details": dhcpcd_details,
-                "action": "disable_dhcpcd" if dhcpcd_busy else "",
-                "action_label": "停止并禁用",
-            },
-            {
-                "group": "网络接管",
-                "name": "WAN 接口归属",
-                "status": wan_owner_label,
-                "level": "warning" if wan_owner_ifupdown else "ok",
+                "name": "WAN 接管情况",
+                "status": "未接管" if wan_legacy else "已接管",
+                "level": "warning" if wan_legacy else "ok",
                 "detail": (
-                    f"{wan_name} 由 ifupdown 管理，面板对 WAN 的 IPv6 / MTU 设置不会生效"
-                    if wan_owner_ifupdown
-                    else "WAN 由 NetworkManager 管理，面板设置可以生效"
+                    f"{wan_name} 仍由旧网络栈管理，面板对 WAN 的设置不会生效"
+                    if wan_legacy
+                    else f"WAN {wan_name} 由 systemd-networkd 管理"
                 ),
-                "extra_details": wan_owner_details,
+                "extra_details": (
+                    [f"iface {wan_name} inet {ifupdown_map[wan_name]}"] if wan_legacy else []
+                ),
                 "action": "",
                 "action_label": "",
             },
             {
                 "group": "网络接管",
-                "name": "systemd-resolved 端口冲突",
-                "status": "有异常" if active_resolved else "无异常",
-                "level": "warning" if active_resolved else "ok",
-                "detail": "resolved 与 dnsmasq 会争用 53 端口",
-                "action": "",
-                "action_label": "",
-            },
-            {
-                "group": "网络接管",
-                "name": "netplan renderer",
-                "status": "无异常" if netplan["ok"] else "需处理",
-                "level": netplan["level"],
-                "detail": "统一网络配置后端",
-                "extra_details": [f"{item['path']}: {item['renderer']}" for item in netplan["details"]],
-                "action": "repair_network_stack" if not netplan["ok"] else "",
-                "action_label": "修复网络栈",
-            },
-            {
-                "group": "网络接管",
-                "name": "有线网卡由 NetworkManager 管理",
-                "status": "无异常" if wired_devices and not unmanaged_wired else ("未检测到有线网卡" if not wired_devices else "有异常"),
-                "level": "ok" if wired_devices and not unmanaged_wired else ("warning" if not wired_devices else "error"),
-                "detail": "管理有线网络接口",
-                "action": "repair_network_stack" if unmanaged_wired else "",
-                "action_label": "修复网络栈",
+                "name": "systemd-resolved",
+                "status": "无异常" if active_resolved else "未运行",
+                "level": "ok" if active_resolved else "warning",
+                "detail": "为 WAN 侧提供 DNS；dnsmasq 只绑定 LAN 地址，不会争用 53 端口",
+                "action": "enable_resolved" if not active_resolved else "",
+                "action_label": "启用服务",
             },
             {
                 "group": "路由转发",
@@ -654,43 +639,46 @@ def get_dependency_rows() -> list[dict[str, Any]]:
             },
         ]
     )
+    if wan_mode == networkd.WAN_MODE_PPPOE:
+        rows.extend(
+            [
+                {
+                    "group": "PPPoE 拨号",
+                    "name": "pppd（PPPoE 客户端）",
+                    "status": "已安装" if backend["ppp_installed"] else "未安装",
+                    "level": "ok" if backend["ppp_installed"] else "error",
+                    "detail": "systemd-networkd 不会拨号，PPPoE 由 pppd 建立会话",
+                    "action": "" if backend["ppp_installed"] else "install_ppp",
+                    "action_label": "安装 ppp",
+                },
+                {
+                    "group": "PPPoE 拨号",
+                    "name": "linux-router-pppoe.service",
+                    "status": "无异常" if backend["pppoe_service_active"] else "未运行",
+                    "level": "ok" if backend["pppoe_service_active"] else "error",
+                    "detail": "在物理网口上建立 PPPoE 会话并拿到 ppp0",
+                    "action": "" if backend["pppoe_service_active"] else "restart_pppoe",
+                    "action_label": "重新拨号",
+                },
+            ]
+        )
+
     if config.get("ipv6_mode") == IPV6_MODE_PD:
-        pd_status = get_pd_status()
         pd_details = []
-        if pd_status["delegated"]:
-            pd_details.append(f"运营商委派：{pd_status['delegated']}")
-        if pd_status["prefix"]:
-            pd_details.append(f"LAN /64：{pd_status['prefix']}")
-        if pd_status["updated_at"]:
-            pd_details.append(f"更新于 {pd_status['updated_at']}")
-        if pd_status.get("error"):
-            pd_details.append(f"同步异常：{pd_status['error']}")
+        if backend["delegated"]:
+            pd_details.append(f"LAN 上的公网前缀：{backend['delegated']}")
+        if backend["wan_link"]:
+            addresses = backend["wan_link"].get("ipv6") or []
+            if addresses:
+                pd_details.append(f"WAN IPv6：{', '.join(addresses[:2])}")
         rows.extend(
             [
                 {
                     "group": "IPv6 前缀委派",
-                    "name": "dhcpcd（PD 客户端）",
-                    "status": "已安装" if pd_status["available"] else "未安装",
-                    "level": "ok" if pd_status["available"] else "error",
-                    "detail": "通过 ia_pd 向运营商申请 IPv6 前缀",
-                    "action": "" if pd_status["available"] else "install_pd_client",
-                    "action_label": "安装 PD 客户端",
-                },
-                {
-                    "group": "IPv6 前缀委派",
-                    "name": "linux-router-pd.service",
-                    "status": "无异常" if pd_status["service_active"] else "未运行",
-                    "level": "ok" if pd_status["service_active"] else "error",
-                    "detail": "在 WAN 上请求前缀并分配给 LAN",
-                    "action": "" if pd_status["service_active"] else "restart_pd",
-                    "action_label": "重启 PD 客户端",
-                },
-                {
-                    "group": "IPv6 前缀委派",
-                    "name": "已委派前缀",
-                    "status": "已下发" if pd_status["prefix"] else "等待下发",
-                    "level": "ok" if pd_status["prefix"] else "warning",
-                    "detail": "PD 前缀会随运营商续租自动跟随",
+                    "name": "DHCPPrefixDelegation",
+                    "status": "已下发" if backend["delegated"] else "等待下发",
+                    "level": "ok" if backend["delegated"] else "warning",
+                    "detail": "由 systemd-networkd 请求前缀并在 LAN 上通告，无需额外守护进程",
                     "extra_details": pd_details,
                     "action": "",
                     "action_label": "",
@@ -763,26 +751,25 @@ def _run_dependency_action(action: str) -> CommandResult:
         return CommandResult(True, "已写入 managed=true 并重启 NetworkManager")
     if action == "apply_netplan":
         return apply_netplan()
-    if action == "restart_networkmanager":
-        return restart_service("NetworkManager")
     if action == "enable_router_panel_service":
         return enable_service("router-panel.service")
     if action == "disable_dhcpcd":
         return disable_service("dhcpcd.service")
     if action == "fix_forwarding":
         return ensure_forwarding()
-    if action == "install_pd_client":
-        result = install_pd_client()
-        if not result.ok:
-            return result
+    if action == "install_ppp":
+        return install_package("ppp")
+    if action == "restart_pppoe":
+        return restart_service(networkd.PPPOE_SERVICE_NAME)
+    if action == "switch_to_networkd":
         config = load_router_config()
-        if config.get("ipv6_mode") == IPV6_MODE_PD:
-            started = enable_pd(config)
-            if not started.ok:
-                return CommandResult(True, f"{result.output}，但启动 PD 客户端失败：{started.output}")
-        return result
-    if action == "restart_pd":
-        return restart_service(PD_SERVICE_NAME)
+        if not config.get("wan_interface") or not config.get("lan_interface"):
+            return CommandResult(False, "请先在「路由」页面选择 WAN 和 LAN 接口")
+        enable_service(networkd.NETWORKD_SERVICE)
+        return networkd.apply_networkd(config)
+    if action == "enable_resolved":
+        enable_service("systemd-resolved.service")
+        return restart_service("systemd-resolved.service")
     if action == "apply_firewall":
         config = load_router_config()
         if not config.get("wan_interface") or not config.get("lan_interface"):

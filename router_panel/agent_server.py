@@ -48,6 +48,10 @@ ProgressCallback = Callable[[str], None]
 ROUTER_CONFIG_FIELDS = (
     "wan_interface",
     "lan_interface",
+    "wan_mode",
+    "pppoe_username",
+    "pppoe_password",
+    "pppoe_nic",
     "lan_network",
     "dhcp_enabled",
     "dhcp_start",

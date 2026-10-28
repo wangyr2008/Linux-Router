@@ -195,25 +195,51 @@
     >
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
-      {% if status.wan_owner and status.wan_owner.managed_by == 'ifupdown' %}
+      {% if status.backend and not status.backend.service_active %}
       <p class="alert compact">
-        WAN 接口 {{ status.wan_owner.interface }} 由 ifupdown 管理（
-        <code>iface {{ status.wan_owner.interface }} inet {{ status.wan_owner.method }}</code>{% if status.wan_owner.dhcpcd_pid %}，dhcpcd PID {{ status.wan_owner.dhcpcd_pid }}{% endif %}），
-        NetworkManager 并没有接管它。这里的「WAN 自动获取 IPv6」和 MTU 不会生效，PD 模式也会被拒绝启动。
-        先把该网口移交 NetworkManager 再回来配置，步骤见 DEPLOYMENT.md「网络栈归属」。
+        systemd-networkd 没有运行，WAN/LAN 配置不会生效。到「依赖」页点「启用 networkd」，或应用一次配置。
       </p>
       {% endif %}
 
       <div class="form-grid">
         <label class="field">
-          <span class="field-label">WAN 上行接口</span>
-          <select name="wan_interface" required>
+          <span class="field-label">WAN 连接方式</span>
+          <select name="wan_mode" data-wan-mode>
+            {% for value, label in wan_modes.items() %}
+            <option value="{{ value }}" {{ 'selected' if value == config.wan_mode else '' }}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <span class="field-hint">光猫桥接用 PPPoE；光猫拨号或上级路由用 DHCP</span>
+        </label>
+        <label class="field" data-wan-field="dhcp">
+          <span class="field-label">WAN 上行网口</span>
+          <select name="wan_interface">
             <option value="">请选择</option>
             {% for item in status.wan_candidates %}
             <option value="{{ item.name }}" {{ 'selected' if item.name == config.wan_interface else '' }}>{{ item.name }}{% if item.default_route %} · 当前默认路由{% endif %}{% if item.ipv4 %} · {{ item.ipv4[0] }}{% endif %}</option>
             {% endfor %}
           </select>
-          <span class="field-hint">PPPoE 拨号选 ppp0，DHCP 上网选接光猫的网口</span>
+          <span class="field-hint">接光猫或上级路由的网口</span>
+        </label>
+        <label class="field" data-wan-field="pppoe">
+          <span class="field-label">PPPoE 物理网口</span>
+          <select name="pppoe_nic">
+            <option value="">请选择</option>
+            {% for item in status.interfaces %}
+            <option value="{{ item.name }}" {{ 'selected' if item.name == config.pppoe_nic else '' }}>{{ item.name }}（{{ item.link_speed or '未知' }}）</option>
+            {% endfor %}
+          </select>
+          <span class="field-hint">连接桥接光猫的网口，pppd 在这块网卡上建立会话</span>
+        </label>
+        <label class="field" data-wan-field="pppoe">
+          <span class="field-label">PPPoE 账号</span>
+          <input type="text" class="mono-value" name="pppoe_username" value="{{ config.pppoe_username }}" placeholder="宽带账号">
+          <span class="field-hint">运营商给的拨号账号</span>
+        </label>
+        <label class="field" data-wan-field="pppoe">
+          <span class="field-label">PPPoE 密码</span>
+          <input type="password" class="mono-value" name="pppoe_password" value="{{ config.pppoe_password }}" placeholder="宽带密码">
+          <span class="field-hint">写入 /etc/ppp/chap-secrets（权限 600）</span>
         </label>
         <label class="field">
           <span class="field-label">LAN 局域网接口</span>

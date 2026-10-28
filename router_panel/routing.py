@@ -14,7 +14,6 @@ from .core import (
     DNSMASQ_CONF_DIR,
     DNSMASQ_LEASE_PATH,
     DNSMASQ_RULESET_PATH,
-    LAN_CONNECTION_NAME,
     LEGACY_NETWORK_CONFIG_PATH,
     ROUTER_CONFIG_PATH,
     ROUTER_PANEL_SYSCTL_PATH,
@@ -22,8 +21,6 @@ from .core import (
     CommandResult,
     atomic_write_text,
     command_exists,
-    dhcpcd_instances,
-    ifupdown_managed_interfaces,
     is_service_active,
     is_service_enabled,
     load_os_release,
@@ -49,7 +46,7 @@ from .network import (
     list_all_interfaces,
 )
 from .network_parsers import parse_dnsmasq_leases
-from . import pd as pd_client
+from . import networkd
 
 ProgressCallback = Callable[[str], None]
 
@@ -70,6 +67,10 @@ IPV6_MODE_LABELS = {
 DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "wan_interface": "",
     "lan_interface": "",
+    "wan_mode": networkd.WAN_MODE_DHCP,
+    "pppoe_username": "",
+    "pppoe_password": "",
+    "pppoe_nic": "",
     "lan_network": DEFAULT_LAN_NETWORK,
     "dhcp_enabled": True,
     "dhcp_start": "",
@@ -220,16 +221,37 @@ def normalize_router_config(
 
     config: dict[str, Any] = dict(base)
 
+    wan_mode = get("wan_mode").lower() or networkd.WAN_MODE_DHCP
+    if wan_mode not in networkd.WAN_MODES:
+        return config, "WAN 连接方式无效"
+
     wan = get("wan_interface")
     lan = get("lan_interface")
-    if wan and not IFNAME_RE.fullmatch(wan):
-        return config, f"WAN 接口名称无效：{wan}"
+    pppoe_nic = get("pppoe_nic")
+    pppoe_username = get("pppoe_username")
+    pppoe_password = get("pppoe_password")
+
+    if wan_mode == networkd.WAN_MODE_PPPOE:
+        if not pppoe_username:
+            return config, "PPPoE 账号不能为空"
+        if not pppoe_nic or not IFNAME_RE.fullmatch(pppoe_nic):
+            return config, "请选择 PPPoE 拨号所用的物理网口"
+        if available_interfaces and pppoe_nic not in available_interfaces:
+            return config, f"PPPoE 物理网口 {pppoe_nic} 不存在或不是有线网卡"
+        if pppoe_nic == lan:
+            return config, "PPPoE 物理网口不能和 LAN 是同一块网卡"
+        wan = networkd.PPPOE_INTERFACE
+    else:
+        pppoe_nic = ""
+        if wan and not IFNAME_RE.fullmatch(wan):
+            return config, f"WAN 接口名称无效：{wan}"
+        if available_wan_interfaces and wan and wan not in available_wan_interfaces:
+            return config, f"WAN 接口 {wan} 不存在"
+
     if lan and not IFNAME_RE.fullmatch(lan):
         return config, f"LAN 接口名称无效：{lan}"
     if wan and wan == lan:
         return config, "WAN 和 LAN 不能是同一块网卡"
-    if available_wan_interfaces and wan and wan not in available_wan_interfaces:
-        return config, f"WAN 接口 {wan} 不存在"
     if available_interfaces and lan and lan not in available_interfaces:
         return config, f"LAN 接口 {lan} 不存在或不是有线网卡"
 
@@ -288,6 +310,10 @@ def normalize_router_config(
         {
             "wan_interface": wan,
             "lan_interface": lan,
+            "wan_mode": wan_mode,
+            "pppoe_username": pppoe_username,
+            "pppoe_password": pppoe_password,
+            "pppoe_nic": pppoe_nic,
             "lan_network": str(network),
             "dhcp_enabled": _as_bool(payload.get("dhcp_enabled", base.get("dhcp_enabled", True)), True),
             "dhcp_start": get("dhcp_start"),
@@ -375,10 +401,14 @@ def save_router_config(config: dict[str, Any]) -> None:
 
 
 def build_dnsmasq_config(config: dict[str, Any]) -> str:
+    """dnsmasq serves DHCPv4 and DNS; systemd-networkd owns IPv6 and RAs.
+
+    DNS is bound to the LAN addresses only (``bind-interfaces``) so it never takes
+    the wildcard port and cannot shadow systemd-resolved's stub on 127.0.0.53.
+    """
     lan = str(config.get("lan_interface", "") or "")
     network = _lan_ipv4_network(config)
     gateway = str(lan_gateway_ipv4(config))
-    ipv6_network = lan_ipv6_network(config)
     ipv6_address = lan_ipv6_address(config)
     start, end = _dhcp_range(config)
 
@@ -393,7 +423,7 @@ def build_dnsmasq_config(config: dict[str, Any]) -> str:
         lines.extend(["# LAN 接口尚未配置，暂只在回环上提供 DNS", "interface=lo"])
     lines.extend(
         [
-            "bind-dynamic",
+            "bind-interfaces",
             "domain-needed",
             "bogus-priv",
             "dhcp-authoritative",
@@ -401,12 +431,21 @@ def build_dnsmasq_config(config: dict[str, Any]) -> str:
             "cache-size=1000",
         ]
     )
+    if lan:
+        lines.append(f"listen-address={gateway}")
+        # systemd-networkd assigns fe80::1 to the LAN and advertises it via RDNSS.
+        lines.append("listen-address=fe80::1")
+        if ipv6_address is not None:
+            lines.append(f"listen-address={ipv6_address}")
 
     if config.get("dns_upstream"):
         lines.append("# 上游 DNS 只使用下面这几条（不再叠加 /etc/resolv.conf）")
         lines.append("no-resolv")
         for server in str(config["dns_upstream"]).split():
             lines.append(f"server={server}")
+    else:
+        lines.append("# 上游 DNS 来自 systemd-resolved 的存根（WAN 侧 DHCP 下发）")
+        lines.append("server=127.0.0.53")
 
     if config.get("dhcp_enabled"):
         lines.extend(
@@ -414,16 +453,6 @@ def build_dnsmasq_config(config: dict[str, Any]) -> str:
                 f"dhcp-range={start},{end},{network.netmask},{config.get('dhcp_lease', '12h')}",
                 f"dhcp-option=option:router,{gateway}",
                 f"dhcp-option=option:dns-server,{gateway}",
-            ]
-        )
-
-    if ipv6_network is not None and ipv6_address is not None:
-        lines.extend(
-            [
-                "# IPv6：SLAAC 下发前缀，DHCPv6 只下发 DNS 等附加信息",
-                "enable-ra",
-                f"dhcp-range={ipv6_network.network_address},ra-stateless",
-                f"dhcp-option=option6:dns-server,[{ipv6_address}]",
             ]
         )
 
@@ -469,115 +498,9 @@ def ensure_dnsmasq_include() -> CommandResult:
 # ---------------------------------------------------------------------------
 
 
-def ensure_lan_connection(config: dict[str, Any]) -> CommandResult:
-    """Point the LAN NIC at a fixed gateway address through NetworkManager.
-
-    ``never-default`` keeps the LAN from competing with the WAN default route.
-    """
-    lan = str(config.get("lan_interface", "") or "")
-    if not lan:
-        return CommandResult(False, "尚未选择 LAN 接口")
-
-    network = _lan_ipv4_network(config)
-    gateway = lan_gateway_ipv4(config)
-    ipv6_network = lan_ipv6_network(config)
-    ipv6_address = lan_ipv6_address(config)
-
-    exists = run_command(
-        ["nmcli", "-t", "-f", "NAME", "connection", "show"], timeout=10
-    )
-    names = {line.strip() for line in (exists.output or "").splitlines()}
-    create = LAN_CONNECTION_NAME not in names
-
-    if create:
-        command = [
-            "nmcli", "connection", "add", "type", "ethernet",
-            "ifname", lan, "con-name", LAN_CONNECTION_NAME,
-        ]
-    else:
-        command = ["nmcli", "connection", "modify", LAN_CONNECTION_NAME]
-    command.extend(["connection.interface-name", lan])
-    command.extend(
-        [
-            "connection.autoconnect", "yes",
-            "connection.autoconnect-priority", "50",
-            "ipv4.method", "manual",
-            "ipv4.addresses", f"{gateway}/{network.prefixlen}",
-            "ipv4.gateway", "",
-            "ipv4.never-default", "yes",
-            "ipv4.dns", "",
-            "ipv4.ignore-auto-dns", "yes",
-        ]
-    )
-    if config.get("ipv6_mode") == IPV6_MODE_PD:
-        # dhcpcd owns the delegated address on this interface; NM must keep its
-        # hands off IPv6 or it would flush the prefix on every reactivation.
-        command.extend(["ipv6.method", "ignore"])
-    elif ipv6_network is not None and ipv6_address is not None:
-        command.extend(
-            [
-                "ipv6.method", "manual",
-                "ipv6.addresses", f"{ipv6_address}/{ipv6_network.prefixlen}",
-                "ipv6.gateway", "",
-                "ipv6.never-default", "yes",
-                "ipv6.ip6-privacy", "0",
-            ]
-        )
-    else:
-        command.extend(["ipv6.method", "disabled"])
-    if config.get("mtu"):
-        command.extend(["802-3-ethernet.mtu", str(config["mtu"])])
-
-    result = run_command(command, timeout=30)
-    if not result.ok:
-        return CommandResult(False, f"写入 LAN 连接配置失败：{result.output or '未知错误'}")
-
-    up = run_command(
-        ["nmcli", "connection", "up", LAN_CONNECTION_NAME, "ifname", lan], timeout=40
-    )
-    if not up.ok:
-        return CommandResult(False, f"启用 LAN 连接失败：{up.output or '未知错误'}")
-    return CommandResult(True, f"LAN {lan} 已配置为 {gateway}/{network.prefixlen}")
-
-
-def ensure_wan_ipv6(config: dict[str, Any]) -> CommandResult:
-    """Turn on SLAAC/DHCPv6 for the WAN profile so the uplink is dual stack."""
-    wan = str(config.get("wan_interface", "") or "")
-    if not wan or not config.get("wan_ipv6_auto"):
-        return CommandResult(True, "跳过 WAN IPv6 设置")
-
-    # A NIC still listed in /etc/network/interfaces is owned by ifupdown: with
-    # `[ifupdown] managed=false` NetworkManager leaves it alone, so an nmcli
-    # modify would either fail or be thrown away on the next ifup.
-    ifupdown_wan = ifupdown_managed_interfaces().get(wan, "")
-    if ifupdown_wan:
-        return CommandResult(
-            False,
-            (
-                f"WAN {wan} 由 ifupdown 管理（`iface {wan} inet {ifupdown_wan}`），"
-                f"NetworkManager 无法修改它的 IPv6 设置。"
-                f"要自动获取 IPv6，请先把该网口交给 NetworkManager（见 DEPLOYMENT.md「网络栈归属」）"
-            ),
-        )
-
-    devices = gather_wired_network_info(config).get("devices", [])
-    profile = next((item for item in devices if item.get("device") == wan), {})
-    connection_name = str(profile.get("connection", "") or "")
-    if not connection_name:
-        return CommandResult(True, f"WAN {wan} 暂无连接配置，IPv6 设置留待系统自行处理")
-
-    methods = str(profile.get("profile", {}).get("ipv6_method", ""))
-    if methods in {"auto", "dhcp"}:
-        return CommandResult(True, f"WAN {wan} 已启用自动 IPv6")
-
-    result = run_command(
-        ["nmcli", "connection", "modify", connection_name, "ipv6.method", "auto"],
-        timeout=20,
-    )
-    if not result.ok:
-        return CommandResult(False, f"WAN 启用 IPv6 失败：{result.output or '未知错误'}")
-    run_command(["nmcli", "connection", "up", connection_name], timeout=40)
-    return CommandResult(True, f"已为 WAN {wan} 启用自动 IPv6")
+def ensure_network_backend(config: dict[str, Any]) -> CommandResult:
+    """Write the systemd-networkd configuration and bring the links up."""
+    return networkd.apply_networkd(config)
 
 
 def ensure_forwarding() -> CommandResult:
@@ -628,10 +551,10 @@ def apply_router_config(
     if not tested.ok:
         return CommandResult(False, f"dnsmasq 配置校验失败：{tested.output or '未知错误'}")
 
-    report("配置 LAN 接口地址")
-    lan_result = ensure_lan_connection(config)
-    if not lan_result.ok:
-        return lan_result
+    report("写入 systemd-networkd 配置")
+    backend_result = ensure_network_backend(config)
+    if not backend_result.ok:
+        return backend_result
 
     report("写入 nftables 规则")
     firewall_result = apply_ruleset(render_nftables_ruleset(config))
@@ -643,30 +566,13 @@ def apply_router_config(
     if not forward_result.ok:
         return forward_result
 
-    # Persist first: the PD hook re-reads the config to know the LAN interface.
     save_router_config(config)
-
-    pd_result = CommandResult(True, "")
-    if config.get("ipv6_mode") == IPV6_MODE_PD:
-        report("启动 PD 客户端")
-        pd_result = pd_client.enable_pd(config)
-        if not pd_result.ok:
-            return pd_result
-    else:
-        pd_client.disable_pd()
 
     report("启动 dnsmasq")
     run_command(["systemctl", "enable", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
     restarted = run_command(["systemctl", "restart", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
     if not restarted.ok:
         return CommandResult(False, f"启动 dnsmasq 失败：{restarted.output or '未知错误'}")
-
-    report("检查 WAN IPv6")
-    wan_ipv6 = ensure_wan_ipv6(config)
-
-    if config.get("ipv6_mode") == IPV6_MODE_PD:
-        report("等待运营商下发前缀")
-        pd_client.sync_from_system(reason="apply")
 
     report("应用 CAKE 限速")
     cake_result = apply_cake(config)
@@ -675,11 +581,13 @@ def apply_router_config(
         f"路由配置已生效：WAN {config['wan_interface']} → LAN {config['lan_interface']}"
         f"（{lan_gateway_ipv4(config)}/{_lan_ipv4_network(config).prefixlen}）"
     )
+    if config.get("wan_mode") == networkd.WAN_MODE_PPPOE:
+        message += f"；PPPoE 已拨号（{config.get('pppoe_nic', '')}）"
     if config.get("ipv6_mode") == IPV6_MODE_PD:
-        prefix = pd_client.lan_prefix()
-        message += f"；PD 前缀 {prefix}" if prefix else "；PD 前缀尚未下发，面板会自动跟随"
-    if not wan_ipv6.ok:
-        message += f"；WAN IPv6 未启用：{wan_ipv6.output}"
+        prefix = networkd.get_delegated_prefix(str(config.get("lan_interface", "") or ""))
+        message += f"；PD 前缀 {prefix}" if prefix else "；PD 前缀尚未下发，networkd 会自动跟随"
+    if backend_result.output:
+        message += f"；{backend_result.output}"
     if not cake_result.ok:
         message += f"；CAKE 未应用：{cake_result.output}"
     elif cake_enabled(config):
@@ -802,15 +710,28 @@ def gather_router_status() -> dict[str, Any]:
 
     start, end = _dhcp_range(config)
     os_release = load_os_release()
-    pd_status = pd_client.get_pd_status() if config.get("ipv6_mode") == IPV6_MODE_PD else {}
     wan_name = str(config.get("wan_interface", "") or "")
-    ifupdown_map = ifupdown_managed_interfaces()
-    instances = dhcpcd_instances()
+    backend = networkd.get_networkd_status(config)
+    pd_status = {}
+    if config.get("ipv6_mode") == IPV6_MODE_PD:
+        pd_status = {
+            "available": backend["available"],
+            "service": backend["service"],
+            "service_active": backend["service_active"],
+            "service_enabled": backend["service_enabled"],
+            "prefix": backend["delegated"],
+            "delegated": backend["delegated"],
+            "wan": wan_name,
+            "lan": str(config.get("lan_interface", "") or ""),
+            "reason": "systemd-networkd DHCPPrefixDelegation",
+            "updated_at": "",
+            "error": "" if backend["delegated"] else "尚未收到委派前缀",
+        }
     wan_owner = {
         "interface": wan_name,
-        "managed_by": "ifupdown" if wan_name in ifupdown_map else "NetworkManager",
-        "method": ifupdown_map.get(wan_name, ""),
-        "dhcpcd_pid": instances.get(wan_name, 0),
+        "managed_by": "systemd-networkd",
+        "method": str(config.get("wan_mode", networkd.WAN_MODE_DHCP)),
+        "dhcpcd_pid": 0,
     }
 
     return {
@@ -830,6 +751,7 @@ def gather_router_status() -> dict[str, Any]:
             "wan_online": bool(wan_ipv6_global),
         },
         "pd": pd_status,
+        "backend": backend,
         "dhcp": {
             "enabled": bool(config.get("dhcp_enabled")),
             "start": start,
@@ -940,8 +862,7 @@ __all__ = [
     "dnsmasq_config_includes_our_file",
     "ensure_dnsmasq_include",
     "ensure_forwarding",
-    "ensure_lan_connection",
-    "ensure_wan_ipv6",
+    "ensure_network_backend",
     "gather_client_status",
     "gather_router_status",
     "generate_ula_prefix",

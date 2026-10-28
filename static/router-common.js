@@ -80,3 +80,18 @@
     });
   });
 })();
+
+// Show only the fields that belong to the selected WAN mode (DHCP vs PPPoE).
+(function () {
+  const selector = document.querySelector("[data-wan-mode]");
+  if (!selector) return;
+  const groups = document.querySelectorAll("[data-wan-field]");
+  const sync = () => {
+    const mode = selector.value;
+    groups.forEach((group) => {
+      group.hidden = group.dataset.wanField !== mode;
+    });
+  };
+  selector.addEventListener("change", sync);
+  sync();
+})();

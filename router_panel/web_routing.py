@@ -4,6 +4,7 @@ from flask import flash, redirect, render_template, request, url_for
 
 from .agent_client import AgentError, query_agent, submit_operation
 from .firewall import FIREWALL_MODE_LABELS
+from .networkd import WAN_MODE_LABELS
 from .routing import IPV6_MODE_LABELS, load_router_config
 
 
@@ -53,6 +54,7 @@ def register_routing_routes(app, login_required, is_async_request) -> None:
             config=status.get("config", {}),
             ipv6_modes=IPV6_MODE_LABELS,
             firewall_modes=FIREWALL_MODE_LABELS,
+            wan_modes=WAN_MODE_LABELS,
         )
 
     @app.route("/router/apply", methods=["POST"])
@@ -72,6 +74,10 @@ def register_routing_routes(app, login_required, is_async_request) -> None:
             "ipv6_nat": form_flag("ipv6_nat"),
             "wan_ipv6_auto": form_flag("wan_ipv6_auto"),
             "mtu": request.form.get("mtu", "").strip(),
+            "wan_mode": request.form.get("wan_mode", "").strip(),
+            "pppoe_username": request.form.get("pppoe_username", "").strip(),
+            "pppoe_password": request.form.get("pppoe_password", ""),
+            "pppoe_nic": request.form.get("pppoe_nic", "").strip(),
             "firewall_mode": request.form.get("firewall_mode", "").strip(),
             "firewall_lan_tcp": request.form.get("firewall_lan_tcp", "").strip(),
             "firewall_wan_tcp": request.form.get("firewall_wan_tcp", "").strip(),

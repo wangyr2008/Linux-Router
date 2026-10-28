@@ -1,101 +1,142 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
-from .core import (
-    get_network_interface_hardware,
-    normalize_mac_address,
-    read_text,
-    run_command,
-)
-from .network_parsers import (
-    normalize_nmcli_general_state,
-    parse_nmcli_lines,
-    translate_connection_type,
-    translate_device_state,
-)
+from .core import normalize_mac_address, read_text, run_command
+from .network_parsers import translate_connection_type, translate_device_state
+
+ETHERNET_TYPE = "802-3-ethernet"
+PPP_TYPE = "ppp"
+
+
+def link_type(ifname: str) -> str:
+    """Coarse device type without asking any network manager."""
+    if not ifname:
+        return ""
+    if ifname.startswith(("ppp", "tun", "tap", "wg")):
+        return PPP_TYPE if ifname.startswith("ppp") else ifname.rstrip("0123456789") or "tunnel"
+    if Path(f"/sys/class/net/{ifname}/device").exists():
+        return ETHERNET_TYPE
+    return "unknown"
+
+
+def _ip_json(*args: str) -> list[dict[str, Any]]:
+    result = run_command(["ip", "-j", *args], timeout=8)
+    if not result.ok or not result.output:
+        return []
+    try:
+        payload = json.loads(result.output)
+    except json.JSONDecodeError:
+        return []
+    return payload if isinstance(payload, list) else []
+
+
+def _addresses(interface: dict[str, Any]) -> tuple[list[str], list[str]]:
+    ipv4: list[str] = []
+    ipv6: list[str] = []
+    for address in interface.get("addr_info", []):
+        local = str(address.get("local", "") or "")
+        if not local or address.get("scope") == "host":
+            continue
+        prefixlen = address.get("prefixlen")
+        formatted = f"{local}/{prefixlen}" if prefixlen is not None else local
+        if address.get("family") == "inet":
+            ipv4.append(formatted)
+        elif address.get("family") == "inet6" and not local.lower().startswith("fe80:"):
+            ipv6.append(formatted)
+    return ipv4, ipv6
+
+
+def _operstate(interface: dict[str, Any]) -> str:
+    state = str(interface.get("operstate", "") or "").lower()
+    if state in {"up", "unknown"}:
+        return "connected"
+    return "disconnected"
 
 
 def get_active_connections() -> list[dict[str, str]]:
-    active_connections = run_command(
-        [
-            "nmcli",
-            "-t",
-            "-f",
-            "NAME,TYPE,DEVICE",
-            "connection",
-            "show",
-            "--active",
-        ]
-    )
-    active_items = (
-        parse_nmcli_lines(active_connections.output, ["name", "type", "device"])
-        if active_connections.ok and active_connections.output
-        else []
-    )
-    return [
-        {
-            **item,
-            "type_label": translate_connection_type(item.get("type", "")),
-        }
-        for item in active_items
-        if item.get("device") != "lo"
-    ]
+    """One entry per interface that currently has an address."""
+    items: list[dict[str, str]] = []
+    for interface in _ip_json("address", "show"):
+        ifname = str(interface.get("ifname", "") or "")
+        if not ifname or ifname == "lo":
+            continue
+        ipv4, ipv6 = _addresses(interface)
+        if not ipv4 and not ipv6:
+            continue
+        kind = link_type(ifname)
+        items.append(
+            {
+                "name": ifname,
+                "type": kind,
+                "device": ifname,
+                "type_label": translate_connection_type(kind),
+                "ipv4_addresses": ipv4,
+                "ipv6_addresses": ipv6,
+            }
+        )
+    return items
 
 
 def get_device_status_item(ifname: str) -> dict[str, str]:
     if not ifname:
         return {}
-
-    result = run_command(
-        [
-            "nmcli",
-            "-t",
-            "-f",
-            "DEVICE,TYPE,STATE,CONNECTION",
-            "device",
-            "status",
-        ]
-    )
-    if not result.ok or not result.output:
-        return {}
-
-    for item in parse_nmcli_lines(result.output, ["device", "type", "state", "connection"]):
-        if item.get("device") == ifname:
-            return item
+    for interface in _ip_json("address", "show", "dev", ifname):
+        kind = link_type(ifname)
+        state = _operstate(interface)
+        return {
+            "device": ifname,
+            "type": kind,
+            "state": state,
+            "connection": ifname if state == "connected" else "",
+        }
     return {}
 
 
 def get_filtered_device_status(allowed_types: set[str]) -> tuple[list[dict[str, str]], list[str]]:
-    result = run_command(
-        [
-            "nmcli",
-            "-t",
-            "-f",
-            "DEVICE,TYPE,STATE,CONNECTION",
-            "device",
-            "status",
-        ]
-    )
-    if not result.ok or not result.output:
-        return [], [result.output or "无法读取网络状态"]
-
     devices: list[dict[str, str]] = []
-    for item in parse_nmcli_lines(result.output, ["device", "type", "state", "connection"]):
-        device_type = item.get("type", "").strip()
-        device_name = item.get("device", "").strip()
-        if device_type not in allowed_types:
+    for interface in _ip_json("address", "show"):
+        ifname = str(interface.get("ifname", "") or "")
+        if not ifname or ifname == "lo":
             continue
-        if not device_name or device_name == "lo" or device_name.startswith("p2p-dev-"):
+        kind = link_type(ifname)
+        if allowed_types and kind not in allowed_types:
             continue
-        devices.append(item)
+        state = _operstate(interface)
+        devices.append(
+            {
+                "device": ifname,
+                "type": kind,
+                "state": state,
+                "connection": ifname if state == "connected" else "",
+            }
+        )
     return devices, []
 
 
+def get_default_route_devs() -> dict[str, str]:
+    """Interface holding the IPv4 / IPv6 default route (ppp0 for PPPoE uplinks)."""
+    devs: dict[str, str] = {}
+    for family in ("-4", "-6"):
+        result = run_command(["ip", family, "route", "show", "default"], timeout=5)
+        if not result.ok or not result.output:
+            continue
+        for line in result.output.splitlines():
+            parts = line.split()
+            for index, part in enumerate(parts):
+                if part == "dev" and index + 1 < len(parts):
+                    devs[family] = parts[index + 1].strip()
+                    break
+            if family in devs:
+                break
+    return devs
+
+
 def get_device_details(ifname: str) -> dict[str, Any]:
-    """Read layer-3 details of one interface, including both address families."""
-    empty: dict[str, Any] = {
+    """Layer-3 details of one interface, including both address families."""
+    details: dict[str, Any] = {
         "mac": "",
         "ipv4": [],
         "ipv6": [],
@@ -104,82 +145,46 @@ def get_device_details(ifname: str) -> dict[str, Any]:
         "dns": [],
     }
     if not ifname:
-        return empty
-
-    result = run_command(
-        [
-            "nmcli",
-            "-t",
-            "-f",
-            "GENERAL.HWADDR,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS,IP6.ADDRESS,IP6.GATEWAY,IP6.DNS",
-            "device",
-            "show",
-            ifname,
-        ]
-    )
-    details = dict(empty)
-    details["ipv4"] = []
-    details["ipv6"] = []
-    details["dns"] = []
-    if not result.ok or not result.output:
         return details
 
-    for line in result.output.splitlines():
-        if ":" not in line:
+    for interface in _ip_json("address", "show", "dev", ifname):
+        details["mac"] = str(interface.get("address", "") or "")
+        details["ipv4"], details["ipv6"] = _addresses(interface)
+
+    for family, key in (("-4", "gateway"), ("-6", "gateway6")):
+        result = run_command(["ip", family, "route", "show", "default", "dev", ifname], timeout=5)
+        if not result.ok or not result.output:
             continue
-        key, value = line.split(":", 1)
-        value = value.strip()
-        if not value or value == "--":
-            continue
-        if key == "GENERAL.HWADDR":
-            details["mac"] = value
-        elif key.startswith("IP4.ADDRESS"):
-            details["ipv4"].append(value)
-        elif key == "IP4.GATEWAY":
-            details["gateway"] = value
-        elif key.startswith("IP4.DNS"):
-            if value not in details["dns"]:
-                details["dns"].append(value)
-        elif key.startswith("IP6.ADDRESS"):
-            # Skip IPv6 link-local addresses, they are noise in the UI.
-            if value.lower().startswith("fe80:"):
-                continue
-            details["ipv6"].append(value)
-        elif key == "IP6.GATEWAY":
-            details["gateway6"] = value
-        elif key.startswith("IP6.DNS"):
-            if value not in details["dns"]:
-                details["dns"].append(value)
+        for line in result.output.splitlines():
+            parts = line.split()
+            if "via" in parts:
+                index = parts.index("via")
+                if index + 1 < len(parts):
+                    details[key] = parts[index + 1]
+                    break
+
+    details["dns"] = get_dns_servers()
     return details
 
 
-def get_interface_addresses(ifname: str) -> dict[str, list[str]]:
-    """Addresses straight from the kernel, so the UI still works when NetworkManager
-    is not managing the interface (for example a LAN interface configured by hand)."""
-    result = run_command(["ip", "-j", "address", "show", "dev", ifname], timeout=5)
-    addresses: dict[str, list[str]] = {"ipv4": [], "ipv6": []}
-    if not result.ok or not result.output:
-        return addresses
-
+def get_dns_servers() -> list[str]:
+    servers: list[str] = []
     try:
-        interfaces = json.loads(result.output)
-    except json.JSONDecodeError:
-        return addresses
+        content = Path("/etc/resolv.conf").read_text(encoding="utf-8")
+    except OSError:
+        return servers
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "nameserver" and parts[1] not in servers:
+            servers.append(parts[1])
+    return servers
 
-    for interface in interfaces:
-        for address in interface.get("addr_info", []):
-            local = str(address.get("local", "")).strip()
-            family = address.get("family", "")
-            if not local or address.get("scope") == "host":
-                continue
-            prefixlen = address.get("prefixlen")
-            formatted = f"{local}/{prefixlen}" if prefixlen is not None else local
-            if family == "inet":
-                addresses["ipv4"].append(formatted)
-            elif family == "inet6":
-                if local.lower().startswith("fe80:"):
-                    continue
-                addresses["ipv6"].append(formatted)
+
+def get_interface_addresses(ifname: str) -> dict[str, list[str]]:
+    """Addresses straight from the kernel, so the UI works with any backend."""
+    addresses: dict[str, list[str]] = {"ipv4": [], "ipv6": []}
+    for interface in _ip_json("address", "show", "dev", ifname):
+        addresses["ipv4"], addresses["ipv6"] = _addresses(interface)
     return addresses
 
 
@@ -195,7 +200,6 @@ def get_interface_neighbors(ifname: str) -> list[dict[str, str]]:
             if not parts or "lladdr" not in parts:
                 continue
             if family == "ipv6" and parts[0].lower().startswith("fe80:"):
-                # Link-local neighbours are noise in the device list.
                 continue
             try:
                 mac_index = parts.index("lladdr") + 1
@@ -221,15 +225,15 @@ def get_interface_neighbors(ifname: str) -> list[dict[str, str]]:
 
 def default_wired_profile(ifname: str) -> dict[str, Any]:
     return {
-        "name": "",
+        "name": ifname,
         "active_device": ifname,
         "interface_name": ifname,
         "autoconnect": True,
-        "ipv4_method": "auto",
+        "ipv4_method": "",
         "ipv4_address": "",
         "ipv4_gateway": "",
         "ipv4_dns": "",
-        "ipv6_method": "auto",
+        "ipv6_method": "",
         "ipv6_address": "",
         "route_metric": "-1",
     }
@@ -266,7 +270,7 @@ def get_wired_sysfs_speed(ifname: str) -> str:
 
 
 def normalize_wired_state(state: str, carrier: str) -> str:
-    if state == "unavailable" and carrier == "0":
+    if state == "connected" and carrier == "0":
         return "disconnected"
     return state
 
@@ -300,19 +304,10 @@ def translate_ipv6_method(value: str) -> str:
 
 
 def get_all_connection_methods() -> dict[str, tuple[str, str]]:
-    """One nmcli call for every profile, so page loads stay fast on multi-NIC hosts."""
-    result = run_command(
-        ["nmcli", "-t", "-f", "NAME,IPV4.METHOD,IPV6.METHOD", "connection", "show"],
-        timeout=8,
-    )
-    methods: dict[str, tuple[str, str]] = {}
-    if not result.ok or not result.output:
-        return methods
-    for item in parse_nmcli_lines(result.output, ["name", "ipv4", "ipv6"]):
-        name = item.get("name", "").strip()
-        if name:
-            methods[name] = (item.get("ipv4", "").strip(), item.get("ipv6", "").strip())
-    return methods
+    """Addressing method per interface, read from the systemd-networkd files."""
+    from .networkd import get_configured_methods
+
+    return get_configured_methods()
 
 
 def get_connection_methods(connection_name: str) -> tuple[str, str]:
@@ -321,62 +316,25 @@ def get_connection_methods(connection_name: str) -> tuple[str, str]:
     return get_all_connection_methods().get(connection_name, ("", ""))
 
 
-def get_default_route_devs() -> dict[str, str]:
-    """Interface holding the IPv4 / IPv6 default route (ppp0 for PPPoE uplinks)."""
-    devs: dict[str, str] = {}
-    for family in ("-4", "-6"):
-        result = run_command(["ip", family, "route", "show", "default"], timeout=5)
-        if not result.ok or not result.output:
-            continue
-        for line in result.output.splitlines():
-            parts = line.split()
-            for index, part in enumerate(parts):
-                if part == "dev" and index + 1 < len(parts):
-                    devs[family] = parts[index + 1].strip()
-                    break
-            if family in devs:
-                break
-    return devs
-
-
 def list_all_interfaces() -> list[dict[str, Any]]:
     """Every interface except loopback, for the WAN selector.
 
     A PPPoE uplink is ``ppp0``, which is not an ethernet device and therefore
     never shows up in the wired listing.
     """
-    result = run_command(["ip", "-j", "address", "show"], timeout=8)
-    if not result.ok or not result.output:
-        return []
-    try:
-        interfaces = json.loads(result.output)
-    except json.JSONDecodeError:
-        return []
-
     default_devs = set(get_default_route_devs().values())
     items: list[dict[str, Any]] = []
-    for interface in interfaces:
-        ifname = str(interface.get("ifname", "")).strip()
+    for interface in _ip_json("address", "show"):
+        ifname = str(interface.get("ifname", "") or "")
         if not ifname or ifname == "lo":
             continue
-        ipv4: list[str] = []
-        ipv6: list[str] = []
-        for address in interface.get("addr_info", []):
-            local = str(address.get("local", "")).strip()
-            if not local:
-                continue
-            prefixlen = address.get("prefixlen")
-            formatted = f"{local}/{prefixlen}" if prefixlen is not None else local
-            if address.get("family") == "inet":
-                ipv4.append(formatted)
-            elif address.get("family") == "inet6" and not local.lower().startswith("fe80:"):
-                ipv6.append(formatted)
-        operstate = str(interface.get("operstate", "")).lower()
+        ipv4, ipv6 = _addresses(interface)
+        state = _operstate(interface)
         items.append(
             {
                 "name": ifname,
-                "state": "connected" if operstate in {"up", "unknown"} else "disconnected",
-                "state_label": "已连接" if operstate in {"up", "unknown"} else "未连接",
+                "state": state,
+                "state_label": translate_device_state(state),
                 "kind": str(interface.get("link_type", "")),
                 "ipv4": ipv4,
                 "ipv6": ipv6,
@@ -388,106 +346,55 @@ def list_all_interfaces() -> list[dict[str, Any]]:
 
 
 def gather_wired_network_info(router_config: dict[str, Any] | None = None) -> dict[str, Any]:
-    result = run_command(
-        [
-            "nmcli",
-            "-t",
-            "-f",
-            (
-                "GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION,"
-                "GENERAL.HWADDR,IP4.ADDRESS,IP4.GATEWAY,IP4.DNS,IP6.ADDRESS,IP6.GATEWAY"
-            ),
-            "device",
-            "show",
-        ]
-    )
-    if not result.ok or not result.output:
-        return {
-            "devices": [],
-            "errors": [result.output or "无法读取有线网络状态"],
-        }
-
-    raw_devices: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    for line in result.output.splitlines():
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        value = value.strip()
-
-        if key == "GENERAL.DEVICE":
-            if current:
-                raw_devices.append(current)
-            current = {
-                "device": value,
-                "type": "",
-                "state": "",
-                "connection": "",
-                "mac": "",
-                "ipv4": [],
-                "ipv6": [],
-                "gateway": "",
-                "gateway6": "",
-                "dns": [],
-            }
-            continue
-        if current is None:
-            continue
-
-        if key == "GENERAL.TYPE":
-            current["type"] = value
-        elif key == "GENERAL.STATE":
-            current["state"] = normalize_nmcli_general_state(value)
-        elif key == "GENERAL.CONNECTION":
-            current["connection"] = "" if value == "--" else value
-        elif key == "GENERAL.HWADDR":
-            current["mac"] = value
-        elif key.startswith("IP4.ADDRESS"):
-            current["ipv4"].append(value)
-        elif key == "IP4.GATEWAY":
-            current["gateway"] = value
-        elif key.startswith("IP4.DNS"):
-            if value and value not in current["dns"]:
-                current["dns"].append(value)
-        elif key.startswith("IP6.ADDRESS"):
-            if value and not value.lower().startswith("fe80:"):
-                current["ipv6"].append(value)
-        elif key == "IP6.GATEWAY":
-            current["gateway6"] = value
-    if current:
-        raw_devices.append(current)
-
     router_config = router_config or {}
     wan_interface = str(router_config.get("wan_interface", "") or "")
     lan_interface = str(router_config.get("lan_interface", "") or "")
+    pppoe_nic = str(router_config.get("pppoe_nic", "") or "")
     connection_methods = get_all_connection_methods()
 
     devices: list[dict[str, Any]] = []
-    for device in sorted(raw_devices, key=lambda value: value.get("device", "")):
-        if device.get("type") != "ethernet":
+    for interface in _ip_json("address", "show"):
+        ifname = str(interface.get("ifname", "") or "")
+        if not ifname or ifname == "lo":
             continue
-        ifname = device.get("device", "")
-        connection_name = device.get("connection", "")
+        if link_type(ifname) != ETHERNET_TYPE:
+            continue
+
+        ipv4, ipv6 = _addresses(interface)
         carrier = get_wired_carrier(ifname)
-        state = normalize_wired_state(device.get("state", ""), carrier)
+        state = normalize_wired_state(_operstate(interface), carrier)
         speed = "" if carrier == "0" else get_wired_sysfs_speed(ifname)
         profile = default_wired_profile(ifname)
-        profile["name"] = connection_name
-        ipv4_method, ipv6_method = connection_methods.get(connection_name, ("", ""))
+        ipv4_method, ipv6_method = connection_methods.get(ifname, ("", ""))
         profile["ipv4_method"] = ipv4_method
         profile["ipv6_method"] = ipv6_method
         profile["ipv4_method_label"] = translate_ipv4_method(ipv4_method)
         profile["ipv6_method_label"] = translate_ipv6_method(ipv6_method)
 
-        if ifname and ifname == wan_interface:
-            role = "wan"
-            role_label = "WAN 上行"
+        if ifname and ifname == pppoe_nic:
+            role, role_label = "pppoe", "PPPoE 物理口"
         elif ifname and ifname == lan_interface:
-            role = "lan"
-            role_label = "LAN 局域网"
+            role, role_label = "lan", "LAN 局域网"
+        elif ifname and ifname == wan_interface:
+            role, role_label = "wan", "WAN 上行"
         else:
-            role = ""
-            role_label = "未分配"
+            role, role_label = "", "未分配"
+
+        gateway = ""
+        gateway6 = ""
+        for family, key in (("-4", "gateway"), ("-6", "gateway6")):
+            result = run_command(
+                ["ip", family, "route", "show", "default", "dev", ifname], timeout=5
+            )
+            if result.ok and result.output:
+                parts = result.output.splitlines()[0].split()
+                if "via" in parts:
+                    index = parts.index("via")
+                    if index + 1 < len(parts):
+                        if key == "gateway":
+                            gateway = parts[index + 1]
+                        else:
+                            gateway6 = parts[index + 1]
 
         devices.append(
             {
@@ -496,28 +403,29 @@ def gather_wired_network_info(router_config: dict[str, Any] | None = None) -> di
                 "role_label": role_label,
                 "state": state,
                 "state_label": translate_device_state(state),
-                "connection": connection_name or "未连接",
+                "connection": ifname if state == "connected" else "未连接",
                 "details": {
-                    "mac": device.get("mac", ""),
+                    "mac": str(interface.get("address", "") or ""),
                     "carrier": carrier,
                     "link_speed": format_link_speed(speed),
-                    "ipv4": device.get("ipv4", []),
-                    "ipv6": device.get("ipv6", []),
-                    "gateway": device.get("gateway", ""),
-                    "gateway6": device.get("gateway6", ""),
-                    "dns": device.get("dns", []),
+                    "ipv4": ipv4,
+                    "ipv6": ipv6,
+                    "gateway": gateway,
+                    "gateway6": gateway6,
+                    "dns": get_dns_servers(),
                 },
                 "profile": profile,
             }
         )
 
-    return {
-        "devices": devices,
-        "errors": [],
-    }
+    devices.sort(key=lambda item: item["device"])
+    return {"devices": devices, "errors": []}
 
 
 __all__ = [
+    "ETHERNET_TYPE",
+    "PPP_TYPE",
+    "link_type",
     "get_active_connections",
     "get_device_status_item",
     "get_filtered_device_status",
@@ -528,6 +436,7 @@ __all__ = [
     "list_all_interfaces",
     "get_all_connection_methods",
     "get_connection_methods",
+    "get_dns_servers",
     "default_wired_profile",
     "format_link_speed",
     "translate_ipv4_method",

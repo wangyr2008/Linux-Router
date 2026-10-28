@@ -697,16 +697,13 @@ if [[ "$ACTION" == "install" ]]; then
     gunicorn
     iproute2
     nftables
-    network-manager
+    ppp
     python3
     python3-flask
     tar
     udev
   )
   # Optional: only needed for the "运营商 PD 自动" IPv6 mode.
-  if [[ "$WITH_PD" -eq 1 ]]; then
-    install_packages+=(dhcpcd)
-  fi
   apt-get install -y --no-install-recommends "${install_packages[@]}"
 else
   for command_name in curl tar python3 gunicorn systemd-analyze nft dnsmasq; do
@@ -858,60 +855,24 @@ write_dnsmasq_bootstrap
 systemctl enable nftables.service >/dev/null
 systemctl restart nftables.service
 
-# dnsmasq and systemd-resolved both want port 53.
-if service_is_enabled systemd-resolved.service || service_is_active systemd-resolved.service; then
-  log "Disabling systemd-resolved so dnsmasq can own port 53"
-  systemctl disable --now systemd-resolved.service >/dev/null 2>&1 || true
-fi
+# systemd-resolved answers on 127.0.0.53 only; dnsmasq binds the LAN addresses,
+# so both can run. resolved is what turns the WAN DHCP DNS into /etc/resolv.conf.
+systemctl enable systemd-resolved.service >/dev/null 2>&1 || true
+systemctl start systemd-resolved.service >/dev/null 2>&1 || \
+  log "WARNING: systemd-resolved failed to start; DNS upstream may be missing"
+
 systemctl enable dnsmasq.service >/dev/null
 systemctl restart dnsmasq.service || log "WARNING: dnsmasq failed to start; check journalctl -u dnsmasq"
 
-systemctl enable NetworkManager.service >/dev/null
-systemctl start NetworkManager.service
+log "Enabling systemd-networkd"
+systemctl enable systemd-networkd.service >/dev/null
+systemctl restart systemd-networkd.service
 
+# The old stack keeps running for now: it still provides connectivity until the
+# panel writes its own .network files. Applying the router config takes the
+# interfaces over (stops NetworkManager/dhcpcd/ifupdown for those NICs).
 if [[ "$CONFIGURE_NETWORK" -eq 1 ]]; then
-  log "Writing NetworkManager configuration"
-  install -d -m 0755 /etc/NetworkManager/conf.d
-  cat > /etc/NetworkManager/conf.d/90-linux-router.conf <<'EOF'
-[ifupdown]
-managed=true
-EOF
-
-  netplan_available=0
-  if command -v netplan >/dev/null 2>&1 && [[ -d /etc/netplan ]]; then
-    netplan_available=1
-    log "Setting netplan renderer to NetworkManager"
-    cat > /etc/netplan/90-linux-router.yaml <<'EOF'
-network:
-  version: 2
-  renderer: NetworkManager
-EOF
-    chmod 0600 /etc/netplan/90-linux-router.yaml
-    NETPLAN_GENERATED=1
-    netplan generate
-  fi
-
-  apply_network=1
-  if [[ "$NETWORK_APPLY_MODE" == "defer" ]]; then
-    apply_network=0
-  elif [[ "$NETWORK_APPLY_MODE" == "auto" && -n "${SSH_CONNECTION:-}" ]]; then
-    apply_network=0
-  fi
-
-  if [[ "$apply_network" -eq 1 ]]; then
-    log "Applying network configuration"
-    NETWORK_APPLIED=1
-    if [[ "$DHCPCD_WAS_ACTIVE" -eq 1 || "$DHCPCD_WAS_ENABLED" -eq 1 ]]; then
-      log "Disabling dhcpcd to prevent duplicate interface management"
-      systemctl disable --now dhcpcd.service
-    fi
-    if [[ "$netplan_available" -eq 1 ]]; then
-      netplan apply
-    fi
-    systemctl restart NetworkManager.service
-  else
-    log "Network configuration written but not applied; apply it during a maintenance window"
-  fi
+  log "networkd is ready; the panel will take the NICs over when you apply"
 fi
 
 log "Installing systemd services"
@@ -924,9 +885,9 @@ if [[ -n "$NEW_PASSWORD" ]]; then
   printf 'Credentials are also stored in %s/initial_password.txt\n' "$DATA_DIR"
 fi
 printf '\nNext step: open the panel -> 路由, pick the WAN and LAN NICs, then apply.\n'
-printf 'That writes the NetworkManager LAN profile, /etc/dnsmasq.d/linux-router.conf\n'
+printf 'That writes /etc/systemd/network/*.network, /etc/dnsmasq.d/linux-router.conf\n'
 printf 'and /etc/nftables.d/90-linux-router.nft (NAT + forwarding, IPv4 and IPv6).\n'
 if [[ "$CONFIGURE_NETWORK" -eq 1 && "$NETWORK_APPLY_MODE" != "now" && -n "${SSH_CONNECTION:-}" ]]; then
   printf '\nNetwork changes were deferred because the installer detected an SSH session.\n'
-  printf 'During a maintenance window, disable dhcpcd, run "netplan apply" (when available), and restart NetworkManager.\n'
+  printf 'Apply the WAN/LAN settings from the panel during a maintenance window.\n'
 fi

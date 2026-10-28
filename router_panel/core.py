@@ -51,7 +51,7 @@ SYSTEM_COMMAND_TIMEOUT = 30
 REQUIRED_PACKAGES = (
     "python3-flask",
     "gunicorn",
-    "network-manager",
+    "systemd",
     "dnsmasq",
     "nftables",
     "iproute2",
