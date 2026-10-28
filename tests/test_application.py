@@ -1181,5 +1181,38 @@ class AccessControlTests(unittest.TestCase):
 
 
 
+
+class PackageInstallTests(unittest.TestCase):
+    def test_update_failure_does_not_block_install(self):
+        """A stale cdrom:// source makes apt-get update fail but the install can still work."""
+        def fake_run(command, timeout=8, env=None):
+            if command[:2] == ["apt-get", "update"]:
+                return fail("Err:2 cdrom://... does not have a Release file")
+            return ok("Setting up dhcpcd")
+
+        with patch.object(dependencies, "package_installed", side_effect=lambda name: False), patch.object(
+            dependencies, "run_command", side_effect=fake_run
+        ):
+            result = dependencies.install_missing_packages()
+
+        self.assertTrue(result.ok)
+        self.assertIn("有失败项", result.output)
+
+    def test_install_failure_is_reported(self):
+        def fake_run(command, timeout=8, env=None):
+            if command[:2] == ["apt-get", "update"]:
+                return fail("Err:2 cdrom://... does not have a Release file")
+            return fail("E: Unable to locate package dhcpcd")
+
+        with patch.object(dependencies, "package_installed", side_effect=lambda name: False), patch.object(
+            dependencies, "run_command", side_effect=fake_run
+        ):
+            result = dependencies.install_missing_packages()
+
+        self.assertFalse(result.ok)
+        self.assertIn("Unable to locate", result.output)
+
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -388,8 +388,9 @@ def install_missing_packages() -> CommandResult:
     env = os.environ.copy()
     env["DEBIAN_FRONTEND"] = "noninteractive"
     update = run_command(["apt-get", "update"], timeout=APT_TIMEOUT, env=env)
-    if not update.ok:
-        return CommandResult(False, update.output or "apt-get update 失败")
+    # A broken source (a stale cdrom:// line after a DVD install) makes update
+    # fail while the real mirrors still work, so only warn and try the install.
+    update_warning = "" if update.ok else "；apt-get update 有失败项，已忽略并继续"
 
     install = run_command(
         ["apt-get", "install", "-y", "--no-install-recommends", *missing_packages],
@@ -397,8 +398,11 @@ def install_missing_packages() -> CommandResult:
         env=env,
     )
     if not install.ok:
-        return CommandResult(False, install.output or "安装依赖失败")
-    return CommandResult(True, f"已安装: {', '.join(missing_packages)}")
+        detail = install.output or "安装依赖失败"
+        if not update.ok and update.output:
+            detail += f"（apt-get update：{update.output.splitlines()[0] if update.output else ''}）"
+        return CommandResult(False, detail)
+    return CommandResult(True, f"已安装: {', '.join(missing_packages)}{update_warning}")
 
 
 def get_dependency_rows() -> list[dict[str, Any]]:

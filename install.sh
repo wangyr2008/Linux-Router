@@ -671,7 +671,11 @@ fi
 if [[ "$ACTION" == "install" ]]; then
   export DEBIAN_FRONTEND=noninteractive
   log "Installing system packages"
-  apt-get update
+  # A stale cdrom:// entry (common after a DVD install) makes apt-get update
+  # return non-zero even though the network mirrors work, so do not abort here.
+  if ! apt-get update; then
+    log "WARNING: apt-get update reported failures, continuing anyway"
+  fi
   # Deliberately no iptables, iw, wpasupplicant or hostapd: this build is wired-only
   # and uses the nftables stack that ships with Debian 13.
   install_packages=(
