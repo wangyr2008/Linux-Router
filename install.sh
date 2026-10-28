@@ -27,7 +27,6 @@ DNSMASQ_CONF="/etc/dnsmasq.conf"
 SYSCTL_FILE="/etc/sysctl.d/90-router-panel.conf"
 CONFIGURE_NETWORK=1
 NETWORK_APPLY_MODE="auto"
-WITH_PD=0
 REMOTE_SOURCE_REQUESTED=0
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 ACTION=""
@@ -526,7 +525,6 @@ Options:
   --source-dir PATH          Install from a local source directory (no download)
   --install-dir PATH         Application directory (default: /opt/linux-router)
   --data-dir PATH            Persistent data directory (default: /var/lib/linux-router)
-  --with-pd                  Also install dhcpcd for DHCPv6 prefix delegation
   --no-network-config        Do not write NetworkManager or netplan configuration
   --apply-network-now        Apply network configuration even over SSH
   --defer-network-restart    Write network configuration without applying it now
@@ -580,10 +578,6 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--data-dir requires a value"
       DATA_DIR="${2%/}"
       shift 2
-      ;;
-    --with-pd)
-      WITH_PD=1
-      shift
       ;;
     --no-network-config)
       CONFIGURE_NETWORK=0
