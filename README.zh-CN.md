@@ -179,6 +179,31 @@ journalctl -u linux-router-pd -n 50 --no-pager
 > 前缀委派要求运营商真的给 PD（多数家宽给 /60 或 /56，桥接 + 自己拨号才拿得到）。
 > 如果光猫是路由模式，前缀会被光猫吃掉，这时只能用 ULA + NAT66。
 
+## CAKE 限速（按带宽整形）
+
+设置页可开启 CAKE，按 Mbit/s 填运营商带宽即可，用于压制缓冲膨胀（bufferbloat）：
+
+| 方向 | 实现 | 说明 |
+| --- | --- | --- |
+| 上行 | WAN 出方向 `tc qdisc ... root cake bandwidth <n>mbit` | 必填 |
+| 下行 | 专用 `ifb-lr` 设备镜像 WAN 入方向后再整形 | 可留空，留空则只处理上行 |
+
+- 生效方式：写入 `/etc/linux-router/cake.sh` + `linux-router-cake.service`，开机自动加载
+- 自愈：`linux-router-cake.timer` 每 5 分钟跑一次 `ensure`，PPPoE 重连导致设备重建后会自动补挂；
+  `ensure` 是幂等的（队列已存在就不动），不会重置统计
+- 填带宽建议为标称值的 85%~95%，填满反而容易排队
+- 修改 WAN 接口后无需单独操作，应用路由配置时会同步刷新限速
+
+手工核对：
+
+```bash
+tc qdisc show dev <WAN>        # 期望 qdisc cake ... bandwidth <上行>Mbit
+tc qdisc show dev ifb-lr       # 有下行时才有，bandwidth <下行>Mbit
+systemctl status linux-router-cake --no-pager
+```
+
+> 想临时关掉：`sh /etc/linux-router/cake.sh clear`，或在设置页取消勾选后应用。
+
 ## 访问控制（入站防护）
 
 默认是「开放」：只做 NAT，不拦截任何入站连接。**在 PD / 全局前缀模式下，LAN 设备持有公网 IPv6，

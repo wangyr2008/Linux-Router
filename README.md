@@ -149,6 +149,19 @@ journalctl -u linux-router-pd -n 50 --no-pager
 > PD only works if the ISP actually delegates (most residential links hand out /60 or /56, and only when the
 > ONT is bridged and the router dials). With an ONT in router mode the prefix never reaches you — use ULA + NAT66.
 
+## CAKE shaping (bandwidth based)
+
+Enable CAKE on the Settings page and enter your line rate in Mbit/s:
+
+| Direction | Implementation |
+| --- | --- |
+| upload | `tc qdisc ... root cake bandwidth <n>mbit` on the WAN egress (required) |
+| download | mirrored to a dedicated `ifb-lr` device, then shaped (optional) |
+
+Written to `/etc/linux-router/cake.sh` plus `linux-router-cake.service` (loads at boot).
+`linux-router-cake.timer` re-runs `ensure` every 5 minutes so a PPPoE redial that recreates the
+device re-attaches the qdisc; `ensure` is idempotent and never resets counters.
+
 ## Access control (inbound filtering)
 
 The default is **open**: NAT only, nothing is filtered. **With a delegated or static global prefix the LAN holds
