@@ -124,6 +124,45 @@ journalctl -u linux-router-pd -n 50 --no-pager
 > PD only works if the ISP actually delegates (most residential links hand out /60 or /56, and only when the
 > ONT is bridged and the router dials). With an ONT in router mode the prefix never reaches you — use ULA + NAT66.
 
+## Access control (inbound filtering)
+
+The default is **open**: NAT only, nothing is filtered. **With a delegated or static global prefix the LAN holds
+public IPv6 addresses, so you must switch to protect** — otherwise every LAN device is directly reachable.
+
+Protect mode adds `inet lr_input` (`policy drop`) and turns the forward chain into `policy drop`:
+
+| Allowed | Purpose |
+| --- | --- |
+| established/related, ICMP, ICMPv6 | required for PMTU and neighbour discovery |
+| `lo` | loopback (health checks) |
+| WAN `udp 68/546` | DHCPv4 / DHCPv6 client replies |
+| LAN `tcp 22/53/80` + your extras | SSH, DNS, panel |
+| LAN `udp 53/67/547` | DNS, DHCPv4 server, DHCPv6 server |
+| `tailscale0` | Tailscale remote access and subnet routes |
+| WAN custom TCP/UDP | only when you need to reach the box from outside |
+
+Forwarding then only allows `iifname <LAN>` and `tailscale0`: the LAN can get out, the outside cannot get in.
+
+> ⚠️ If you SSH in over the WAN, put `22` in “WAN open TCP ports” **before** enabling protect mode.
+> ⚠️ There is no port forwarding (DNAT) yet. Opening an inbound port to a LAN host means writing a dnat rule by hand.
+
+## Running sing-box / transparent proxy
+
+It works: sing-box only manages the tables it creates, so TUN mode and `auto_redirect` do not collide with
+`lr_forward` / `lr_nat` / `lr_input`. Four things still need attention, or traffic silently bypasses the proxy:
+
+1. **Routing loop** — TUN `auto_route` points the default route at tun0, which also captures the router's own
+   traffic. Set `bind_interface: "ppp0"` (or `inet4_bind_address`) on the outbound.
+2. **IPv6 leak** — with PD the LAN has public IPv6; a TUN with only `inet4_address` lets IPv6 go direct.
+   Add `inet6_address` + `auto_route` for full coverage, or at least keep access control on protect.
+3. **DNS ownership** — LAN clients use the local dnsmasq. To make sing-box DNS rules apply, set “upstream DNS”
+   to `127.0.0.1#5353` (sing-box dns listening on `127.0.0.1:5353`). The panel then writes `no-resolv`, so
+   dnsmasq stops appending `/etc/resolv.conf` and queries cannot leak to the ISP.
+4. **Never `nft flush ruleset`** — it wipes our tables and NAT/filtering die instantly. Use
+   `systemctl reload nftables` after editing rules.
+
+The sing-box Clash API (default 9090) is an input service: add `9090` to “LAN open TCP ports” in protect mode.
+
 ## nftables layout
 
 The panel writes `/etc/nftables.d/90-linux-router.nft`, pulled in by `include "/etc/nftables.d/*.nft"` in

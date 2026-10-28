@@ -420,6 +420,8 @@ def get_dependency_rows() -> list[dict[str, Any]]:
     nat = get_router_nat_status()
     firewall = get_firewall_status()
     lan_configured = _lan_has_address(config)
+    protected = str(config.get("firewall_mode", "")) == "protect"
+    native_ipv6 = str(config.get("ipv6_mode", "")) in {IPV6_MODE_PD, "static"}
     package_details = {
         "python3-flask": "提供网页运行框架",
         "gunicorn": "运行网页服务",
@@ -567,6 +569,23 @@ def get_dependency_rows() -> list[dict[str, Any]]:
                 "extra_details": [nat["details"]] if nat["details"] else [],
                 "action": nat["action"],
                 "action_label": "重新加载规则" if nat["action"] == "apply_firewall" else ("安装依赖" if nat["action"] == "install_packages" else ""),
+            },
+            {
+                "group": "路由转发",
+                "name": "入站访问控制",
+                "status": "保护中" if protected else "开放",
+                "level": "ok" if (protected or not native_ipv6) else "warning",
+                "detail": (
+                    "丢弃来自 WAN 的新入站连接，只放行本机服务与已建立的连接"
+                    if protected
+                    else (
+                        "LAN 使用公网前缀但未做入站过滤，外部可直接连入内网设备"
+                        if native_ipv6
+                        else "未做入站过滤；ULA + NAT66 模式下外部本就无法主动连入"
+                    )
+                ),
+                "action": "",
+                "action_label": "",
             },
             {
                 "group": "路由转发",

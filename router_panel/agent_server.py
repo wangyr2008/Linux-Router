@@ -57,6 +57,10 @@ ROUTER_CONFIG_FIELDS = (
     "ipv6_nat",
     "wan_ipv6_auto",
     "mtu",
+    "firewall_mode",
+    "firewall_lan_tcp",
+    "firewall_wan_tcp",
+    "firewall_wan_udp",
 )
 
 

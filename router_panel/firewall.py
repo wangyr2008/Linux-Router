@@ -21,7 +21,22 @@ NFTABLES_SERVICE = "nftables.service"
 FIREWALL_TABLE_FORWARD = "inet lr_forward"
 FIREWALL_TABLE_NAT4 = "ip lr_nat"
 FIREWALL_TABLE_NAT6 = "ip6 lr_nat6"
+FIREWALL_TABLE_INPUT = "inet lr_input"
+FIREWALL_MODE_OPEN = "open"
+FIREWALL_MODE_PROTECT = "protect"
+FIREWALL_MODES = (FIREWALL_MODE_OPEN, FIREWALL_MODE_PROTECT)
+FIREWALL_MODE_LABELS = {
+    FIREWALL_MODE_OPEN: "开放（只做 NAT，不拦截入站）",
+    FIREWALL_MODE_PROTECT: "保护（默认拒绝入站，只放行本机服务）",
+}
+# Ports the router itself must answer on the LAN.
+LAN_BASE_TCP_PORTS = ("22", "53", "80")
+LAN_BASE_UDP_PORTS = ("53", "67", "547")
+# DHCPv4 client (68) and DHCPv6 client (546) replies arrive on the WAN.
+WAN_BASE_UDP_PORTS = ("68", "546")
+TAILSCALE_INTERFACE = "tailscale0"
 
+_PORT_ITEM_RE = re.compile(r"^\d{1,5}(?:-\d{1,5})?$")
 _NAT_COUNTER_RE = re.compile(r"counter packets (\d+) bytes (\d+)")
 
 
@@ -29,12 +44,53 @@ def _quote(value: str) -> str:
     return '"' + value.replace('"', "") + '"'
 
 
+def parse_port_list(raw: Any) -> tuple[list[str], str | None]:
+    """Normalise "22, 80, 1000-2000" into a validated list."""
+    if raw is None:
+        return [], None
+    if isinstance(raw, (list, tuple)):
+        items = [str(item).strip() for item in raw]
+    else:
+        items = [part.strip() for part in re.split(r"[\s,;]+", str(raw)) if part.strip()]
+
+    ports: list[str] = []
+    for item in items:
+        if not item:
+            continue
+        if not _PORT_ITEM_RE.fullmatch(item):
+            return [], f"端口格式无效：{item}（只支持 80 或 1000-2000 这种写法）"
+        if "-" in item:
+            start, end = item.split("-", 1)
+            if not (1 <= int(start) <= 65535 and 1 <= int(end) <= 65535):
+                return [], f"端口超出范围：{item}"
+            if int(start) > int(end):
+                return [], f"端口范围起止颠倒：{item}"
+        elif not 1 <= int(item) <= 65535:
+            return [], f"端口超出范围：{item}"
+        if item not in ports:
+            ports.append(item)
+    return ports, None
+
+
+def _port_set(ports: list[str]) -> str:
+    return "{ " + ", ".join(ports) + " }"
+
+
+def _merge(*groups: Any) -> list[str]:
+    merged: list[str] = []
+    for group in groups:
+        for item in group:
+            if item not in merged:
+                merged.append(item)
+    return merged
+
+
 def render_nftables_ruleset(config: dict[str, Any]) -> str:
     """Build the nftables ruleset for the router.
 
-    Only forwarding and NAT are managed here. The input path is deliberately left
-    untouched so the panel keeps working no matter what other firewall rules the
-    operator has loaded.
+    Always: forwarding + NAT. In protect mode it additionally adds an input chain
+    (policy drop) and tightens forwarding, which is what keeps a LAN behind a
+    delegated public IPv6 prefix from being reachable from the outside.
     """
     wan = str(config.get("wan_interface", "") or "").strip()
     lan = str(config.get("lan_interface", "") or "").strip()
@@ -46,6 +102,12 @@ def render_nftables_ruleset(config: dict[str, Any]) -> str:
     ipv6_nat = bool(config.get("ipv6_nat", False))
     if str(config.get("ipv6_mode", "")) == "off":
         ipv6_lan_network = ""
+
+    mode = str(config.get("firewall_mode", FIREWALL_MODE_OPEN))
+    protect = mode == FIREWALL_MODE_PROTECT
+    lan_tcp, _ = parse_port_list(config.get("firewall_lan_tcp"))
+    wan_tcp, _ = parse_port_list(config.get("firewall_wan_tcp"))
+    wan_udp, _ = parse_port_list(config.get("firewall_wan_udp"))
 
     lines: list[str] = [
         "#!/usr/sbin/nft -f",
@@ -59,15 +121,22 @@ def render_nftables_ruleset(config: dict[str, Any]) -> str:
         f"delete table {FIREWALL_TABLE_NAT4}",
         f"table {FIREWALL_TABLE_NAT6}",
         f"delete table {FIREWALL_TABLE_NAT6}",
+        f"table {FIREWALL_TABLE_INPUT}",
+        f"delete table {FIREWALL_TABLE_INPUT}",
         "",
         f"table {FIREWALL_TABLE_FORWARD} {{",
         "    chain forward {",
-        "        type filter hook forward priority filter; policy accept;",
+        f"        type filter hook forward priority filter; policy {'drop' if protect else 'accept'};",
         "        ct state established,related accept",
         "        ct state invalid drop",
     ]
 
-    if lan and wan:
+    if protect:
+        if lan:
+            lines.append(f"        iifname {_quote(lan)} accept")
+        lines.append(f"        iifname {_quote(TAILSCALE_INTERFACE)} accept")
+        lines.append("        # Everything else (new inbound connections from the WAN) is dropped.")
+    elif lan and wan:
         lines.extend(
             [
                 f"        iifname {_quote(lan)} oifname {_quote(wan)} accept",
@@ -75,18 +144,8 @@ def render_nftables_ruleset(config: dict[str, Any]) -> str:
                 f"        iifname {_quote(lan)} oifname {_quote(lan)} accept",
             ]
         )
-    lines.extend(
-        [
-            "        # policy accept keeps the router transparent. If you later tighten it to",
-            "        # drop, remember to allow ICMPv6 ND/PMTU:",
-            "        #   icmpv6 type { destination-unreachable, packet-too-big, time-exceeded,",
-            "        #                 parameter-problem, nd-router-advert, nd-neighbor-solicit,",
-            "        #                 nd-neighbor-advert } accept",
-            "    }",
-            "}",
-            "",
-        ]
-    )
+        lines.append("        # policy accept keeps the router transparent; switch to 保护 to filter.")
+    lines.extend(["    }", "}", ""])
 
     if wan and lan_network:
         lines.extend(
@@ -114,7 +173,49 @@ def render_nftables_ruleset(config: dict[str, Any]) -> str:
             ]
         )
 
+    if protect and lan:
+        lines.extend(_render_input_chain(lan, wan, lan_tcp, wan_tcp, wan_udp))
+
     return "\n".join(lines)
+
+
+def _render_input_chain(
+    lan: str,
+    wan: str,
+    lan_tcp: list[str],
+    wan_tcp: list[str],
+    wan_udp: list[str],
+) -> list[str]:
+    lines = [
+        f"table {FIREWALL_TABLE_INPUT} {{",
+        "    chain input {",
+        "        type filter hook input priority filter; policy drop;",
+        "        ct state established,related accept",
+        "        ct state invalid drop",
+        '        iifname "lo" accept',
+        "",
+        "        # ICMP/ICMPv6 is required for PMTU and neighbour discovery.",
+        "        meta l4proto icmp accept",
+        "        meta l4proto ipv6-icmp accept",
+        "",
+        f"        iifname {_quote(TAILSCALE_INTERFACE)} accept",
+    ]
+
+    if wan:
+        lines.append("")
+        lines.append("        # DHCP client replies on the WAN")
+        lines.append(f"        iifname {_quote(wan)} udp dport {_port_set(_merge(WAN_BASE_UDP_PORTS, wan_udp))} accept")
+        if wan_tcp:
+            lines.append(f"        iifname {_quote(wan)} tcp dport {_port_set(wan_tcp)} accept")
+
+    lines.append("")
+    lines.append("        # Router services reachable from the LAN")
+    lines.append(
+        f"        iifname {_quote(lan)} tcp dport {_port_set(_merge(LAN_BASE_TCP_PORTS, lan_tcp))} accept"
+    )
+    lines.append(f"        iifname {_quote(lan)} udp dport {_port_set(list(LAN_BASE_UDP_PORTS))} accept")
+    lines.extend(["    }", "}", ""])
+    return lines
 
 
 def nftables_config_includes_our_ruleset() -> bool:
@@ -178,7 +279,12 @@ def check_ruleset(ruleset: str) -> CommandResult:
 
 def reset_router_tables() -> None:
     """Drop our tables so a broken ruleset can be reloaded from scratch."""
-    for table in (FIREWALL_TABLE_FORWARD, FIREWALL_TABLE_NAT4, FIREWALL_TABLE_NAT6):
+    for table in (
+        FIREWALL_TABLE_FORWARD,
+        FIREWALL_TABLE_NAT4,
+        FIREWALL_TABLE_NAT6,
+        FIREWALL_TABLE_INPUT,
+    ):
         run_command(["nft", "delete", "table", table], timeout=10)
 
 
@@ -238,6 +344,7 @@ def get_firewall_status() -> dict[str, Any]:
         "ruleset_present": NFTABLES_RULESET_PATH.exists(),
         "include_present": nftables_config_includes_our_ruleset(),
         "forward_table": False,
+        "input_table": False,
         "nat4": False,
         "nat6": False,
         "nat4_packets": 0,
@@ -249,6 +356,7 @@ def get_firewall_status() -> dict[str, Any]:
         return status
 
     status["forward_table"] = _table_exists(FIREWALL_TABLE_FORWARD)
+    status["input_table"] = _table_exists(FIREWALL_TABLE_INPUT)
     status["nat4"] = _table_exists(FIREWALL_TABLE_NAT4)
     status["nat6"] = _table_exists(FIREWALL_TABLE_NAT6)
     if status["nat4"]:
@@ -260,6 +368,12 @@ def get_firewall_status() -> dict[str, Any]:
 
 __all__ = [
     "NFTABLES_INCLUDE_LINE",
+    "FIREWALL_MODE_LABELS",
+    "FIREWALL_MODE_OPEN",
+    "FIREWALL_MODE_PROTECT",
+    "FIREWALL_MODES",
+    "FIREWALL_TABLE_INPUT",
+    "parse_port_list",
     "render_nftables_ruleset",
     "nftables_config_includes_our_ruleset",
     "ensure_nftables_include",

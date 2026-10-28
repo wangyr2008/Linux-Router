@@ -1056,5 +1056,130 @@ class PrefixDelegationTests(unittest.TestCase):
 
 
 
+
+class AccessControlTests(unittest.TestCase):
+    def config(self, **overrides):
+        payload = {
+            "wan_interface": "ppp0",
+            "lan_interface": "enp2s0",
+            "lan_network": "192.168.50.0/24",
+            "ipv6_mode": "pd",
+        }
+        payload.update(overrides)
+        config, error = routing.normalize_router_config(payload)
+        assert error is None, error
+        return config
+
+    def test_default_mode_is_open_with_no_input_table(self):
+        config = self.config()
+        self.assertEqual(config["firewall_mode"], "open")
+        text = firewall.render_nftables_ruleset(config)
+        self.assertIn("policy accept;", text)
+        self.assertNotIn("table inet lr_input {", text)
+        self.assertIn("delete table inet lr_input", text)
+
+    def test_protect_mode_drops_input_and_forward(self):
+        text = firewall.render_nftables_ruleset(self.config(firewall_mode="protect"))
+        self.assertIn("table inet lr_input {", text)
+        self.assertIn("type filter hook input priority filter; policy drop;", text)
+        self.assertIn("type filter hook forward priority filter; policy drop;", text)
+        self.assertIn('iifname "enp2s0" accept', text)
+        self.assertIn('iifname "ppp0" udp dport { 68, 546 } accept', text)
+        self.assertIn('iifname "enp2s0" tcp dport { 22, 53, 80 } accept', text)
+        self.assertIn('iifname "enp2s0" udp dport { 53, 67, 547 } accept', text)
+        self.assertIn('iifname "tailscale0" accept', text)
+        self.assertIn("meta l4proto ipv6-icmp accept", text)
+        self.assertIn("meta l4proto icmp accept", text)
+
+    def test_protect_mode_merges_extra_ports(self):
+        text = firewall.render_nftables_ruleset(
+            self.config(firewall_mode="protect", firewall_lan_tcp="9090, 8080", firewall_wan_tcp="22")
+        )
+        self.assertIn('iifname "enp2s0" tcp dport { 22, 53, 80, 9090, 8080 } accept', text)
+        self.assertIn('iifname "ppp0" tcp dport { 22 } accept', text)
+
+    def test_protect_mode_allows_wan_udp_extras(self):
+        text = firewall.render_nftables_ruleset(
+            self.config(firewall_mode="protect", firewall_wan_udp="41641")
+        )
+        self.assertIn('iifname "ppp0" udp dport { 68, 546, 41641 } accept', text)
+
+    def test_port_list_parsing(self):
+        ports, error = firewall.parse_port_list("22, 80 ,1000-2000")
+        self.assertIsNone(error)
+        self.assertEqual(ports, ["22", "80", "1000-2000"])
+        self.assertEqual(firewall.parse_port_list("")[0], [])
+        self.assertIn("格式无效", firewall.parse_port_list("abc")[1])
+        self.assertIn("超出范围", firewall.parse_port_list("70000")[1])
+        self.assertIn("起止颠倒", firewall.parse_port_list("200-100")[1])
+
+    def test_invalid_ports_are_rejected_by_config(self):
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "ppp0", "lan_interface": "enp2s0", "firewall_lan_tcp": "abc"}
+        )
+        self.assertIn("LAN 放行端口", error)
+
+    def test_invalid_mode_is_rejected(self):
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "ppp0", "lan_interface": "enp2s0", "firewall_mode": "block-all"}
+        )
+        self.assertIn("访问控制模式无效", error)
+
+    def test_upstream_dns_disables_resolv_conf(self):
+        text = routing.build_dnsmasq_config(self.config(dns_upstream="127.0.0.1#5353"))
+        self.assertIn("no-resolv", text)
+        self.assertIn("server=127.0.0.1#5353", text)
+
+    def test_dependency_row_warns_when_public_ipv6_is_unfiltered(self):
+        config = self.config()  # pd + open
+        with patch.object(dependencies, "load_router_config", return_value=config), patch.object(
+            dependencies, "gather_wired_network_info", return_value={"devices": []}
+        ), patch.object(
+            dependencies, "get_router_nat_status",
+            return_value={"level": "ok", "summary": "", "details": "", "action": ""},
+        ), patch.object(dependencies, "get_firewall_status", return_value={
+            "available": True, "service_active": True, "service_enabled": True,
+            "nat4": True, "nat6": False, "input_table": False, "nat4_packets": 0, "nat6_packets": 0, "errors": [],
+        }), patch.object(dependencies, "_lan_has_address", return_value=True), patch.object(
+            dependencies, "get_ip_forward_status", return_value={"ipv4": "1", "ipv6": "1", "persistent": ""}
+        ), patch.object(
+            dependencies, "get_netplan_renderer_summary",
+            return_value={"ok": True, "level": "ok", "summary": "", "details": []},
+        ), patch.object(dependencies, "get_pd_status", return_value={
+            "available": True, "service_active": True, "service_enabled": True, "prefix": "",
+            "delegated": "", "updated_at": "", "reason": "", "error": "",
+        }):
+            rows = dependencies.get_dependency_rows()
+
+        row = next(item for item in rows if item["name"] == "入站访问控制")
+        self.assertEqual(row["level"], "warning")
+        self.assertIn("公网", row["detail"])
+
+        protected_config = self.config(firewall_mode="protect")
+        with patch.object(dependencies, "load_router_config", return_value=protected_config), patch.object(
+            dependencies, "gather_wired_network_info", return_value={"devices": []}
+        ), patch.object(
+            dependencies, "get_router_nat_status",
+            return_value={"level": "ok", "summary": "", "details": "", "action": ""},
+        ), patch.object(dependencies, "get_firewall_status", return_value={
+            "available": True, "service_active": True, "service_enabled": True,
+            "nat4": True, "nat6": False, "input_table": True, "nat4_packets": 0, "nat6_packets": 0, "errors": [],
+        }), patch.object(dependencies, "_lan_has_address", return_value=True), patch.object(
+            dependencies, "get_ip_forward_status", return_value={"ipv4": "1", "ipv6": "1", "persistent": ""}
+        ), patch.object(
+            dependencies, "get_netplan_renderer_summary",
+            return_value={"ok": True, "level": "ok", "summary": "", "details": []},
+        ), patch.object(dependencies, "get_pd_status", return_value={
+            "available": True, "service_active": True, "service_enabled": True, "prefix": "",
+            "delegated": "", "updated_at": "", "reason": "", "error": "",
+        }):
+            rows = dependencies.get_dependency_rows()
+
+        row = next(item for item in rows if item["name"] == "入站访问控制")
+        self.assertEqual(row["level"], "ok")
+        self.assertEqual(row["status"], "保护中")
+
+
+
 if __name__ == "__main__":
     unittest.main()

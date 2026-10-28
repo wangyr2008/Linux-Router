@@ -30,7 +30,14 @@ from .core import (
     read_text,
     run_command,
 )
-from .firewall import apply_ruleset, get_firewall_status, render_nftables_ruleset
+from .firewall import (
+    FIREWALL_MODE_OPEN,
+    FIREWALL_MODES,
+    apply_ruleset,
+    get_firewall_status,
+    parse_port_list,
+    render_nftables_ruleset,
+)
 from .network import (
     gather_wired_network_info,
     get_device_details,
@@ -71,6 +78,10 @@ DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "ipv6_nat": True,
     "wan_ipv6_auto": True,
     "mtu": "",
+    "firewall_mode": FIREWALL_MODE_OPEN,
+    "firewall_lan_tcp": "22,80",
+    "firewall_wan_tcp": "",
+    "firewall_wan_udp": "",
 }
 
 
@@ -241,6 +252,20 @@ def normalize_router_config(
         if not 576 <= mtu_value <= 9000:
             return config, "MTU 必须在 576 到 9000 之间"
 
+    firewall_mode = get("firewall_mode").lower() or FIREWALL_MODE_OPEN
+    if firewall_mode not in FIREWALL_MODES:
+        return config, "访问控制模式无效"
+
+    lan_tcp, error = parse_port_list(get("firewall_lan_tcp"))
+    if error:
+        return config, f"LAN 放行端口：{error}"
+    wan_tcp, error = parse_port_list(get("firewall_wan_tcp"))
+    if error:
+        return config, f"WAN 放行 TCP 端口：{error}"
+    wan_udp, error = parse_port_list(get("firewall_wan_udp"))
+    if error:
+        return config, f"WAN 放行 UDP 端口：{error}"
+
     config.update(
         {
             "wan_interface": wan,
@@ -258,6 +283,10 @@ def normalize_router_config(
             "ipv6_nat": _as_bool(payload.get("ipv6_nat", base.get("ipv6_nat", True)), True),
             "wan_ipv6_auto": _as_bool(payload.get("wan_ipv6_auto", base.get("wan_ipv6_auto", True)), True),
             "mtu": mtu,
+            "firewall_mode": firewall_mode,
+            "firewall_lan_tcp": ",".join(lan_tcp),
+            "firewall_wan_tcp": ",".join(wan_tcp),
+            "firewall_wan_udp": ",".join(wan_udp),
         }
     )
 
@@ -353,7 +382,8 @@ def build_dnsmasq_config(config: dict[str, Any]) -> str:
     )
 
     if config.get("dns_upstream"):
-        lines.append("# 上游 DNS（留空时使用 /etc/resolv.conf，即 WAN 下发的 DNS）")
+        lines.append("# 上游 DNS 只使用下面这几条（不再叠加 /etc/resolv.conf）")
+        lines.append("no-resolv")
         for server in str(config["dns_upstream"]).split():
             lines.append(f"server={server}")
 

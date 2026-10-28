@@ -143,6 +143,46 @@ journalctl -u linux-router-pd -n 50 --no-pager
 > 前缀委派要求运营商真的给 PD（多数家宽给 /60 或 /56，桥接 + 自己拨号才拿得到）。
 > 如果光猫是路由模式，前缀会被光猫吃掉，这时只能用 ULA + NAT66。
 
+## 访问控制（入站防护）
+
+默认是「开放」：只做 NAT，不拦截任何入站连接。**在 PD / 全局前缀模式下，LAN 设备持有公网 IPv6，
+这时必须切到「保护」**，否则内网设备等于直接挂在公网上。
+
+「保护」模式会额外生成 `inet lr_input`（`policy drop`），并把 forward 链改成 `policy drop`：
+
+| 放行项 | 用途 |
+| --- | --- |
+| 已建立/相关连接、ICMP、ICMPv6 | 必须，PMTU 与邻居发现依赖它 |
+| `lo` | 本机回环（健康检查走这里） |
+| WAN `udp 68/546` | DHCPv4 / DHCPv6 客户端应答 |
+| LAN `tcp 22/53/80` + 自定义 | SSH、DNS、面板 |
+| LAN `udp 53/67/547` | DNS、DHCPv4 服务、DHCPv6 服务 |
+| `tailscale0` | Tailscale 远程管理与子网路由 |
+| WAN 自定义 TCP/UDP | 需要从外网直连本机时才填 |
+
+forward 链在保护模式下只放行 `iifname <LAN>` 与 `tailscale0`：LAN 可以出去，外部不能主动进来。
+
+> ⚠️ 如果你从 WAN 侧 SSH 管理这台机器，**先把 22 填进「WAN 放行 TCP 端口」**再切保护模式，否则会把自己关在门外。
+> ⚠️ 目前没有做端口转发（DNAT）。要让外网访问内网某台机器，需要手写 dnat 规则——需要的话可以让我加进面板。
+
+## 与 sing-box / 透明代理共存
+
+能用。这套规则与 sing-box 的 TUN / `auto_redirect` 不冲突（sing-box 只动自己创建的表），
+但下面四件事不处理，会出现“看着通了其实绕过了代理”：
+
+1. **路由回环**：TUN 的 `auto_route` 会把默认路由指到 tun0，路由器自己的出站也会被卷进隧道。
+   给 outbound 加 `bind_interface: "ppp0"`（或 `inet4_bind_address`），让出站从 WAN 直接走。
+2. **IPv6 泄漏**：PD 模式下 LAN 有公网 IPv6，tun 只配 `inet4_address` 的话 IPv6 会绕过代理直连。
+   要全量代理就给 tun 加 `inet6_address` + `auto_route`；只代理 IPv4 的话，至少把访问控制留在「保护」。
+3. **DNS 归属**：LAN 设备的 DNS 是本机 dnsmasq。想让 sing-box 的分流规则生效，把面板「上游 DNS」填
+   `127.0.0.1#5353`（sing-box 的 dns listen 配 `127.0.0.1:5353`）。填了之后面板会写 `no-resolv`，
+   dnsmasq 不再叠加 `/etc/resolv.conf`，避免查询漏到运营商 DNS。
+4. **不要 `nft flush ruleset`**：sing-box 自己的规则没问题，但启动脚本里若有 `flush ruleset`，
+   会把 `lr_forward`/`lr_nat`/`lr_nat6`/`lr_input` 一起清掉，NAT 和防护立刻失效。
+   改完规则用 `systemctl reload nftables`。
+
+另外 sing-box 的 Clash API（默认 9090）属于 input 服务，保护模式下要访问就把它填进「LAN 放行 TCP 端口」。
+
 ## nftables 规则
 
 面板生成 `/etc/nftables.d/90-linux-router.nft`，由 `/etc/nftables.conf` 的

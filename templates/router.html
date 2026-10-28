@@ -140,6 +140,12 @@
           <span class="status-badge status-{{ 'ok' if forwarding.ipv6 == '1' else 'error' }}">{{ '已启用' if forwarding.ipv6 == '1' else '未启用' }}</span>
         </dd>
       </div>
+      <div>
+        <dt>入站防护</dt>
+        <dd>
+          <span class="status-badge status-{{ 'ok' if firewall.input_table else 'warning' }}">{{ '已启用' if firewall.input_table else '未启用' }}</span>
+        </dd>
+      </div>
       <div><dt>IPv4 NAT</dt><dd class="numeric-value">{{ firewall.nat4_packets }} 个包</dd></div>
       <div><dt>IPv6 NAT66</dt><dd class="numeric-value">{{ firewall.nat6_packets }} 个包</dd></div>
     </dl>
@@ -267,6 +273,37 @@
           <span>启用 IPv6 NAT66（仅 ULA 模式生效）</span>
         </label>
       </div>
+
+      <div class="form-grid">
+        <label>
+          访问控制
+          <select name="firewall_mode">
+            {% for value, label in firewall_modes.items() %}
+            <option value="{{ value }}" {{ 'selected' if value == config.firewall_mode else '' }}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <p class="muted form-hint">保护模式会丢弃所有来自 WAN 的新入站连接，并收紧 LAN→WAN 以外的转发</p>
+        </label>
+        <label>
+          LAN 放行 TCP 端口
+          <input type="text" class="mono-value" name="firewall_lan_tcp" value="{{ config.firewall_lan_tcp }}" placeholder="22,80">
+          <p class="muted form-hint">面板 80、SSH 22、DNS 53 已内置；sing-box 的 9090 面板要访问就加进来</p>
+        </label>
+        <label>
+          WAN 放行 TCP 端口
+          <input type="text" class="mono-value" name="firewall_wan_tcp" value="{{ config.firewall_wan_tcp }}" placeholder="留空即全部拒绝">
+          <p class="muted form-hint">需要从外网直连本机服务时才填，例如 22</p>
+        </label>
+        <label>
+          WAN 放行 UDP 端口
+          <input type="text" class="mono-value" name="firewall_wan_udp" value="{{ config.firewall_wan_udp }}" placeholder="留空即全部拒绝">
+          <p class="muted form-hint">WireGuard/Tailscale 直连等才需要，例如 41641</p>
+        </label>
+      </div>
+
+      {% if config.ipv6_mode == 'pd' and config.firewall_mode != 'protect' %}
+      <p class="alert compact">当前是「运营商 PD 自动」模式，LAN 设备持有公网 IPv6，但访问控制为开放：外部可以直接连入内网设备。建议切到「保护」。</p>
+      {% endif %}
 
       <p class="muted form-hint">
         应用配置会写入 NetworkManager 的 LAN 连接、dnsmasq 与 nftables 规则。
