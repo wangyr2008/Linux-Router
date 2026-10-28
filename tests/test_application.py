@@ -858,8 +858,71 @@ class PrefixDelegationTests(unittest.TestCase):
         with patch.object(pd_client, "dhcpcd_binary", return_value="/usr/sbin/dhcpcd"):
             text = pd_client.render_service_unit(self.config())
         self.assertIn("Type=simple", text)
-        self.assertIn("--nobackground", text)
+        self.assertIn("-B", text)
+        self.assertIn("-6", text)
         self.assertIn("/etc/linux-router/dhcpcd.conf", text)
+
+    def test_service_unit_names_both_interfaces(self):
+        """ia_pd only delegates to interfaces dhcpcd is actually running on."""
+        with patch.object(pd_client, "dhcpcd_binary", return_value="/usr/sbin/dhcpcd"):
+            text = pd_client.render_service_unit(self.config())
+        exec_line = next(line for line in text.splitlines() if line.startswith("ExecStart="))
+        self.assertTrue(exec_line.endswith("ppp0 enp2s0"), exec_line)
+        # -f, not --config after -c was reused for --script in dhcpcd 10
+        self.assertIn("-f /etc/linux-router/dhcpcd.conf", exec_line)
+
+    def test_pd_refuses_when_ifupdown_owns_the_wan(self):
+        """Taking the interface over would kill the DHCP client providing its IPv4."""
+        with patch.object(pd_client, "dhcpcd_binary", return_value="/usr/sbin/dhcpcd"), patch.object(
+            pd_client, "dhcpcd_instances", return_value={"ppp0": 644}
+        ), patch.object(
+            pd_client, "ifupdown_managed_interfaces", return_value={"ppp0": "dhcp"}
+        ), patch.object(pd_client, "run_command") as runner:
+            result = pd_client.enable_pd(self.config())
+
+        self.assertFalse(result.ok)
+        self.assertIn("ifupdown", result.output)
+        self.assertIn("DEPLOYMENT.md", result.output)
+        # Nothing may be written or started when we bail out.
+        for call in runner.call_args_list:
+            self.assertNotIn("restart", call.args[0])
+
+    def test_pd_stops_orphan_instances_on_its_own_interfaces(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "pd-orphan"
+        workdir.mkdir(exist_ok=True)
+        config_dir = workdir / "etc"
+        service_path = workdir / "linux-router-pd.service"
+        hook_path = workdir / "99-linux-router"
+
+        def fake_run(command, timeout=8, env=None):
+            return ok()
+
+        with patch.object(pd_client, "dhcpcd_binary", return_value="/usr/sbin/dhcpcd"), patch.object(
+            pd_client, "dhcpcd_instances", return_value={"enp2s0": 999}
+        ), patch.object(pd_client, "ifupdown_managed_interfaces", return_value={}), patch.object(
+            pd_client, "run_command", side_effect=fake_run
+        ) as runner, patch.object(
+            pd_client, "PD_CONFIG_DIR", config_dir
+        ), patch.object(
+            pd_client, "PD_DHCPCD_CONF_PATH", config_dir / "dhcpcd.conf"
+        ), patch.object(
+            pd_client, "PD_HOOK_PATH", hook_path
+        ), patch.object(
+            pd_client, "PD_SERVICE_PATH", service_path
+        ), patch.object(
+            pd_client, "PD_STATE_PATH", workdir / "pd.json"
+        ), patch.object(
+            pd_client, "is_service_active", return_value=False
+        ), patch.object(
+            pd_client, "is_service_enabled", return_value=False
+        ):
+            result = pd_client.enable_pd(self.config())
+
+        self.assertTrue(result.ok, result.output)
+        self.assertIn("enp2s0 上的 dhcpcd 实例", result.output)
+        exits = [call.args[0] for call in runner.call_args_list if "-x" in call.args[0]]
+        self.assertEqual(exits, [["/usr/sbin/dhcpcd", "-x", "enp2s0"]])
+        self.assertTrue(service_path.exists())
 
     def test_first_lan_subnet_slices_delegations(self):
         self.assertEqual(pd_client.first_lan_subnet("2408:8207:6a1c:2f00::/60"), "2408:8207:6a1c:2f00::/64")
@@ -1211,6 +1274,112 @@ class PackageInstallTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertIn("Unable to locate", result.output)
+
+
+
+
+class NetworkStackOwnershipTests(unittest.TestCase):
+    """The panel writes settings through nmcli, which is a no-op for ifupdown NICs."""
+
+    def config(self, **overrides):
+        payload = {
+            "wan_interface": "ens3",
+            "lan_interface": "ens4",
+            "lan_network": "192.168.50.0/24",
+            "wan_ipv6_auto": "1",
+        }
+        payload.update(overrides)
+        config, error = routing.normalize_router_config(payload)
+        assert error is None, error
+        return config
+
+    def test_parse_ifupdown_interfaces_ignores_manual(self):
+        content = (
+            "source /etc/network/interfaces.d/*\n"
+            "auto lo\n"
+            "iface lo inet loopback\n"
+            "allow-hotplug ens3\n"
+            "iface ens3 inet dhcp\n"
+            "# iface ens4 inet static\n"
+            "iface ens4 inet manual\n"
+        )
+        parsed = core.parse_ifupdown_interfaces(content)
+        self.assertEqual(parsed, {"lo": "loopback", "ens3": "dhcp"})
+        self.assertNotIn("ens4", parsed)
+
+    def test_ifupdown_managed_interfaces_reads_dir(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "ifupdown"
+        workdir.mkdir(exist_ok=True)
+        main = workdir / "interfaces"
+        main.write_text("iface ens3 inet dhcp\n", encoding="utf-8")
+        dropin = workdir / "interfaces.d"
+        dropin.mkdir(exist_ok=True)
+        (dropin / "lan").write_text("iface ens4 inet static\n", encoding="utf-8")
+        with patch.object(core, "IFUPDOWN_INTERFACES_PATH", main), patch.object(
+            core, "IFUPDOWN_INTERFACES_DIR", dropin
+        ):
+            managed = core.ifupdown_managed_interfaces()
+        self.assertEqual(managed, {"ens3": "dhcp", "ens4": "static"})
+
+    def test_dhcpcd_instances_reads_per_interface_pid_files(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "dhcpcd-run"
+        workdir.mkdir(exist_ok=True)
+        (workdir / "ens3.pid").write_text(str(os.getpid()), encoding="utf-8")
+        (workdir / "ens9.pid").write_text("4194303", encoding="utf-8")  # not running
+        with patch.object(core, "DHCPCD_RUN_DIR", workdir):
+            instances = core.dhcpcd_instances()
+        self.assertEqual(instances, {"ens3": os.getpid()})
+
+    def test_wan_ipv6_is_refused_for_ifupdown_interface(self):
+        with patch.object(routing, "ifupdown_managed_interfaces", return_value={"ens3": "dhcp"}), patch.object(
+            routing, "run_command"
+        ) as runner:
+            result = routing.ensure_wan_ipv6(self.config())
+        self.assertFalse(result.ok)
+        self.assertIn("ifupdown", result.output)
+        runner.assert_not_called()
+
+    def test_wan_ipv6_still_works_for_nm_interface(self):
+        config = self.config()
+        devices = [{"device": "ens3", "connection": "Wired connection 1", "profile": {"ipv6_method": "disabled"}}]
+        with patch.object(routing, "ifupdown_managed_interfaces", return_value={}), patch.object(
+            routing, "gather_wired_network_info", return_value={"devices": devices}
+        ), patch.object(routing, "run_command", return_value=ok()) as runner:
+            result = routing.ensure_wan_ipv6(config)
+        self.assertTrue(result.ok)
+        self.assertEqual(runner.call_args_list[0].args[0][:3], ["nmcli", "connection", "modify"])
+
+    def test_dependency_rows_report_wan_owner(self):
+        config = self.config()
+        with patch.object(dependencies, "load_router_config", return_value=config), patch.object(
+            dependencies, "gather_wired_network_info", return_value={"devices": []}
+        ), patch.object(
+            dependencies, "ifupdown_managed_interfaces", return_value={"ens3": "dhcp"}
+        ), patch.object(
+            dependencies, "dhcpcd_instances", return_value={"ens3": 644}
+        ), patch.object(
+            dependencies, "get_router_nat_status",
+            return_value={"level": "ok", "summary": "", "details": "", "action": ""},
+        ), patch.object(dependencies, "get_firewall_status", return_value={
+            "available": True, "service_active": True, "service_enabled": True,
+            "nat4": True, "nat6": False, "input_table": False, "nat4_packets": 0, "nat6_packets": 0, "errors": [],
+        }), patch.object(dependencies, "_lan_has_address", return_value=True), patch.object(
+            dependencies, "get_ip_forward_status", return_value={"ipv4": "1", "ipv6": "1", "persistent": ""}
+        ), patch.object(
+            dependencies, "get_netplan_renderer_summary",
+            return_value={"ok": True, "level": "ok", "summary": "", "details": []},
+        ):
+            rows = dependencies.get_dependency_rows()
+
+        owner = next(row for row in rows if row["name"] == "WAN 接口归属")
+        self.assertEqual(owner["level"], "warning")
+        self.assertIn("ifupdown", owner["status"])
+        self.assertIn("不会生效", owner["detail"])
+
+        busy = next(row for row in rows if row["name"] == "dhcpcd 重复管理")
+        self.assertEqual(busy["level"], "error")
+        self.assertIn("PID 644", " ".join(busy["extra_details"]))
+        self.assertIn("ifupdown", " ".join(busy["extra_details"]))
 
 
 

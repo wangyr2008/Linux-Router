@@ -112,6 +112,31 @@ WAN(ppp0) --DHCPv6-PD--> dhcpcd --ia_pd--> 2408:...:2f00::/60
 - **Renumbering**: the ISP changing the prefix fires `DELEGATED6`, the hook calls `pd_hook.py`, which recomputes the LAN /64, rewrites dnsmasq and restarts it — clients pick up the new RA
 - **Lost delegation** (`EXPIRE6`/`STOP6`): the prefix is cleared and RA stops, no stale addresses
 
+#### Why this dhcpcd does not fight NetworkManager
+
+What conflicts is letting dhcpcd act as a **full network manager**: by default it grabs the IPv4
+address, the default route, `/etc/resolv.conf` and the hostname, overwriting NetworkManager's state.
+This instance is restricted to one job:
+
+| Measure | Effect |
+| --- | --- |
+| `noipv4` + `-6` | never touches IPv4; the WAN IPv4 address stays with NetworkManager |
+| `noipv6rs` + `nohook resolv.conf, hostname` | no RA handling, no DNS/hostname writes (what the dhcpcd manpage recommends for `ia_pd`) |
+| own config + own unit | never reads or writes `/etc/dhcpcd.conf`, never uses the distro `dhcpcd.service` |
+| explicit `WAN LAN` on the command line | only those NICs; `ia_pd` requires dhcpcd to run on the interface it delegates to |
+| LAN profile `ipv6.method ignore` | LAN IPv6 belongs to dhcpcd alone, NetworkManager will not flush it |
+
+Before starting, the panel checks for other dhcpcd instances on the WAN/LAN and **refuses to start
+PD with an explanation** instead of stealing their addresses.
+
+#### When ifupdown still owns the WAN
+
+Debian netinst writes `iface ens3 inet dhcp` into `/etc/network/interfaces`, and NetworkManager
+defaults to `[ifupdown] managed=false`, so it does not manage that NIC — ifupdown's own dhcpcd
+instance does (`/run/dhcpcd/ens3.pid`, while `dhcpcd.service` is *inactive*, which is why the
+service state alone is misleading). WAN settings written by the panel then have no effect and PD
+mode refuses to start. The router page flags this; the fix is in DEPLOYMENT.md («网络栈归属»).
+
 Verify with:
 
 ```bash

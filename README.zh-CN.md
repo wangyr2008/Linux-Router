@@ -130,6 +130,42 @@ WAN(ppp0) --DHCPv6-PD--> dhcpcd --ia_pd--> 拿到 2408:...:2f00::/60
 - **前缀变化**：运营商换前缀时 dhcpcd 触发 `DELEGATED6`，hook 调 `pd_hook.py`，重新算 LAN /64、重写 dnsmasq、重启服务，内网设备收到新 RA 后自动换地址
 - 前缀丢了（`EXPIRE6`/`STOP6`）：清空 LAN 前缀并停发 RA，不会残留旧地址
 
+#### 为什么这里的 dhcpcd 不会和 NetworkManager 打架
+
+会打架的是**让 dhcpcd 当完整网络管理器**：它默认会抢 IPv4 地址、默认路由、`/etc/resolv.conf` 和 hostname，和 NetworkManager 两套状态互相覆盖。我们把它限制成"只做一件事"：
+
+| 手段 | 作用 |
+| --- | --- |
+| `noipv4` + 启动参数 `-6` | 完全不碰 IPv4，WAN 的 IPv4 地址仍由 NetworkManager 提供 |
+| `noipv6rs` + `nohook resolv.conf, hostname` | 不发/不收 RA，不改 DNS 和主机名（这也是 dhcpcd 手册对 `ia_pd` 的明确建议） |
+| 独立配置 + 独立 unit | 不读也不改 `/etc/dhcpcd.conf`，不占用发行版的 `dhcpcd.service` |
+| 命令行显式列出 `WAN LAN` | 只在指定网口上跑，`ia_pd` 要求"dhcpcd 必须在被委派的接口上运行" |
+| LAN 连接 `ipv6.method ignore` | LAN 的 IPv6 地址只由 dhcpcd 管，NetworkManager 不去清 |
+
+反过来，如果启动前发现别的 dhcpcd 实例已经占着 WAN/LAN，面板**拒绝启动 PD 并说明原因**，而不是把对方的地址抢掉。
+
+#### WAN 被 ifupdown 管着怎么办
+
+Debian netinst 安装时会写 `/etc/network/interfaces`：
+
+```text
+allow-hotplug ens3
+iface ens3 inet dhcp
+```
+
+而 NetworkManager 默认 `[ifupdown] managed=false`，**不接管这类网口**——它们由 ifupdown 启动的一个 dhcpcd 实例在管（`/run/dhcpcd/ens3.pid`，注意此时 `dhcpcd.service` 是 inactive，只看服务状态会漏掉）。后果是面板对 WAN 的设置（自动获取 IPv6、MTU、静态地址）写了也不生效，PD 模式也会被拒绝启动。
+
+路由页会在这种情况下直接给出提示，依赖页的「WAN 接口归属」也会标黄。移交办法：
+
+```bash
+sudo cp /etc/network/interfaces /etc/network/interfaces.bak
+sudo sed -i 's/^allow-hotplug ens3/# allow-hotplug ens3/; s/^iface ens3 inet dhcp/# iface ens3 inet dhcp/' /etc/network/interfaces
+sudo systemctl stop ifup@ens3.service     # 杀掉那个 dhcpcd 实例
+sudo systemctl restart NetworkManager     # NM 接管并重新 DHCP
+```
+
+> ⚠️ 这条命令会让该网口短暂断网。如果这台机器是你 SSH 的目标，从 WAN 侧操作会掉线；请从 LAN 侧或本地控制台执行。
+
 验证：
 
 ```bash

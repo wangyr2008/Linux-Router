@@ -31,6 +31,9 @@ LAN_CONNECTION_NAME = "linux-router-lan"
 NETWORKMANAGER_CONFIG_PATH = Path("/etc/NetworkManager/NetworkManager.conf")
 NETWORKMANAGER_CONF_DIR = Path("/etc/NetworkManager/conf.d")
 NETPLAN_DIR = Path("/etc/netplan")
+IFUPDOWN_INTERFACES_PATH = Path("/etc/network/interfaces")
+IFUPDOWN_INTERFACES_DIR = Path("/etc/network/interfaces.d")
+DHCPCD_RUN_DIR = Path("/run/dhcpcd")
 ROUTER_PANEL_SYSCTL_PATH = Path("/etc/sysctl.d/90-router-panel.conf")
 NFTABLES_CONFIG_PATH = Path("/etc/nftables.conf")
 NFTABLES_CONF_DIR = Path("/etc/nftables.d")
@@ -616,6 +619,77 @@ def normalize_lan_network(value: str) -> tuple[IPv4Network | None, str | None]:
     return network, None
 
 
+def parse_ifupdown_interfaces(content: str) -> dict[str, str]:
+    """Map interface name -> address method from /etc/network/interfaces syntax.
+
+    Only stanzas that actually configure something are returned; `manual` means
+    ifupdown leaves the interface alone, so it does not count as managed.
+    """
+    managed: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 4 or parts[0] != "iface":
+            continue
+        name, method = parts[1], parts[3]
+        if method == "manual":
+            managed.pop(name, None)
+        else:
+            managed[name] = method
+    return managed
+
+
+def ifupdown_managed_interfaces() -> dict[str, str]:
+    """Interfaces that ifupdown still configures, with their address method.
+
+    Debian's netinst writes `iface <nic> inet dhcp` for the NIC used during
+    installation. With `[ifupdown] managed=false` NetworkManager then leaves that
+    NIC alone, so any WAN setting the panel writes through nmcli is ignored.
+    """
+    managed: dict[str, str] = {}
+    paths = [IFUPDOWN_INTERFACES_PATH]
+    try:
+        paths.extend(sorted(IFUPDOWN_INTERFACES_DIR.glob("*")))
+    except OSError:
+        pass
+    for path in paths:
+        content = read_text(str(path))
+        if content:
+            managed.update(parse_ifupdown_interfaces(content))
+    return managed
+
+
+def dhcpcd_instances() -> dict[str, int]:
+    """Interfaces currently handled by a dhcpcd instance.
+
+    dhcpcd keeps /run/dhcpcd/pid for the manager and /run/dhcpcd/<if>.pid for
+    per-interface daemons, so a running instance is visible even when
+    dhcpcd.service itself is inactive (ifupdown starts one this way).
+    """
+    instances: dict[str, int] = {}
+    try:
+        pid_files = list(DHCPCD_RUN_DIR.glob("*.pid"))
+    except OSError:
+        return instances
+    for pid_file in pid_files:
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            pass
+        instances[pid_file.stem] = pid
+    return instances
+
+
 def get_build_info() -> dict[str, str]:
     info = {"branch": "unknown", "build": "unknown"}
     try:
@@ -658,6 +732,9 @@ __all__ = [
     "NETWORKMANAGER_CONFIG_PATH",
     "NETWORKMANAGER_CONF_DIR",
     "NETPLAN_DIR",
+    "IFUPDOWN_INTERFACES_PATH",
+    "IFUPDOWN_INTERFACES_DIR",
+    "DHCPCD_RUN_DIR",
     "ROUTER_PANEL_SYSCTL_PATH",
     "NFTABLES_CONFIG_PATH",
     "NFTABLES_CONF_DIR",
@@ -701,6 +778,9 @@ __all__ = [
     "load_auth_config",
     "save_auth_config",
     "normalize_lan_network",
+    "parse_ifupdown_interfaces",
+    "ifupdown_managed_interfaces",
+    "dhcpcd_instances",
     "get_build_info",
     "is_service_active",
     "is_service_enabled",

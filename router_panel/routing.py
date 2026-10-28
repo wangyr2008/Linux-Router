@@ -22,6 +22,8 @@ from .core import (
     CommandResult,
     atomic_write_text,
     command_exists,
+    dhcpcd_instances,
+    ifupdown_managed_interfaces,
     is_service_active,
     is_service_enabled,
     load_os_release,
@@ -525,6 +527,20 @@ def ensure_wan_ipv6(config: dict[str, Any]) -> CommandResult:
     if not wan or not config.get("wan_ipv6_auto"):
         return CommandResult(True, "跳过 WAN IPv6 设置")
 
+    # A NIC still listed in /etc/network/interfaces is owned by ifupdown: with
+    # `[ifupdown] managed=false` NetworkManager leaves it alone, so an nmcli
+    # modify would either fail or be thrown away on the next ifup.
+    ifupdown_wan = ifupdown_managed_interfaces().get(wan, "")
+    if ifupdown_wan:
+        return CommandResult(
+            False,
+            (
+                f"WAN {wan} 由 ifupdown 管理（`iface {wan} inet {ifupdown_wan}`），"
+                f"NetworkManager 无法修改它的 IPv6 设置。"
+                f"要自动获取 IPv6，请先把该网口交给 NetworkManager（见 DEPLOYMENT.md「网络栈归属」）"
+            ),
+        )
+
     devices = gather_wired_network_info(config).get("devices", [])
     profile = next((item for item in devices if item.get("device") == wan), {})
     connection_name = str(profile.get("connection", "") or "")
@@ -761,6 +777,15 @@ def gather_router_status() -> dict[str, Any]:
     start, end = _dhcp_range(config)
     os_release = load_os_release()
     pd_status = pd_client.get_pd_status() if config.get("ipv6_mode") == IPV6_MODE_PD else {}
+    wan_name = str(config.get("wan_interface", "") or "")
+    ifupdown_map = ifupdown_managed_interfaces()
+    instances = dhcpcd_instances()
+    wan_owner = {
+        "interface": wan_name,
+        "managed_by": "ifupdown" if wan_name in ifupdown_map else "NetworkManager",
+        "method": ifupdown_map.get(wan_name, ""),
+        "dhcpcd_pid": instances.get(wan_name, 0),
+    }
 
     return {
         "config": config,
@@ -768,6 +793,7 @@ def gather_router_status() -> dict[str, Any]:
         "wan_candidates": wan_candidates,
         "wan": wan,
         "lan": lan,
+        "wan_owner": wan_owner,
         "ipv6": {
             "mode": config.get("ipv6_mode", IPV6_MODE_OFF),
             "mode_label": IPV6_MODE_LABELS.get(str(config.get("ipv6_mode", "")), "未知"),

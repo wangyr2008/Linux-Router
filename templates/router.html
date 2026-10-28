@@ -195,6 +195,15 @@
     >
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
+      {% if status.wan_owner and status.wan_owner.managed_by == 'ifupdown' %}
+      <p class="alert compact">
+        WAN 接口 {{ status.wan_owner.interface }} 由 ifupdown 管理（
+        <code>iface {{ status.wan_owner.interface }} inet {{ status.wan_owner.method }}</code>{% if status.wan_owner.dhcpcd_pid %}，dhcpcd PID {{ status.wan_owner.dhcpcd_pid }}{% endif %}），
+        NetworkManager 并没有接管它。这里的「WAN 自动获取 IPv6」和 MTU 不会生效，PD 模式也会被拒绝启动。
+        先把该网口移交 NetworkManager 再回来配置，步骤见 DEPLOYMENT.md「网络栈归属」。
+      </p>
+      {% endif %}
+
       <div class="form-grid">
         <label class="field">
           <span class="field-label">WAN 上行接口</span>

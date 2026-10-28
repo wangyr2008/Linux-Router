@@ -309,6 +309,45 @@ IPv6 模式说明：
 
 PD 模式会把 LAN 的 NetworkManager 连接设为 `ipv6.method ignore`，让 dhcpcd 独占 IPv6 地址；IPv4 仍由 NetworkManager 管理。
 
+### 网络栈归属（ifupdown / NetworkManager / dhcpcd）
+
+一台 Debian 上可能同时存在三套东西，先看清谁在管哪块网卡，否则会出现"面板改了没反应"：
+
+| 组件 | 判断方法 |
+| --- | --- |
+| ifupdown | `/etc/network/interfaces` 里有 `iface <网卡> inet dhcp`；`systemctl status ifup@<网卡>` |
+| NetworkManager | `nmcli -t -f DEVICE,STATE,CONNECTION device status`，连接名不是 `Ifupdown (xxx)` |
+| dhcpcd | `ls /run/dhcpcd/*.pid`（每接口实例）与 `/run/dhcpcd/pid`（管理器实例） |
+
+关键点：**`dhcpcd.service` 处于 inactive 并不代表没有 dhcpcd 在跑**。Debian netinst 会写
+`iface ens3 inet dhcp`，ifupdown 启动时就会拉起一个只针对 ens3 的 dhcpcd 实例
+（`/run/dhcpcd/ens3.pid`），而 NetworkManager 因为 `[ifupdown] managed=false` 并不接管这块网卡。
+这时面板对 WAN 的 IPv6 / MTU 设置写了也不生效，PD 模式会直接拒绝启动（否则会杀掉这个实例、断掉 WAN 的 IPv4 地址）。
+
+移交某块网口给 NetworkManager：
+
+```bash
+sudo cp /etc/network/interfaces /etc/network/interfaces.bak
+sudo sed -i 's/^allow-hotplug ens3/# allow-hotplug ens3/; s/^iface ens3 inet dhcp/# iface ens3 inet dhcp/' /etc/network/interfaces
+sudo systemctl stop ifup@ens3.service
+sudo systemctl restart NetworkManager
+nmcli -t -f DEVICE,STATE,CONNECTION device status   # 连接名不应再是 Ifupdown (ens3)
+```
+
+> ⚠️ 该网口会短暂断网，从 WAN 侧 SSH 操作会掉线；请从 LAN 侧或本地控制台执行。
+
+确认 PD 实例没有和别人抢网卡：
+
+```bash
+systemctl status linux-router-pd --no-pager
+ls -l /run/dhcpcd/
+ps -o pid,args -C dhcpcd
+```
+
+正常情况下只有一个 dhcpcd 进程，命令行形如
+`dhcpcd -6 -B -q -f /etc/linux-router/dhcpcd.conf <WAN> <LAN>`。
+如果还看到发行版的 `dhcpcd: <网卡> [ip4] [ip6]`，说明有另一套在管 IPv4，先按上表定位来源。
+
 ## 10. 常见故障排查
 
 ### Web 页面无法打开

@@ -14,6 +14,8 @@ from .core import (
     CommandResult,
     atomic_write_text,
     command_exists,
+    dhcpcd_instances,
+    ifupdown_managed_interfaces,
     is_service_active,
     is_service_enabled,
     run_command,
@@ -128,6 +130,12 @@ def render_hook_script(config: dict[str, Any]) -> str:
 
 def render_service_unit(config: dict[str, Any]) -> str:
     binary = dhcpcd_binary() or "/usr/sbin/dhcpcd"
+    wan = str(config.get("wan_interface", "") or "")
+    lan = str(config.get("lan_interface", "") or "")
+    # Interfaces must be named on the command line: ia_pd refuses to hand a prefix
+    # to an interface dhcpcd is not running on, and naming them keeps this instance
+    # in manager mode with its own /run/dhcpcd/pid instead of grabbing every NIC.
+    interfaces = " ".join(item for item in (wan, lan) if item)
     return "\n".join(
         [
             "[Unit]",
@@ -139,7 +147,9 @@ def render_service_unit(config: dict[str, Any]) -> str:
             "",
             "[Service]",
             "Type=simple",
-            f"ExecStart={binary} --nobackground --quiet --config {PD_DHCPCD_CONF_PATH}",
+            (
+                f"ExecStart={binary} -6 -B -q -f {PD_DHCPCD_CONF_PATH} {interfaces}"
+            ).strip(),
             "Restart=always",
             "RestartSec=10",
             "RuntimeDirectory=linux-router-pd",
@@ -261,12 +271,65 @@ def install_pd_client() -> CommandResult:
     return CommandResult(False, "安装 dhcpcd 失败，请检查 apt 源或手动执行 apt install dhcpcd")
 
 
-def _stop_conflicting_dhcpcd() -> bool:
-    """Our own unit needs the pidfile; the distro unit would collide."""
-    if not is_service_active(SYSTEM_DHCPCD_SERVICE) and not is_service_enabled(SYSTEM_DHCPCD_SERVICE):
-        return False
-    run_command(["systemctl", "disable", "--now", SYSTEM_DHCPCD_SERVICE], timeout=SYSTEM_COMMAND_TIMEOUT)
-    return True
+def _stop_conflicting_dhcpcd() -> list[str]:
+    """Clear every dhcpcd instance that would fight ours for an interface.
+
+    Three things can be in the way: the distribution unit, a per-interface daemon
+    started by ifupdown, and a manager instance left over from a manual run.
+    """
+    notes: list[str] = []
+    if is_service_active(SYSTEM_DHCPCD_SERVICE) or is_service_enabled(SYSTEM_DHCPCD_SERVICE):
+        run_command(
+            ["systemctl", "disable", "--now", SYSTEM_DHCPCD_SERVICE],
+            timeout=SYSTEM_COMMAND_TIMEOUT,
+        )
+        notes.append(f"已停止 {SYSTEM_DHCPCD_SERVICE}")
+    return notes
+
+
+def _check_interface_conflicts(config: dict[str, Any]) -> CommandResult:
+    """Refuse to start when another stack owns the WAN and we would break it.
+
+    Taking over an ifupdown-managed interface means killing the DHCP client that
+    currently provides its IPv4 address, which would drop the uplink (and any SSH
+    session) until the panel is reconfigured. That has to be a deliberate choice,
+    so report it instead of doing it silently.
+    """
+    wan = str(config.get("wan_interface", "") or "")
+    lan = str(config.get("lan_interface", "") or "")
+    instances = dhcpcd_instances()
+    managed = ifupdown_managed_interfaces()
+
+    for ifname in (wan, lan):
+        if not ifname or ifname not in instances:
+            continue
+        if ifname in managed:
+            return CommandResult(
+                False,
+                (
+                    f"接口 {ifname} 正由 ifupdown 的 dhcpcd 实例管理（/etc/network/interfaces 中 "
+                    f"`iface {ifname} inet {managed[ifname]}`），NetworkManager 并未接管它。"
+                    f"直接启动 PD 会杀掉这个实例、断开该网口的 IPv4 地址。"
+                    f"请先把 {ifname} 交给 NetworkManager，再切到 PD 模式："
+                    f"把 /etc/network/interfaces 里 `iface {ifname}` 一段改为 `manual`，"
+                    f"然后 systemctl restart NetworkManager。详见 DEPLOYMENT.md「网络栈归属」。"
+                ),
+            )
+    return CommandResult(True, "")
+
+
+def _take_over_instances(config: dict[str, Any]) -> list[str]:
+    """Stop dhcpcd instances on our interfaces that nothing else depends on."""
+    notes: list[str] = []
+    instances = dhcpcd_instances()
+    binary = dhcpcd_binary()
+    for ifname in (config.get("wan_interface"), config.get("lan_interface")):
+        if not ifname or ifname not in instances:
+            continue
+        if binary:
+            run_command([binary, "-x", str(ifname)], timeout=15)
+        notes.append(f"已停止 {ifname} 上的 dhcpcd 实例")
+    return notes
 
 
 def enable_pd(config: dict[str, Any]) -> CommandResult:
@@ -277,7 +340,12 @@ def enable_pd(config: dict[str, Any]) -> CommandResult:
     if not dhcpcd_available():
         return CommandResult(False, "系统未安装 dhcpcd，请先在依赖页面安装 PD 客户端")
 
-    stopped_system_unit = _stop_conflicting_dhcpcd()
+    conflict = _check_interface_conflicts(config)
+    if not conflict.ok:
+        return conflict
+
+    notes = _stop_conflicting_dhcpcd()
+    notes.extend(_take_over_instances(config))
 
     try:
         PD_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -301,12 +369,16 @@ def enable_pd(config: dict[str, Any]) -> CommandResult:
         {
             "wan": wan,
             "lan": lan,
-            "stopped_system_dhcpcd": stopped_system_unit,
+            "stopped_system_dhcpcd": bool(notes),
+            "notes": notes,
             "enabled_at": _utc_now(),
         }
     )
     save_pd_state(state)
-    return CommandResult(True, f"PD 客户端已启动（{wan} 请求前缀，{lan} 接收 /64）")
+    message = f"PD 客户端已启动（{wan} 请求前缀，{lan} 接收 /64）"
+    if notes:
+        message += "；" + "，".join(notes)
+    return CommandResult(True, message)
 
 
 def disable_pd() -> CommandResult:
@@ -418,6 +490,15 @@ def sync_from_system(delegated_prefix: str = "", reason: str = "") -> int:
 def get_pd_status() -> dict[str, Any]:
     state = load_pd_state()
     binary = dhcpcd_binary()
+    wan = str(state.get("wan", "") or "")
+    lan = str(state.get("lan", "") or "")
+    managed = ifupdown_managed_interfaces()
+    instances = dhcpcd_instances()
+    conflicts = [
+        {"interface": ifname, "method": managed[ifname]}
+        for ifname in (wan, lan)
+        if ifname and ifname in managed and ifname in instances
+    ]
     return {
         "available": bool(binary),
         "binary": binary,
@@ -426,11 +507,14 @@ def get_pd_status() -> dict[str, Any]:
         "service_enabled": is_service_enabled(PD_SERVICE_NAME),
         "prefix": str(state.get("prefix", "") or ""),
         "delegated": str(state.get("delegated", "") or ""),
-        "wan": str(state.get("wan", "") or ""),
-        "lan": str(state.get("lan", "") or ""),
+        "wan": wan,
+        "lan": lan,
         "reason": str(state.get("reason", "") or ""),
         "updated_at": str(state.get("updated_at", "") or ""),
         "error": str(state.get("error", "") or ""),
+        "instances": instances,
+        "ifupdown_managed": managed,
+        "conflicts": conflicts,
     }
 
 

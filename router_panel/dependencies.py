@@ -18,7 +18,9 @@ from .core import (
     CommandResult,
     atomic_write_text,
     command_exists,
+    dhcpcd_instances,
     file_update_lock,
+    ifupdown_managed_interfaces,
     is_service_active,
     is_service_enabled,
     package_installed,
@@ -426,6 +428,41 @@ def get_dependency_rows() -> list[dict[str, Any]]:
     lan_configured = _lan_has_address(config)
     protected = str(config.get("firewall_mode", "")) == "protect"
     native_ipv6 = str(config.get("ipv6_mode", "")) in {IPV6_MODE_PD, "static"}
+
+    # Which stack actually owns each interface. ifupdown keeps a per-interface
+    # dhcpcd running (visible in /run/dhcpcd/<if>.pid) even when dhcpcd.service is
+    # inactive, so the service state alone says nothing.
+    wan_name = str(config.get("wan_interface", "") or "")
+    lan_name = str(config.get("lan_interface", "") or "")
+    ifupdown_map = ifupdown_managed_interfaces()
+    instances = dhcpcd_instances()
+    own_pd_active = is_service_active(PD_SERVICE_NAME)
+    per_interface = {name: pid for name, pid in instances.items() if name != "pid"}
+    stack_conflicts = {
+        name: pid for name, pid in per_interface.items() if name in {wan_name, lan_name}
+    }
+    dhcpcd_busy = bool(stack_conflicts) or (active_dhcpcd and not own_pd_active)
+    dhcpcd_details = [
+        (
+            f"{name}: PID {pid}，由 ifupdown 启动（{ifupdown_map[name]}）"
+            if name in ifupdown_map
+            else f"{name}: PID {pid}"
+        )
+        for name, pid in sorted(stack_conflicts.items())
+    ]
+    if active_dhcpcd and not own_pd_active:
+        dhcpcd_details.append("dhcpcd.service 正在运行，会与面板争用默认路由与 DNS")
+    wan_owner_ifupdown = wan_name in ifupdown_map
+    wan_owner_label = (
+        f"ifupdown（{ifupdown_map[wan_name]}）" if wan_owner_ifupdown else "NetworkManager"
+    )
+    wan_owner_details = []
+    if wan_owner_ifupdown:
+        wan_owner_details = [
+            f"/etc/network/interfaces: iface {wan_name} inet {ifupdown_map[wan_name]}",
+            "面板的「WAN 自动获取 IPv6」与 MTU 不会生效，PD 模式会被拒绝启动",
+            "移交步骤见 DEPLOYMENT.md「网络栈归属」",
+        ]
     package_details = {
         "python3-flask": "提供网页运行框架",
         "gunicorn": "运行网页服务",
@@ -511,12 +548,27 @@ def get_dependency_rows() -> list[dict[str, Any]]:
             },
             {
                 "group": "网络接管",
-                "name": "dhcpcd 服务冲突",
-                "status": "有异常" if active_dhcpcd else "无异常",
-                "level": "error" if active_dhcpcd else "ok",
+                "name": "dhcpcd 重复管理",
+                "status": "有异常" if dhcpcd_busy else "无异常",
+                "level": "error" if dhcpcd_busy else "ok",
                 "detail": "避免重复管理网卡",
-                "action": "disable_dhcpcd" if active_dhcpcd else "",
+                "extra_details": dhcpcd_details,
+                "action": "disable_dhcpcd" if dhcpcd_busy else "",
                 "action_label": "停止并禁用",
+            },
+            {
+                "group": "网络接管",
+                "name": "WAN 接口归属",
+                "status": wan_owner_label,
+                "level": "warning" if wan_owner_ifupdown else "ok",
+                "detail": (
+                    f"{wan_name} 由 ifupdown 管理，面板对 WAN 的 IPv6 / MTU 设置不会生效"
+                    if wan_owner_ifupdown
+                    else "WAN 由 NetworkManager 管理，面板设置可以生效"
+                ),
+                "extra_details": wan_owner_details,
+                "action": "",
+                "action_label": "",
             },
             {
                 "group": "网络接管",
