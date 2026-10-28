@@ -27,6 +27,7 @@ DNSMASQ_CONF="/etc/dnsmasq.conf"
 SYSCTL_FILE="/etc/sysctl.d/90-router-panel.conf"
 CONFIGURE_NETWORK=1
 NETWORK_APPLY_MODE="auto"
+WITH_PD=0
 ACTION=""
 PURGE_DATA=0
 NEW_PASSWORD=""
@@ -389,6 +390,12 @@ uninstall_router_panel() {
   systemctl daemon-reload
   systemctl reset-failed "$SERVICE_NAME" "$AGENT_SERVICE_NAME" >/dev/null 2>&1 || true
 
+  systemctl disable --now linux-router-pd.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/linux-router-pd.service
+  rm -f /usr/lib/dhcpcd/dhcpcd-hooks/99-linux-router
+  rm -rf /etc/linux-router
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
   rm -f "$SYSCTL_FILE"
   if [[ "$has_install_state" -eq 1 ]]; then
     if restore_persisted_file "/etc/NetworkManager/conf.d/90-linux-router.conf" "networkmanager.conf"; then
@@ -517,6 +524,7 @@ Options:
   --source-dir PATH          Install from a local source directory (no download)
   --install-dir PATH         Application directory (default: /opt/linux-router)
   --data-dir PATH            Persistent data directory (default: /var/lib/linux-router)
+  --with-pd                  Also install dhcpcd for DHCPv6 prefix delegation
   --no-network-config        Do not write NetworkManager or netplan configuration
   --apply-network-now        Apply network configuration even over SSH
   --defer-network-restart    Write network configuration without applying it now
@@ -567,6 +575,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || die "--data-dir requires a value"
       DATA_DIR="${2%/}"
       shift 2
+      ;;
+    --with-pd)
+      WITH_PD=1
+      shift
       ;;
     --no-network-config)
       CONFIGURE_NETWORK=0
@@ -662,18 +674,24 @@ if [[ "$ACTION" == "install" ]]; then
   apt-get update
   # Deliberately no iptables, iw, wpasupplicant or hostapd: this build is wired-only
   # and uses the nftables stack that ships with Debian 13.
-  apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    dnsmasq \
-    gunicorn \
-    iproute2 \
-    nftables \
-    network-manager \
-    python3 \
-    python3-flask \
-    tar \
+  install_packages=(
+    ca-certificates
+    curl
+    dnsmasq
+    gunicorn
+    iproute2
+    nftables
+    network-manager
+    python3
+    python3-flask
+    tar
     udev
+  )
+  # Optional: only needed for the "运营商 PD 自动" IPv6 mode.
+  if [[ "$WITH_PD" -eq 1 ]]; then
+    install_packages+=(dhcpcd)
+  fi
+  apt-get install -y --no-install-recommends "${install_packages[@]}"
 else
   for command_name in curl tar python3 gunicorn systemd-analyze nft dnsmasq; do
     command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name"

@@ -17,7 +17,7 @@
 | --- | --- | --- |
 | 无线 | Wi-Fi 连接、热点、AP+STA 并发、热点保活 | **全部移除**，只保留有线 |
 | 转发后端 | `iptables` + NetworkManager `ipv4.method shared` | **nftables**（Debian 13 默认），规则由面板生成 |
-| IPv6 | 无 | **双栈**：WAN 自动 SLAAC/DHCPv6，LAN 支持 ULA+NAT66 或全局前缀 |
+| IPv6 | 无 | **双栈**：WAN 自动 SLAAC/DHCPv6，LAN 支持 **运营商 PD 自动**、ULA+NAT66 或全局前缀 |
 | DHCP/DNS | dnsmasq-base（仅热点用） | `dnsmasq` 独立服务，提供 DHCPv4、RA、DHCPv6 与 LAN DNS |
 | 依赖 | `iptables`、`iw`、`wpasupplicant`、`hostapd` 相关 | 去掉以上全部，仅保留 Flask/Gunicorn/NetworkManager/dnsmasq/nftables |
 | 页面 | 概览 / 依赖 / 有线 / 无线 / 热点 / 工具 / 设备 / 设置 | 概览 / 依赖 / 有线 / **路由** / 设备 / 工具 / 设置 |
@@ -52,6 +52,9 @@ python3 python3-flask gunicorn network-manager dnsmasq nftables iproute2 udev cu
 ```bash
 # 在设备上，源码目录例如 /root/Linux-Router
 sudo bash /root/Linux-Router/install.sh install --source-dir /root/Linux-Router
+
+# 需要公网 IPv6（PD 模式）时顺便装上 dhcpcd
+sudo bash /root/Linux-Router/install.sh install --source-dir /root/Linux-Router --with-pd
 ```
 
 方式二：从 GitHub 分支安装（先把本分支推到你自己的仓库/分支）：
@@ -98,19 +101,47 @@ sudo bash /tmp/linux-router-install.sh install
 应用时会依次写入 dnsmasq 配置 → 配置 LAN 地址 → 加载 nftables 规则 → 启用转发 → 重启 dnsmasq。
 **如果改了 LAN 地址，当前页面需要用新地址重新打开。**
 
-## IPv6 三种模式
+## IPv6 四种模式
 
 | 模式 | 适用场景 | LAN 前缀 | NAT66 | 说明 |
 | --- | --- | --- | --- | --- |
-| `ULA + NAT66`（默认） | 运营商没给 IPv6，或不想折腾前缀委派 | 自动生成 `fdxx:xxxx:xxxx::/64` | 开 | 内网设备可访问 IPv6 外网，外部无法主动连入 |
-| `全局前缀（纯路由）` | 运营商已下发固定 /64，或你自己做了前缀委派 | 你填写的 `2408:...::/64` | 关 | 标准路由，内网设备拿到公网 IPv6 |
+| `运营商 PD 自动` | 光猫桥接、工控机自己 PPPoE 拨号 | 运营商委派的前缀里取第一个 /64 | 关 | 内网设备拿到**公网 IPv6**，可被外部访问；前缀变化自动跟随 |
+| `ULA + NAT66`（默认） | 运营商没给 IPv6，或光猫是路由模式 | 自动生成 `fdxx:xxxx:xxxx::/64` | 开 | 内网设备能出不能进 |
+| `全局前缀（纯路由）` | 已知道固定 /64，或 PD 由别处代劳 | 你填写的 `2408:...::/64` | 关 | 标准路由，前缀变了要手改 |
 | `关闭` | 只要 IPv4 | 无 | 关 | dnsmasq 不发 RA |
 
 WAN 侧默认勾选“WAN 自动获取 IPv6”，面板会把 WAN 连接的 `ipv6.method` 设为 `auto`（SLAAC + DHCPv6）。
+PPPoE 拨号时 WAN 要选 **ppp0**（逻辑接口），不是物理网卡。
 
-> **关于前缀委派（PD）**：NetworkManager 本身不做 PD。如果你的运营商只给 PD 不给固定 /64，可以在系统里另外跑
-> `dhcpcd` 或 `odhcp6c` 拿到前缀，然后把分到的 /64 填到“全局前缀”模式里，本面板不做 NAT66，只做转发。
-> 想完全零依赖，用默认的 ULA + NAT66 即可。
+### PD 模式怎么工作
+
+NetworkManager 至今不支持 DHCPv6-PD，所以 PD 模式用一个只做前缀委派的 `dhcpcd` 实例补上这一环：
+
+```text
+WAN(ppp0) --DHCPv6-PD--> dhcpcd --ia_pd--> 拿到 2408:...:2f00::/60
+                                            └─ 第一个 /64 配到 LAN(enp2s0)
+                                               └─ hook 重写 dnsmasq 的 RA 前缀并重启
+```
+
+- 依赖只多一个 `dhcpcd`（Debian 13 自带仓库，约 300KB），安装时加 `--with-pd`，或在面板“依赖”页点“安装 PD 客户端”
+- `dhcpcd` 用独立配置 `/etc/linux-router/dhcpcd.conf` 和独立服务 `linux-router-pd.service`，**不改** `/etc/dhcpcd.conf`
+- 配置里 `noipv4` + `noipv6rs` + `nohook resolv.conf, hostname`：IPv4、WAN 地址、DNS 仍归 NetworkManager，dhcpcd 只负责要前缀
+- LAN 的 IPv6 地址由 dhcpcd 分配，所以 NetworkManager 的 LAN 连接被设为 `ipv6.method ignore`，避免两边互相清地址
+- **前缀变化**：运营商换前缀时 dhcpcd 触发 `DELEGATED6`，hook 调 `pd_hook.py`，重新算 LAN /64、重写 dnsmasq、重启服务，内网设备收到新 RA 后自动换地址
+- 前缀丢了（`EXPIRE6`/`STOP6`）：清空 LAN 前缀并停发 RA，不会残留旧地址
+
+验证：
+
+```bash
+systemctl status linux-router-pd --no-pager
+dhcpcd --variables | grep -i prefix     # 或在 WAN 上抓包看 IA_PD
+ip -6 addr show dev <LAN> scope global  # 应该有 2408:...::1/64
+cat /var/lib/linux-router/pd.json        # 面板显示的委派前缀就来自这里
+journalctl -u linux-router-pd -n 50 --no-pager
+```
+
+> 前缀委派要求运营商真的给 PD（多数家宽给 /60 或 /56，桥接 + 自己拨号才拿得到）。
+> 如果光猫是路由模式，前缀会被光猫吃掉，这时只能用 ULA + NAT66。
 
 ## nftables 规则
 

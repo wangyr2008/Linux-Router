@@ -33,10 +33,13 @@ from .core import (
 from .firewall import apply_ruleset, get_firewall_status, render_nftables_ruleset
 from .network import (
     gather_wired_network_info,
+    get_device_details,
     get_interface_addresses,
     get_interface_neighbors,
+    list_all_interfaces,
 )
 from .network_parsers import parse_dnsmasq_leases
+from . import pd as pd_client
 
 ProgressCallback = Callable[[str], None]
 
@@ -45,11 +48,13 @@ LEASE_RE = re.compile(r"^[0-9]+[smhd]?$")
 IPV6_MODE_OFF = "off"
 IPV6_MODE_ULA = "ula"
 IPV6_MODE_STATIC = "static"
-IPV6_MODES = (IPV6_MODE_OFF, IPV6_MODE_ULA, IPV6_MODE_STATIC)
+IPV6_MODE_PD = "pd"
+IPV6_MODES = (IPV6_MODE_ULA, IPV6_MODE_PD, IPV6_MODE_STATIC, IPV6_MODE_OFF)
 IPV6_MODE_LABELS = {
-    IPV6_MODE_OFF: "关闭 IPv6",
     IPV6_MODE_ULA: "ULA 私有前缀 + NAT66",
+    IPV6_MODE_PD: "运营商 PD 自动（dhcpcd）",
     IPV6_MODE_STATIC: "运营商下发的全局前缀（纯路由）",
+    IPV6_MODE_OFF: "关闭 IPv6",
 }
 
 DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
@@ -89,10 +94,12 @@ def generate_ula_prefix() -> str:
         if seed:
             break
     digest = hashlib.sha256(seed).digest()[:5] if seed else secrets.token_bytes(5)
-    return (
+    raw = (
         f"fd{digest[0]:02x}:{digest[1]:02x}{digest[2]:02x}:"
         f"{digest[3]:02x}{digest[4]:02x}::/64"
     )
+    # Canonical form, so a generated prefix equals the one re-read from the file.
+    return str(ipaddress.ip_network(raw))
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -154,6 +161,9 @@ def _normalize_ipv6_prefix(raw: str, mode: str) -> tuple[str, str | None]:
     value = raw.strip()
     if mode == IPV6_MODE_OFF:
         return "", None
+    if mode == IPV6_MODE_PD:
+        # The prefix is delegated by the ISP; whatever the form sent is ignored.
+        return "", None
     if not value:
         if mode == IPV6_MODE_ULA:
             return generate_ula_prefix(), None
@@ -179,6 +189,7 @@ def normalize_router_config(
     payload: dict[str, Any],
     existing: dict[str, Any] | None = None,
     available_interfaces: list[str] | None = None,
+    available_wan_interfaces: list[str] | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     base = dict(DEFAULT_ROUTER_CONFIG)
     if existing:
@@ -200,10 +211,10 @@ def normalize_router_config(
         return config, f"LAN 接口名称无效：{lan}"
     if wan and wan == lan:
         return config, "WAN 和 LAN 不能是同一块网卡"
-    if available_interfaces:
-        for label, ifname in (("WAN", wan), ("LAN", lan)):
-            if ifname and ifname not in available_interfaces:
-                return config, f"{label} 接口 {ifname} 不存在或不是有线网卡"
+    if available_wan_interfaces and wan and wan not in available_wan_interfaces:
+        return config, f"WAN 接口 {wan} 不存在"
+    if available_interfaces and lan and lan not in available_interfaces:
+        return config, f"LAN 接口 {lan} 不存在或不是有线网卡"
 
     network, error = normalize_lan_network(get("lan_network"))
     if error or network is None:
@@ -268,7 +279,8 @@ def normalize_router_config(
     else:
         config["dhcp_start"], config["dhcp_end"] = _dhcp_range(config)
 
-    if config["ipv6_mode"] == IPV6_MODE_STATIC:
+    if config["ipv6_mode"] in {IPV6_MODE_STATIC, IPV6_MODE_PD}:
+        # Both modes route the ISP prefix natively; NAT66 would defeat the point.
         config["ipv6_nat"] = False
 
     return config, None
@@ -293,6 +305,9 @@ def load_router_config() -> dict[str, Any]:
             payload = {}
 
     config, _ = normalize_router_config(payload)
+    if config.get("ipv6_mode") == IPV6_MODE_PD:
+        # In PD mode the LAN /64 is owned by the delegation, not by the config file.
+        config["ipv6_prefix"] = pd_client.lan_prefix()
     return config
 
 
@@ -443,7 +458,11 @@ def ensure_lan_connection(config: dict[str, Any]) -> CommandResult:
             "ipv4.ignore-auto-dns", "yes",
         ]
     )
-    if ipv6_network is not None and ipv6_address is not None:
+    if config.get("ipv6_mode") == IPV6_MODE_PD:
+        # dhcpcd owns the delegated address on this interface; NM must keep its
+        # hands off IPv6 or it would flush the prefix on every reactivation.
+        command.extend(["ipv6.method", "ignore"])
+    elif ipv6_network is not None and ipv6_address is not None:
         command.extend(
             [
                 "ipv6.method", "manual",
@@ -559,6 +578,18 @@ def apply_router_config(
     if not forward_result.ok:
         return forward_result
 
+    # Persist first: the PD hook re-reads the config to know the LAN interface.
+    save_router_config(config)
+
+    pd_result = CommandResult(True, "")
+    if config.get("ipv6_mode") == IPV6_MODE_PD:
+        report("启动 PD 客户端")
+        pd_result = pd_client.enable_pd(config)
+        if not pd_result.ok:
+            return pd_result
+    else:
+        pd_client.disable_pd()
+
     report("启动 dnsmasq")
     run_command(["systemctl", "enable", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
     restarted = run_command(["systemctl", "restart", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
@@ -568,11 +599,17 @@ def apply_router_config(
     report("检查 WAN IPv6")
     wan_ipv6 = ensure_wan_ipv6(config)
 
-    save_router_config(config)
+    if config.get("ipv6_mode") == IPV6_MODE_PD:
+        report("等待运营商下发前缀")
+        pd_client.sync_from_system(reason="apply")
+
     message = (
         f"路由配置已生效：WAN {config['wan_interface']} → LAN {config['lan_interface']}"
         f"（{lan_gateway_ipv4(config)}/{_lan_ipv4_network(config).prefixlen}）"
     )
+    if config.get("ipv6_mode") == IPV6_MODE_PD:
+        prefix = pd_client.lan_prefix()
+        message += f"；PD 前缀 {prefix}" if prefix else "；PD 前缀尚未下发，面板会自动跟随"
     if not wan_ipv6.ok:
         message += f"；WAN IPv6 未启用：{wan_ipv6.output}"
     return CommandResult(True, message)
@@ -583,22 +620,32 @@ def apply_router_config(
 # ---------------------------------------------------------------------------
 
 
-def _interface_status(config: dict[str, Any], ifname: str, devices: list[dict[str, Any]]) -> dict[str, Any]:
+def _interface_status(
+    ifname: str,
+    devices: list[dict[str, Any]],
+    all_interfaces: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Works for ethernet NICs and for logical uplinks such as ppp0."""
     device = next((item for item in devices if item.get("device") == ifname), {})
+    generic = next((item for item in all_interfaces if item.get("name") == ifname), {})
+    details = get_device_details(ifname) if ifname else {}
     addresses = get_interface_addresses(ifname) if ifname else {"ipv4": [], "ipv6": []}
-    details = device.get("details", {})
+    ipv4 = addresses["ipv4"] or details.get("ipv4", [])
+    ipv6 = addresses["ipv6"] or details.get("ipv6", [])
+    state = device.get("state") or generic.get("state", "")
+    state_label = device.get("state_label") or generic.get("state_label", "未知")
     return {
         "interface": ifname,
-        "state": device.get("state", ""),
-        "state_label": device.get("state_label", "未知"),
+        "state": state,
+        "state_label": state_label,
         "connection": device.get("connection", ""),
-        "link_speed": details.get("link_speed", "未知"),
-        "ipv4": addresses["ipv4"] or details.get("ipv4", []),
-        "ipv6": addresses["ipv6"] or details.get("ipv6", []),
+        "link_speed": device.get("details", {}).get("link_speed", "未知"),
+        "ipv4": ipv4,
+        "ipv6": ipv6,
         "gateway": details.get("gateway", ""),
         "gateway6": details.get("gateway6", ""),
         "dns": details.get("dns", []),
-        "online": device.get("state") == "connected" and bool(addresses["ipv4"] or addresses["ipv6"]),
+        "online": state == "connected" and bool(ipv4 or ipv6),
     }
 
 
@@ -620,6 +667,7 @@ def gather_router_status() -> dict[str, Any]:
     wired = gather_wired_network_info(config)
     devices = wired.get("devices", [])
     errors = list(wired.get("errors", []))
+    all_interfaces = list_all_interfaces()
 
     interfaces = [
         {
@@ -634,8 +682,21 @@ def gather_router_status() -> dict[str, Any]:
         for device in devices
     ]
 
-    wan = _interface_status(config, str(config.get("wan_interface", "") or ""), devices)
-    lan = _interface_status(config, str(config.get("lan_interface", "") or ""), devices)
+    # The WAN can be a logical interface (ppp0 for PPPoE), so it gets its own list.
+    wan_candidates = [
+        {
+            "name": item["name"],
+            "state": item["state"],
+            "state_label": item["state_label"],
+            "ipv4": item.get("ipv4", []),
+            "ipv6": item.get("ipv6", []),
+            "default_route": item.get("default_route", False),
+        }
+        for item in all_interfaces
+    ]
+
+    wan = _interface_status(str(config.get("wan_interface", "") or ""), devices, all_interfaces)
+    lan = _interface_status(str(config.get("lan_interface", "") or ""), devices, all_interfaces)
 
     ipv6_network = lan_ipv6_network(config)
     ipv6_address = lan_ipv6_address(config)
@@ -669,10 +730,12 @@ def gather_router_status() -> dict[str, Any]:
 
     start, end = _dhcp_range(config)
     os_release = load_os_release()
+    pd_status = pd_client.get_pd_status() if config.get("ipv6_mode") == IPV6_MODE_PD else {}
 
     return {
         "config": config,
         "interfaces": interfaces,
+        "wan_candidates": wan_candidates,
         "wan": wan,
         "lan": lan,
         "ipv6": {
@@ -684,6 +747,7 @@ def gather_router_status() -> dict[str, Any]:
             "wan_addresses": wan_ipv6_global,
             "wan_online": bool(wan_ipv6_global),
         },
+        "pd": pd_status,
         "dhcp": {
             "enabled": bool(config.get("dhcp_enabled")),
             "start": start,
@@ -783,6 +847,10 @@ def gather_client_status() -> dict[str, Any]:
 
 __all__ = [
     "DEFAULT_ROUTER_CONFIG",
+    "IPV6_MODE_OFF",
+    "IPV6_MODE_PD",
+    "IPV6_MODE_STATIC",
+    "IPV6_MODE_ULA",
     "IPV6_MODE_LABELS",
     "IPV6_MODES",
     "apply_router_config",

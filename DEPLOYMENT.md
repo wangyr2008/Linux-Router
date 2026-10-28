@@ -32,6 +32,12 @@ sudo apt-get install -y --no-install-recommends \
   ca-certificates
 ```
 
+需要「运营商 PD 自动」模式时再补一个包（其余模式不需要）：
+
+```bash
+sudo apt-get install -y --no-install-recommends dhcpcd
+```
+
 组件用途：
 
 - `python3-flask`、`gunicorn`：运行 Web 服务；
@@ -286,11 +292,22 @@ cat /var/lib/misc/dnsmasq.leases
 
 IPv6 模式说明：
 
+- `运营商 PD 自动`：`linux-router-pd.service` 里的 dhcpcd 在 WAN 上请求前缀，把第一个 /64 配到 LAN，hook 重写 dnsmasq；
 - `ULA + NAT66`：LAN 用 `fdxx::/64`，nftables 生成 `lr_nat6` 做 masquerade，不依赖运营商；
 - `全局前缀`：把运营商分配或自行委派得到的 /64 填进去，不做 NAT66，只做转发；
 - `关闭`：dnsmasq 不发 RA，`lr_nat6` 表会被删除。
 
-NetworkManager 不实现前缀委派（PD）。需要 PD 时在系统里另行运行 `dhcpcd` 或 `odhcp6c` 取前缀，再把 /64 填到“全局前缀”模式。
+### PD 模式相关文件
+
+| 路径 | 作用 |
+| --- | --- |
+| `/etc/linux-router/dhcpcd.conf` | 只做 PD 的 dhcpcd 配置（`noipv4`、`noipv6rs`、`ia_pd`） |
+| `/usr/lib/dhcpcd/dhcpcd-hooks/99-linux-router` | dhcpcd 事件 hook，被 `dhcpcd-run-hooks` source |
+| `/etc/systemd/system/linux-router-pd.service` | 独立 dhcpcd 实例，不占用发行版 `dhcpcd.service` |
+| `$DATA_DIR/pd.json` | 当前委派前缀、触发事件、上次同步时间与错误 |
+| `/opt/linux-router/pd_hook.py` | hook 的入口，重算 LAN /64 并重写 dnsmasq |
+
+PD 模式会把 LAN 的 NetworkManager 连接设为 `ipv6.method ignore`，让 dhcpcd 独占 IPv6 地址；IPv4 仍由 NetworkManager 管理。
 
 ## 10. 常见故障排查
 
@@ -351,6 +368,22 @@ nmcli -g ipv4.addresses,ipv4.never-default connection show linux-router-lan
 ```
 
 如果面板“依赖”页提示 NAT 规则未加载，点“重新加载规则”即可（等价于 `nft -f /etc/nftables.d/90-linux-router.nft`）。
+
+### PD 拿不到前缀
+
+```bash
+systemctl status linux-router-pd --no-pager
+journalctl -u linux-router-pd -n 80 --no-pager
+cat /var/lib/linux-router/pd.json
+sudo tcpdump -i <WAN接口> -nv 'ip6 and (port 546 or port 547)'
+```
+
+依次确认：
+
+1. WAN 选的是逻辑接口（PPPoE 是 `ppp0`，不是 `enp1s0`）；
+2. 抓包里 Advertise 是否带 `IA_PD`（不带就是运营商没给前缀，只能用 ULA + NAT66）；
+3. `pd.json` 里 `delegated` 有值但 `prefix` 为空，说明 hook 没跑或 LAN 没拿到地址，看 `journalctl -u linux-router-pd` 与 `ip -6 addr show dev <LAN>`；
+4. 光猫是否真的是桥接（路由模式下前缀会被光猫吃掉）。
 
 ### IPv6 不通
 

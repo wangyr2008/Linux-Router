@@ -145,6 +145,31 @@
     </dl>
   </article>
 
+  {% if config.ipv6_mode == 'pd' %}
+  {% set pd = status.pd or {} %}
+  <article class="card">
+    <h3 class="card-title">{{ icon("globe") }}<span>IPv6 前缀委派</span></h3>
+    <dl class="key-value">
+      <div>
+        <dt>PD 客户端</dt>
+        <dd>
+          <span class="status-badge status-{{ 'ok' if pd.service_active else 'error' }}">{{ '运行中' if pd.service_active else ('已安装未运行' if pd.available else '未安装 dhcpcd') }}</span>
+        </dd>
+      </div>
+      <div><dt>运营商委派</dt><dd class="mono-value">{{ pd.delegated or '尚未收到' }}</dd></div>
+      <div><dt>LAN /64</dt><dd class="mono-value">{{ pd.prefix or '等待下发' }}</dd></div>
+      <div><dt>最近更新</dt><dd class="mono-value">{{ pd.updated_at or '无' }}</dd></div>
+      <div><dt>触发事件</dt><dd class="mono-value">{{ pd.reason or '无' }}</dd></div>
+      <div>
+        <dt>同步状态</dt>
+        <dd>
+          <span class="status-badge status-{{ 'error' if pd.error else 'ok' }}">{{ pd.error or '正常' }}</span>
+        </dd>
+      </div>
+    </dl>
+  </article>
+  {% endif %}
+
   {% if status.errors %}
   <article class="card card-wide">
     <h3 class="card-title">{{ icon("server") }}<span>读取异常</span></h3>
@@ -168,11 +193,11 @@
           WAN 上行接口
           <select name="wan_interface" required>
             <option value="">请选择</option>
-            {% for item in status.interfaces %}
-            <option value="{{ item.name }}" {{ 'selected' if item.name == config.wan_interface else '' }}>{{ item.name }}（{{ item.link_speed or '未知' }}）</option>
+            {% for item in status.wan_candidates %}
+            <option value="{{ item.name }}" {{ 'selected' if item.name == config.wan_interface else '' }}>{{ item.name }}{% if item.default_route %} · 当前默认路由{% endif %}{% if item.ipv4 %} · {{ item.ipv4[0] }}{% endif %}</option>
             {% endfor %}
           </select>
-          <p class="muted form-hint">连接光猫/上级路由的网口，IPv4 由 DHCP 或静态配置决定</p>
+          <p class="muted form-hint">PPPoE 拨号时选 ppp0（不是物理网卡）；DHCP 上网时选接光猫的网口</p>
         </label>
         <label>
           LAN 局域网接口
@@ -235,11 +260,11 @@
         <label>
           LAN IPv6 前缀
           <input type="text" class="mono-value" name="ipv6_prefix" value="{{ config.ipv6_prefix }}" placeholder="fd00:50::/64 或 2408:8207:1234:5600::/64">
-          <p class="muted form-hint">留空时 ULA 模式会自动生成私有前缀；全局前缀模式必须填写运营商分配的 /64</p>
+          <p class="muted form-hint">ULA 模式留空自动生成；全局前缀模式必填；PD 模式忽略此项，由运营商下发</p>
         </label>
         <label class="checkbox-field">
           <input type="checkbox" name="ipv6_nat" value="1" {{ 'checked' if config.ipv6_nat else '' }}>
-          <span>启用 IPv6 NAT66（ULA 模式需要）</span>
+          <span>启用 IPv6 NAT66（仅 ULA 模式生效）</span>
         </label>
       </div>
 

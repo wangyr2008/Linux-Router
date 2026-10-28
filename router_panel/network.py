@@ -321,6 +321,72 @@ def get_connection_methods(connection_name: str) -> tuple[str, str]:
     return get_all_connection_methods().get(connection_name, ("", ""))
 
 
+def get_default_route_devs() -> dict[str, str]:
+    """Interface holding the IPv4 / IPv6 default route (ppp0 for PPPoE uplinks)."""
+    devs: dict[str, str] = {}
+    for family in ("-4", "-6"):
+        result = run_command(["ip", family, "route", "show", "default"], timeout=5)
+        if not result.ok or not result.output:
+            continue
+        for line in result.output.splitlines():
+            parts = line.split()
+            for index, part in enumerate(parts):
+                if part == "dev" and index + 1 < len(parts):
+                    devs[family] = parts[index + 1].strip()
+                    break
+            if family in devs:
+                break
+    return devs
+
+
+def list_all_interfaces() -> list[dict[str, Any]]:
+    """Every interface except loopback, for the WAN selector.
+
+    A PPPoE uplink is ``ppp0``, which is not an ethernet device and therefore
+    never shows up in the wired listing.
+    """
+    result = run_command(["ip", "-j", "address", "show"], timeout=8)
+    if not result.ok or not result.output:
+        return []
+    try:
+        interfaces = json.loads(result.output)
+    except json.JSONDecodeError:
+        return []
+
+    default_devs = set(get_default_route_devs().values())
+    items: list[dict[str, Any]] = []
+    for interface in interfaces:
+        ifname = str(interface.get("ifname", "")).strip()
+        if not ifname or ifname == "lo":
+            continue
+        ipv4: list[str] = []
+        ipv6: list[str] = []
+        for address in interface.get("addr_info", []):
+            local = str(address.get("local", "")).strip()
+            if not local:
+                continue
+            prefixlen = address.get("prefixlen")
+            formatted = f"{local}/{prefixlen}" if prefixlen is not None else local
+            if address.get("family") == "inet":
+                ipv4.append(formatted)
+            elif address.get("family") == "inet6" and not local.lower().startswith("fe80:"):
+                ipv6.append(formatted)
+        operstate = str(interface.get("operstate", "")).lower()
+        items.append(
+            {
+                "name": ifname,
+                "state": "connected" if operstate in {"up", "unknown"} else "disconnected",
+                "state_label": "已连接" if operstate in {"up", "unknown"} else "未连接",
+                "kind": str(interface.get("link_type", "")),
+                "ipv4": ipv4,
+                "ipv6": ipv6,
+                "default_route": ifname in default_devs,
+            }
+        )
+    items.sort(key=lambda item: (not item["default_route"], item["name"]))
+    return items
+
+
 def gather_wired_network_info(router_config: dict[str, Any] | None = None) -> dict[str, Any]:
     result = run_command(
         [
@@ -458,6 +524,8 @@ __all__ = [
     "get_device_details",
     "get_interface_addresses",
     "get_interface_neighbors",
+    "get_default_route_devs",
+    "list_all_interfaces",
     "get_all_connection_methods",
     "get_connection_methods",
     "default_wired_profile",

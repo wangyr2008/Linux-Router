@@ -28,7 +28,9 @@ from .core import (
 )
 from .firewall import apply_ruleset, get_firewall_status, render_nftables_ruleset
 from .network import gather_wired_network_info
+from .pd import PD_SERVICE_NAME, enable_pd, get_pd_status, install_pd_client
 from .routing import (
+    IPV6_MODE_PD,
     build_dnsmasq_config,
     ensure_dnsmasq_include,
     ensure_forwarding,
@@ -577,6 +579,49 @@ def get_dependency_rows() -> list[dict[str, Any]]:
             },
         ]
     )
+    if config.get("ipv6_mode") == IPV6_MODE_PD:
+        pd_status = get_pd_status()
+        pd_details = []
+        if pd_status["delegated"]:
+            pd_details.append(f"运营商委派：{pd_status['delegated']}")
+        if pd_status["prefix"]:
+            pd_details.append(f"LAN /64：{pd_status['prefix']}")
+        if pd_status["updated_at"]:
+            pd_details.append(f"更新于 {pd_status['updated_at']}")
+        if pd_status.get("error"):
+            pd_details.append(f"同步异常：{pd_status['error']}")
+        rows.extend(
+            [
+                {
+                    "group": "IPv6 前缀委派",
+                    "name": "dhcpcd（PD 客户端）",
+                    "status": "已安装" if pd_status["available"] else "未安装",
+                    "level": "ok" if pd_status["available"] else "error",
+                    "detail": "通过 ia_pd 向运营商申请 IPv6 前缀",
+                    "action": "" if pd_status["available"] else "install_pd_client",
+                    "action_label": "安装 PD 客户端",
+                },
+                {
+                    "group": "IPv6 前缀委派",
+                    "name": "linux-router-pd.service",
+                    "status": "无异常" if pd_status["service_active"] else "未运行",
+                    "level": "ok" if pd_status["service_active"] else "error",
+                    "detail": "在 WAN 上请求前缀并分配给 LAN",
+                    "action": "" if pd_status["service_active"] else "restart_pd",
+                    "action_label": "重启 PD 客户端",
+                },
+                {
+                    "group": "IPv6 前缀委派",
+                    "name": "已委派前缀",
+                    "status": "已下发" if pd_status["prefix"] else "等待下发",
+                    "level": "ok" if pd_status["prefix"] else "warning",
+                    "detail": "PD 前缀会随运营商续租自动跟随",
+                    "extra_details": pd_details,
+                    "action": "",
+                    "action_label": "",
+                },
+            ]
+        )
     return rows
 
 
@@ -651,6 +696,18 @@ def _run_dependency_action(action: str) -> CommandResult:
         return disable_service("dhcpcd.service")
     if action == "fix_forwarding":
         return ensure_forwarding()
+    if action == "install_pd_client":
+        result = install_pd_client()
+        if not result.ok:
+            return result
+        config = load_router_config()
+        if config.get("ipv6_mode") == IPV6_MODE_PD:
+            started = enable_pd(config)
+            if not started.ok:
+                return CommandResult(True, f"{result.output}，但启动 PD 客户端失败：{started.output}")
+        return result
+    if action == "restart_pd":
+        return restart_service(PD_SERVICE_NAME)
     if action == "apply_firewall":
         config = load_router_config()
         if not config.get("wan_interface") or not config.get("lan_interface"):

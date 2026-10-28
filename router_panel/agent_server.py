@@ -19,7 +19,7 @@ from .core import (
     request_system_reboot,
 )
 from .dependencies import gather_dependency_status, run_dependency_action
-from .network import gather_wired_network_info
+from .network import gather_wired_network_info, list_all_interfaces
 from .routing import (
     apply_router_config,
     gather_client_status,
@@ -174,11 +174,17 @@ def _result(result: CommandResult, success_message: str, fallback_error: str) ->
 
 
 def available_router_interfaces() -> list[str]:
+    """Wired NICs, used for the LAN selector."""
     return [
         str(item.get("name", ""))
         for item in get_network_interface_hardware()
         if item.get("name") and not item.get("wireless")
     ]
+
+
+def available_wan_interfaces() -> list[str]:
+    """Any interface, because a PPPoE uplink is ppp0 rather than the NIC itself."""
+    return [str(item.get("name", "")) for item in list_all_interfaces()]
 
 
 def _execute_router_apply(
@@ -192,6 +198,7 @@ def _execute_router_apply(
         payload,
         existing=load_router_config(),
         available_interfaces=available_router_interfaces(),
+        available_wan_interfaces=available_wan_interfaces(),
     )
     if error:
         raise ValidationError(error)
