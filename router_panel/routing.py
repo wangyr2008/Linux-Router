@@ -32,6 +32,7 @@ from .core import (
     read_text,
     run_command,
 )
+from .cake import apply_cake, cake_enabled, normalize_bandwidth
 from .firewall import (
     FIREWALL_MODE_OPEN,
     FIREWALL_MODES,
@@ -84,6 +85,9 @@ DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "firewall_lan_tcp": "22,80",
     "firewall_wan_tcp": "",
     "firewall_wan_udp": "",
+    "cake_enabled": False,
+    "cake_upload_mbit": 0,
+    "cake_download_mbit": 0,
 }
 
 
@@ -268,6 +272,18 @@ def normalize_router_config(
     if error:
         return config, f"WAN 放行 UDP 端口：{error}"
 
+    cake_on = _as_bool(payload.get("cake_enabled", base.get("cake_enabled", False)), False)
+    cake_upload, error = normalize_bandwidth(
+        get("cake_upload_mbit"), required=cake_on, label="CAKE 上行带宽"
+    )
+    if error:
+        return config, error
+    cake_download, error = normalize_bandwidth(
+        get("cake_download_mbit"), required=False, label="CAKE 下行带宽"
+    )
+    if error:
+        return config, error
+
     config.update(
         {
             "wan_interface": wan,
@@ -289,6 +305,9 @@ def normalize_router_config(
             "firewall_lan_tcp": ",".join(lan_tcp),
             "firewall_wan_tcp": ",".join(wan_tcp),
             "firewall_wan_udp": ",".join(wan_udp),
+            "cake_enabled": cake_on,
+            "cake_upload_mbit": cake_upload,
+            "cake_download_mbit": cake_download,
         }
     )
 
@@ -649,6 +668,9 @@ def apply_router_config(
         report("等待运营商下发前缀")
         pd_client.sync_from_system(reason="apply")
 
+    report("应用 CAKE 限速")
+    cake_result = apply_cake(config)
+
     message = (
         f"路由配置已生效：WAN {config['wan_interface']} → LAN {config['lan_interface']}"
         f"（{lan_gateway_ipv4(config)}/{_lan_ipv4_network(config).prefixlen}）"
@@ -658,6 +680,10 @@ def apply_router_config(
         message += f"；PD 前缀 {prefix}" if prefix else "；PD 前缀尚未下发，面板会自动跟随"
     if not wan_ipv6.ok:
         message += f"；WAN IPv6 未启用：{wan_ipv6.output}"
+    if not cake_result.ok:
+        message += f"；CAKE 未应用：{cake_result.output}"
+    elif cake_enabled(config):
+        message += f"；{cake_result.output}"
     return CommandResult(True, message)
 
 

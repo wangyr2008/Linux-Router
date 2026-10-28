@@ -18,6 +18,7 @@ from .core import (
     get_network_interface_hardware,
     request_system_reboot,
 )
+from .cake import apply_cake, get_cake_status
 from .dependencies import gather_dependency_status, run_dependency_action
 from .network import gather_wired_network_info, list_all_interfaces
 from .routing import (
@@ -26,6 +27,7 @@ from .routing import (
     gather_router_status,
     load_router_config,
     normalize_router_config,
+    save_router_config,
 )
 from .service_monitor import gather_service_monitor_status, run_service_action
 from .system import gather_system_info
@@ -209,6 +211,24 @@ def _execute_router_apply(
     return _result(apply_router_config(config, progress=progress), "路由配置已生效", "应用路由配置失败")
 
 
+def _execute_cake_apply(params: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "cake_enabled": "1" if str(params.get("cake_enabled", "")).strip().lower() in {
+            "1", "true", "on", "yes"
+        } else "",
+        "cake_upload_mbit": str(params.get("cake_upload_mbit", "") or ""),
+        "cake_download_mbit": str(params.get("cake_download_mbit", "") or ""),
+    }
+    config, error = normalize_router_config(payload, existing=load_router_config())
+    if error:
+        raise ValidationError(error)
+    if not config.get("wan_interface"):
+        raise ValidationError("请先在「路由」页面选择 WAN 接口")
+    save_router_config(config)
+    result = apply_cake(config)
+    return _result(result, result.output or "CAKE 限速已应用", "应用 CAKE 限速失败")
+
+
 def _execute_dependency(params: dict[str, Any]) -> dict[str, Any]:
     action = _require_string(params, "action", maximum=64)
     return _result(run_dependency_action(action), "处置完成", "处置失败")
@@ -242,6 +262,7 @@ def _execute_service_monitor_action(params: dict[str, Any]) -> dict[str, Any]:
 
 OPERATIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "router_apply": _execute_router_apply,
+    "cake_apply": _execute_cake_apply,
     "dependency_fix": _execute_dependency,
     "system_reboot": _execute_reboot,
     "tailscale_login": _execute_tailscale_login,
@@ -263,6 +284,8 @@ def execute_query(name: str, params: dict[str, Any]) -> Any:
         return gather_router_status()
     if name == "client_status":
         return gather_client_status()
+    if name == "cake_status":
+        return get_cake_status(load_router_config())
     if name == "tailscale_status":
         return gather_tailscale_status()
     if name == "service_monitor_status":

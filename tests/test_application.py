@@ -13,6 +13,7 @@ os.environ["LINUX_ROUTER_DATA_DIR"] = TEST_DATA_DIRECTORY.name
 
 import app as application
 from router_panel import agent_server
+from router_panel import cake as cake_client
 from router_panel import core
 from router_panel import dependencies
 from router_panel import firewall
@@ -21,6 +22,7 @@ from router_panel import network_parsers
 from router_panel import pd as pd_client
 from router_panel import routing
 from router_panel import system
+from router_panel import web_general
 from router_panel import web_routing
 from router_panel.core import CommandResult
 
@@ -37,6 +39,7 @@ EXPECTED_ROUTES = {
     "/router",
     "/router/apply",
     "/settings",
+    "/settings/cake",
     "/settings/password",
     "/settings/reboot",
     "/static/<path:filename>",
@@ -1381,6 +1384,164 @@ class NetworkStackOwnershipTests(unittest.TestCase):
         self.assertIn("PID 644", " ".join(busy["extra_details"]))
         self.assertIn("ifupdown", " ".join(busy["extra_details"]))
 
+
+
+class CakeShapingTests(unittest.TestCase):
+    def setUp(self):
+        application.app.config["TESTING"] = True
+        self.client = application.app.test_client()
+
+    def login(self):
+        with self.client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+
+    def config(self, **overrides):
+        payload = {
+            "wan_interface": "ens3",
+            "lan_interface": "ens4",
+            "lan_network": "192.168.50.0/24",
+            "cake_enabled": "1",
+            "cake_upload_mbit": "30",
+            "cake_download_mbit": "200",
+        }
+        payload.update(overrides)
+        config, error = routing.normalize_router_config(payload)
+        assert error is None, error
+        return config
+
+    def test_bandwidth_validation(self):
+        self.assertEqual(cake_client.normalize_bandwidth("30", required=True, label="上行"), (30, None))
+        self.assertEqual(cake_client.normalize_bandwidth("", required=False, label="下行"), (0, None))
+        self.assertIn("不能为空", cake_client.normalize_bandwidth("", required=True, label="上行")[1])
+        self.assertIn("必须是整数", cake_client.normalize_bandwidth("3O", required=True, label="上行")[1])
+        self.assertIn("不能超过", cake_client.normalize_bandwidth("999999", required=True, label="上行")[1])
+        self.assertIn("必须大于 0", cake_client.normalize_bandwidth("0", required=True, label="上行")[1])
+
+    def test_config_rejects_enabled_without_upload(self):
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "ens3", "lan_interface": "ens4", "cake_enabled": "1", "cake_upload_mbit": ""}
+        )
+        self.assertIn("CAKE 上行带宽", error)
+
+    def test_config_defaults_to_disabled(self):
+        config, error = routing.normalize_router_config({"wan_interface": "ens3", "lan_interface": "ens4"})
+        self.assertIsNone(error)
+        self.assertFalse(config["cake_enabled"])
+        self.assertEqual(config["cake_upload_mbit"], 0)
+
+    def test_script_sets_both_bandwidths(self):
+        text = cake_client.render_cake_script(self.config())
+        self.assertIn('WAN="ens3"', text)
+        self.assertIn('UPLOAD="30"', text)
+        self.assertIn('DOWNLOAD="200"', text)
+        self.assertIn('cake bandwidth "${UPLOAD}mbit"', text)
+        self.assertIn('cake bandwidth "${DOWNLOAD}mbit"', text)
+        self.assertIn("mirred egress redirect dev", text)
+        self.assertIn(f'IFB="{cake_client.CAKE_IFB_DEVICE}"', text)
+
+    def test_script_is_valid_posix_shell(self):
+        import subprocess
+
+        for config in (self.config(), self.config(cake_enabled="", cake_upload_mbit="")):
+            script = Path(TEST_DATA_DIRECTORY.name) / "cake.sh"
+            script.write_text(cake_client.render_cake_script(config), encoding="utf-8")
+            checked = subprocess.run(["sh", "-n", str(script)], capture_output=True, text=True)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_disabled_script_has_zero_upload(self):
+        text = cake_client.render_cake_script(self.config(cake_enabled="", cake_upload_mbit="30"))
+        self.assertIn('UPLOAD="0"', text)
+        self.assertIn("clear_all", text)
+
+    def test_service_unit_is_oneshot_with_clear(self):
+        text = cake_client.render_service_unit()
+        self.assertIn("Type=oneshot", text)
+        self.assertIn("RemainAfterExit=yes", text)
+        self.assertIn("ExecStop=", text)
+
+    def test_timer_reapplies_after_reconnect(self):
+        text = cake_client.render_timer_unit()
+        self.assertIn("OnUnitActiveSec=5min", text)
+        self.assertIn("WantedBy=timers.target", text)
+
+    def test_apply_enables_service_and_timer(self):
+        calls = []
+
+        def fake_run(command, timeout=8, env=None):
+            calls.append(command)
+            return ok()
+
+        with patch.object(cake_client, "command_exists", return_value=True), patch.object(
+            cake_client, "atomic_write_text"
+        ), patch.object(cake_client, "run_command", side_effect=fake_run):
+            result = cake_client.apply_cake(self.config())
+
+        self.assertTrue(result.ok, result.output)
+        self.assertIn("30 Mbit/s", result.output)
+        self.assertIn("200 Mbit/s", result.output)
+        flat = [" ".join(call) for call in calls]
+        self.assertTrue(any("restart linux-router-cake.service" in item for item in flat))
+        self.assertTrue(any("enable --now linux-router-cake.timer" in item for item in flat))
+
+    def test_apply_disabled_clears_and_stops(self):
+        calls = []
+
+        def fake_run(command, timeout=8, env=None):
+            calls.append(command)
+            return ok()
+
+        with patch.object(cake_client, "command_exists", return_value=True), patch.object(
+            cake_client, "atomic_write_text"
+        ), patch.object(cake_client, "run_command", side_effect=fake_run):
+            result = cake_client.apply_cake(self.config(cake_enabled="", cake_upload_mbit=""))
+
+        self.assertTrue(result.ok, result.output)
+        self.assertIn("已关闭", result.output)
+        flat = [" ".join(call) for call in calls]
+        self.assertTrue(any("disable --now linux-router-cake.timer" in item for item in flat))
+        self.assertTrue(any(item.endswith("clear") for item in flat))
+
+    def test_status_parses_cake_bandwidth(self):
+        def fake_run(command, timeout=8, env=None):
+            if command[:3] == ["tc", "qdisc", "show"] and command[-1] == "ens3":
+                return ok("qdisc cake 8001: root refcnt 2 bandwidth 30Mbit diffserv3 triple-isolate")
+            if command[:3] == ["tc", "qdisc", "show"] and command[-1] == cake_client.CAKE_IFB_DEVICE:
+                return ok("qdisc cake 8002: root refcnt 2 bandwidth 200Mbit diffserv3")
+            return ok("")
+
+        with patch.object(cake_client, "command_exists", return_value=True), patch.object(
+            cake_client, "is_service_active", return_value=True
+        ), patch.object(cake_client, "run_command", side_effect=fake_run):
+            status = cake_client.get_cake_status(self.config())
+
+        self.assertTrue(status["active"])
+        self.assertEqual(status["wan_bandwidth"], 30)
+        self.assertEqual(status["download_bandwidth"], 200)
+        self.assertEqual(status["errors"], [])
+
+    def test_status_reports_missing_tc(self):
+        with patch.object(cake_client, "command_exists", return_value=False):
+            status = cake_client.get_cake_status(self.config())
+        self.assertFalse(status["available"])
+        self.assertTrue(status["errors"])
+
+    def test_settings_page_shows_cake_card(self):
+        self.login()
+        status = {
+            "enabled": True, "active": True, "available": True, "wan": "ens3",
+            "upload_mbit": 30, "download_mbit": 200,
+            "wan_bandwidth": 30, "download_bandwidth": 200,
+            "service_active": True, "wan_qdisc": "", "ifb_qdisc": "", "errors": [],
+        }
+        with patch.object(web_general, "query_agent", return_value=status):
+            response = self.client.get("/settings")
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn("CAKE 限速", body)
+        self.assertIn('name="cake_upload_mbit"', body)
+        self.assertIn("30 Mbit/s", body)
 
 
 if __name__ == "__main__":

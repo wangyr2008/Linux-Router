@@ -53,7 +53,11 @@ def register_general_routes(app, login_required, is_async_request) -> None:
     @app.route("/settings")
     @login_required
     def system_settings():
-        return render_template("settings.html")
+        try:
+            cake = query_agent("cake_status")
+        except AgentError as exc:
+            cake = {"available": False, "enabled": False, "errors": [str(exc)]}
+        return render_template("settings.html", cake=cake)
 
     @app.route("/dependencies")
     @login_required
@@ -104,6 +108,23 @@ def register_general_routes(app, login_required, is_async_request) -> None:
             save_auth_config(auth)
             flash("密码已更新", "success")
         return redirect(url_for("system_settings"))
+
+    @app.route("/settings/cake", methods=["POST"])
+    @login_required
+    def update_cake():
+        params = {
+            "cake_enabled": request.form.get("cake_enabled", ""),
+            "cake_upload_mbit": request.form.get("cake_upload_mbit", "").strip(),
+            "cake_download_mbit": request.form.get("cake_download_mbit", "").strip(),
+        }
+        try:
+            operation = submit_operation("cake_apply", params, scope="system")
+        except AgentError as exc:
+            if is_async_request():
+                return {"ok": False, "pending": False, "message": str(exc)}, 503
+            flash(str(exc), "error")
+            return redirect(url_for("system_settings"))
+        return queued_response(operation, "CAKE 设置已加入队列", "system_settings")
 
     @app.route("/settings/reboot", methods=["POST"])
     @login_required

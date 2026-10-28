@@ -15,6 +15,66 @@
   </article>
 
   <article class="card">
+    <h3 class="card-title">{{ icon("activity") }}<span>CAKE 限速</span></h3>
+    <p class="muted">按 WAN 实际带宽整形，抑制缓冲膨胀（bufferbloat）。填运营商标称带宽的 85%~95% 效果最好。</p>
+    <form action="{{ url_for('update_cake') }}" method="post" class="login-form" data-agent-operation-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="form-grid">
+        <label class="field">
+          <span class="field-label">上行带宽（Mbit/s）</span>
+          <input
+            type="number"
+            class="mono-value"
+            name="cake_upload_mbit"
+            value="{{ cake.upload_mbit or '' }}"
+            min="1"
+            max="100000"
+            placeholder="例如 30"
+          >
+          <span class="field-hint">WAN 出口方向，启用时必填</span>
+        </label>
+        <label class="field">
+          <span class="field-label">下行带宽（Mbit/s）</span>
+          <input
+            type="number"
+            class="mono-value"
+            name="cake_download_mbit"
+            value="{{ cake.download_mbit or '' }}"
+            min="0"
+            max="100000"
+            placeholder="留空表示不整形下行"
+          >
+          <span class="field-hint">经 IFB 镜像整形，留空则只处理上行</span>
+        </label>
+      </div>
+
+      <div class="switch-row">
+        <label class="checkbox-field">
+          <input type="checkbox" name="cake_enabled" value="1" {{ 'checked' if cake.enabled else '' }}>
+          <span>启用 CAKE 限速</span>
+        </label>
+      </div>
+
+      {% if cake.enabled and cake.active %}
+      <p class="muted form-hint">
+        当前状态：{{ cake.wan }} 已挂载 CAKE{% if cake.wan_bandwidth %}，上行 {{ cake.wan_bandwidth }} Mbit/s{% endif %}{% if cake.download_bandwidth %}，下行 {{ cake.download_bandwidth }} Mbit/s{% endif %}
+      </p>
+      {% elif cake.enabled %}
+      <p class="alert compact">已启用但没检测到 CAKE 队列，可能应用失败或 WAN 接口尚未就绪，看「依赖」页的检查结果。</p>
+      {% endif %}
+
+      {% if cake.errors %}
+      <p class="alert compact">{{ cake.errors | join('；') }}</p>
+      {% endif %}
+
+      <div class="form-footer">
+        <p class="muted form-hint">写入 linux-router-cake.service，开机与 WAN 重连后自动恢复。</p>
+        <button type="submit">应用限速设置</button>
+      </div>
+    </form>
+  </article>
+
+  <article class="card">
     <h3 class="card-title">{{ icon("key-round") }}<span>管理员密码</span></h3>
     <form action="{{ url_for('update_password') }}" method="post" class="login-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
