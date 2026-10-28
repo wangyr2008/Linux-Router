@@ -1441,8 +1441,56 @@ code {
 
 .form-grid {
   display: grid;
-  gap: 16px;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 18px 20px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  align-items: start;
+}
+
+.login-form .field {
+  display: grid;
+  grid-template-rows: auto auto auto;
+  gap: 8px;
+  align-content: start;
+  min-width: 0;
+}
+
+.login-form .field-label {
+  display: flex;
+  align-items: flex-end;
+  color: var(--muted);
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.login-form .field-hint {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.login-form .field input,
+.login-form .field select {
+  box-sizing: border-box;
+  height: 44px;
+  min-width: 0;
+}
+
+.login-form .field input[type="text"],
+.login-form .field input[type="number"] {
+  padding: 0 14px;
+}
+
+.login-form .field select {
+  padding: 0 40px 0 14px;
+}
+
+.switch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 28px;
+  align-items: center;
 }
 
 .login-form .checkbox-field {
@@ -1457,6 +1505,7 @@ code {
   flex: 0 0 auto;
   width: 16px;
   height: 16px;
+  margin: 0;
   padding: 0;
   accent-color: var(--text);
 }
@@ -1465,9 +1514,20 @@ code {
   color: var(--text);
 }
 
-.router-form-actions {
+.form-footer {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  justify-content: space-between;
+  gap: 12px 20px;
+}
+
+.form-footer .form-hint {
+  flex: 1 1 320px;
+}
+
+@media (min-width: 760px) {
+  .login-form .field-label {
+    min-height: 2.9em;
+  }
 }
