@@ -1527,6 +1527,31 @@ class CakeShapingTests(unittest.TestCase):
         self.assertFalse(status["available"])
         self.assertTrue(status["errors"])
 
+    def test_apply_writes_real_files(self):
+        """Uses the real atomic_write_text, so the path constants must be Paths."""
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "cake-apply"
+        workdir.mkdir(exist_ok=True)
+        script = workdir / "cake.sh"
+        service = workdir / "cake.service"
+        timer = workdir / "cake.timer"
+
+        with patch.object(cake_client, "CAKE_SCRIPT_PATH", script), patch.object(
+            cake_client, "CAKE_SERVICE_PATH", service
+        ), patch.object(
+            cake_client, "CAKE_TIMER_PATH", timer
+        ), patch.object(
+            cake_client, "command_exists", return_value=True
+        ), patch.object(
+            cake_client, "run_command", return_value=ok()
+        ):
+            result = cake_client.apply_cake(self.config())
+
+        self.assertTrue(result.ok, result.output)
+        self.assertIn('UPLOAD="30"', script.read_text(encoding="utf-8"))
+        self.assertTrue(script.stat().st_mode & 0o111)
+        self.assertIn("Type=oneshot", service.read_text(encoding="utf-8"))
+        self.assertIn("OnUnitActiveSec=5min", timer.read_text(encoding="utf-8"))
+
     def test_settings_page_shows_cake_card(self):
         self.login()
         status = {

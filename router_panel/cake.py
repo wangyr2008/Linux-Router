@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 from .core import (
@@ -12,11 +13,11 @@ from .core import (
     run_command,
 )
 
-CAKE_SCRIPT_PATH = "/etc/linux-router/cake.sh"
+CAKE_SCRIPT_PATH = Path("/etc/linux-router/cake.sh")
 CAKE_SERVICE_NAME = "linux-router-cake.service"
 CAKE_TIMER_NAME = "linux-router-cake.timer"
-CAKE_SERVICE_PATH = f"/etc/systemd/system/{CAKE_SERVICE_NAME}"
-CAKE_TIMER_PATH = f"/etc/systemd/system/{CAKE_TIMER_NAME}"
+CAKE_SERVICE_PATH = Path("/etc/systemd/system") / CAKE_SERVICE_NAME
+CAKE_TIMER_PATH = Path("/etc/systemd/system") / CAKE_TIMER_NAME
 # A dedicated IFB device keeps us from touching an ifb0 someone else may own.
 CAKE_IFB_DEVICE = "ifb-lr"
 CAKE_MAX_MBIT = 100000
@@ -198,7 +199,7 @@ def apply_cake(config: dict[str, Any]) -> CommandResult:
     if not cake_enabled(config):
         run_command(["systemctl", "disable", "--now", CAKE_TIMER_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
         run_command(["systemctl", "stop", CAKE_SERVICE_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
-        cleared = run_command(["/bin/sh", CAKE_SCRIPT_PATH, "clear"], timeout=SYSTEM_COMMAND_TIMEOUT)
+        cleared = run_command(["/bin/sh", str(CAKE_SCRIPT_PATH), "clear"], timeout=SYSTEM_COMMAND_TIMEOUT)
         if not cleared.ok:
             return CommandResult(False, f"清除 CAKE 规则失败：{cleared.output or '未知错误'}")
         return CommandResult(True, "CAKE 限速已关闭")
