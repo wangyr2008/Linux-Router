@@ -9,7 +9,7 @@ from flask import abort, redirect, render_template, request, session, url_for
 from .agent_client import AgentError, get_operation, query_agent
 from .core import PASSWORD_HINT_PATH, get_build_info
 from .web_general import register_general_routes
-from .web_network import register_network_routes
+from .web_routing import register_routing_routes
 from .web_tools import register_tools_routes
 
 
@@ -72,33 +72,12 @@ def register_routes(app) -> None:
                 "operation_status": operation["status"],
             }
         )
-        scope = operation.get("scope")
-        context = operation.get("context") or {}
-        try:
-            if scope == "network":
-                status = query_agent(
-                    "wireless_status",
-                    {
-                        "include_wifi_networks": bool(context.get("include_wifi_networks")),
-                        "wifi_scan_device_override": str(context.get("ifname", "")),
-                    },
-                )
-                response["status"] = status
-                response["fragments"] = {
-                    "wireless": render_template("partials/network_devices.html", status=status),
-                    "errors": render_template("partials/network_errors.html", status=status),
-                    "wifi_networks": render_template("partials/wifi_networks.html", status=status),
-                }
-            elif scope == "hotspot":
-                status = query_agent("hotspot_status")
-                response["status"] = status
-                response["fragments"] = {
-                    "wireless": render_template("partials/hotspot_devices.html", status=status),
-                    "errors": render_template("partials/hotspot_errors.html", status=status),
-                }
-        except AgentError as exc:
-            response["ok"] = False
-            response["message"] = f"{response.get('message', '操作已结束')}，但无法刷新状态：{exc}"
+        if operation.get("scope") == "router":
+            try:
+                response["status"] = query_agent("router_status")
+            except AgentError as exc:
+                response["ok"] = False
+                response["message"] = f"{response.get('message', '操作已结束')}，但无法刷新状态：{exc}"
         return response
 
     @app.context_processor
@@ -111,5 +90,5 @@ def register_routes(app) -> None:
         }
 
     register_general_routes(app, login_required, is_async_request)
-    register_network_routes(app, login_required, is_async_request)
+    register_routing_routes(app, login_required, is_async_request)
     register_tools_routes(app, login_required, is_async_request)

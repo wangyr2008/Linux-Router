@@ -2,53 +2,45 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
-from .core import CommandResult
 
-
-class WirelessStatus(TypedDict):
-    nmcli_available: bool
-    wireless_devices: list[dict[str, Any]]
-    saved_wifi_networks: list[dict[str, str]]
-    saved_wifi_networks_unbound: list[dict[str, str]]
-    wifi_scan_device: str
-    wifi_networks: list[dict[str, Any]]
-    errors: list[str]
-
-
-class HotspotSummary(TypedDict):
-    active: bool
-    conflict: bool
-    connection_name: str
-    ssid: str
-    password: str
-    band: str
-    band_label: str
-    channel: str
-    ifname: str
-    ip: str
-    frequency: str
-    mode: str
-
-
-class HotspotKeepaliveStatus(TypedDict):
-    enabled: bool
+class InterfaceStatus(TypedDict):
+    interface: str
+    state: str
+    state_label: str
+    connection: str
+    link_speed: str
+    ipv4: list[str]
+    ipv6: list[str]
+    gateway: str
+    gateway6: str
+    dns: list[str]
     online: bool
-    recovering: bool
-    last_error: str
-    parent_ifname: str
 
 
-class HotspotStatus(TypedDict):
-    nmcli_available: bool
-    wireless_devices: list[dict[str, Any]]
-    hotspot: HotspotSummary
-    keepalive: HotspotKeepaliveStatus
+class RouterStatus(TypedDict):
+    config: dict[str, Any]
+    interfaces: list[dict[str, Any]]
+    wan: InterfaceStatus
+    lan: InterfaceStatus
+    ipv6: dict[str, Any]
+    dhcp: dict[str, Any]
+    firewall: dict[str, Any]
+    forwarding: dict[str, str]
+    services: dict[str, dict[str, Any]]
+    os_name: str
     errors: list[str]
 
 
-class HotspotClientsStatus(TypedDict):
-    hotspots: list[dict[str, Any]]
-    total_clients: int
+class ClientStatus(TypedDict):
+    clients: list[dict[str, Any]]
+    total: int
+    online: int
+    lan_interface: str
+    errors: list[str]
+
+
+class WiredStatus(TypedDict):
+    devices: list[dict[str, Any]]
     errors: list[str]
 
 
@@ -71,21 +63,10 @@ class SystemInfo(TypedDict, total=False):
     network_interfaces: list[dict[str, Any]]
 
 
-class WifiConnectResult(TypedDict):
-    result: CommandResult
-    binding_error: str | None
-    current_state: dict[str, str]
-    concurrency_mode: str
-    hotspot_is_concurrent: bool
-    hotspot_profile: dict[str, str]
-
-
 __all__ = [
-    "WirelessStatus",
-    "HotspotSummary",
-    "HotspotKeepaliveStatus",
-    "HotspotStatus",
-    "HotspotClientsStatus",
+    "InterfaceStatus",
+    "RouterStatus",
+    "ClientStatus",
+    "WiredStatus",
     "SystemInfo",
-    "WifiConnectResult",
 ]

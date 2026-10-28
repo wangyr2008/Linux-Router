@@ -12,9 +12,9 @@
     <h3 class="card-title">{{ icon("activity") }}<span>网络状态</span></h3>
     <div class="network-status-grid">
       {% for item in [
-        {'key': 'wired', 'label': '有线', 'icon': 'ethernet-port'},
-        {'key': 'wireless', 'label': '无线', 'icon': 'wifi'},
-        {'key': 'hotspot', 'label': '热点', 'icon': 'radio-tower'}
+        {'key': 'wan', 'label': 'WAN', 'icon': 'globe'},
+        {'key': 'lan', 'label': 'LAN', 'icon': 'network'},
+        {'key': 'wired', 'label': '有线', 'icon': 'ethernet-port'}
       ] %}
         {% set online = info.network_status[item.key] if info.network_status else false %}
         <div class="network-status-item {{ 'is-online' if online else 'is-offline' }}">
@@ -81,6 +81,7 @@
             <th>类型</th>
             <th>设备</th>
             <th>IPv4 地址</th>
+            <th>IPv6 地址</th>
           </tr>
         </thead>
         <tbody>
@@ -89,7 +90,8 @@
             <td data-label="名称">{{ connection.name }}</td>
             <td data-label="类型">{{ connection.type_label }}</td>
             <td class="mono-value" data-label="设备">{{ connection.device }}</td>
-            <td class="mono-value" data-label="IPv4 地址">{{ connection.ip_addresses|join(', ') if connection.ip_addresses else '无' }}</td>
+            <td class="mono-value" data-label="IPv4 地址">{{ connection.ipv4_addresses|join(', ') if connection.ipv4_addresses else '无' }}</td>
+            <td class="mono-value" data-label="IPv6 地址">{{ connection.ipv6_addresses|join(', ') if connection.ipv6_addresses else '无' }}</td>
           </tr>
           {% endfor %}
         </tbody>

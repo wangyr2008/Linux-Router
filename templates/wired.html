@@ -4,7 +4,7 @@
 {% block content %}
 <section class="page-header">
   <h2 class="section-title"><span>有线</span></h2>
-  <p class="muted">查看当前有线网络的状态</p>
+  <p class="muted">查看有线网卡的链路状态、地址与接口角色（WAN / LAN 在“路由”页面分配）</p>
 </section>
 
 <section class="card-grid">
@@ -13,23 +13,36 @@
     <article class="card wired-card">
       <div class="card-header-row">
         <h3 class="card-title card-primary-heading">{{ icon("network") }}<span class="mono-value">{{ item.device }}</span></h3>
+        <span class="tag">{{ item.role_label }}</span>
       </div>
       <dl class="key-value">
         <div><dt>状态</dt><dd class="wired-state-text {{ 'wired-state-connected' if item.state == 'connected' else 'wired-state-disconnected' if item.state == 'disconnected' else '' }}">{{ item.state_label }}</dd></div>
+        <div><dt>连接</dt><dd>{{ item.connection }}</dd></div>
         <div><dt>协商速率</dt><dd class="mono-value">{{ item.details.link_speed or '未知' }}</dd></div>
         <div><dt>MAC</dt><dd class="mono-value">{{ item.details.mac or '未知' }}</dd></div>
-        <div><dt>模式</dt><dd>{{ item.profile.ipv4_method_label or '未知' }}</dd></div>
+        <div><dt>IPv4 模式</dt><dd>{{ item.profile.ipv4_method_label or '未知' }}</dd></div>
+        <div><dt>IPv6 模式</dt><dd>{{ item.profile.ipv6_method_label or '未知' }}</dd></div>
         <div>
-          <dt>IP</dt>
+          <dt>IPv4</dt>
           <dd class="mono-value">
             {% if item.details.ipv4 %}
-              {% for address in item.details.ipv4 %}{{ address.split('/', 1)[0] }}{% if not loop.last %}, {% endif %}{% endfor %}
+              {% for address in item.details.ipv4 %}{{ address }}{% if not loop.last %}<br>{% endif %}{% endfor %}
             {% else %}
               无
             {% endif %}
           </dd>
         </div>
-        <div><dt>网关</dt><dd class="mono-value">{{ item.details.gateway or '无' }}</dd></div>
+        <div>
+          <dt>IPv6</dt>
+          <dd class="mono-value">
+            {% if item.details.ipv6 %}
+              {% for address in item.details.ipv6 %}{{ address }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+            {% else %}
+              无
+            {% endif %}
+          </dd>
+        </div>
+        <div><dt>网关</dt><dd class="mono-value">{{ item.details.gateway or '无' }}{% if item.details.gateway6 %}<br>{{ item.details.gateway6 }}{% endif %}</dd></div>
         <div><dt>DNS</dt><dd class="mono-value">{{ item.details.dns|join(', ') if item.details.dns else '无' }}</dd></div>
       </dl>
     </article>

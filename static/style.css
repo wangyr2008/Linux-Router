@@ -1438,3 +1438,36 @@ code {
   border-radius: 6px;
   background: #f3f4f6;
 }
+
+.form-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+}
+
+.login-form .checkbox-field {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  font-weight: 500;
+}
+
+.login-form .checkbox-field input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  accent-color: var(--text);
+}
+
+.login-form .checkbox-field span {
+  color: var(--text);
+}
+
+.router-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}

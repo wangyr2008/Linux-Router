@@ -4,13 +4,7 @@ from flask import flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from .agent_client import AgentError, query_agent, submit_operation
-from .core import (
-    load_auth_config,
-    load_network_config,
-    normalize_lan_network,
-    save_auth_config,
-    save_network_config,
-)
+from .core import load_auth_config, save_auth_config
 
 
 def register_general_routes(app, login_required, is_async_request) -> None:
@@ -32,7 +26,6 @@ def register_general_routes(app, login_required, is_async_request) -> None:
             return redirect(url_for("system_info"))
         return redirect(url_for("login"))
 
-
     @app.route("/login", methods=["GET", "POST"])
     def login():
         error = ""
@@ -51,19 +44,16 @@ def register_general_routes(app, login_required, is_async_request) -> None:
 
         return render_template("login.html", error=error)
 
-
     @app.route("/logout", methods=["POST"])
     @login_required
     def logout():
         session.clear()
         return redirect(url_for("login"))
 
-
     @app.route("/settings")
     @login_required
     def system_settings():
-        return render_template("settings.html", network=load_network_config())
-
+        return render_template("settings.html")
 
     @app.route("/dependencies")
     @login_required
@@ -77,7 +67,6 @@ def register_general_routes(app, login_required, is_async_request) -> None:
             "dependencies.html",
             dependencies=status,
         )
-
 
     @app.route("/dependencies/fix", methods=["POST"])
     @login_required
@@ -95,7 +84,6 @@ def register_general_routes(app, login_required, is_async_request) -> None:
             flash(str(exc), "error")
             return redirect(url_for("dependencies_page"))
         return queued_response(operation, "依赖修复已加入队列", "dependencies_page")
-
 
     @app.route("/settings/password", methods=["POST"])
     @login_required
@@ -117,19 +105,6 @@ def register_general_routes(app, login_required, is_async_request) -> None:
             flash("密码已更新", "success")
         return redirect(url_for("system_settings"))
 
-
-    @app.route("/settings/lan", methods=["POST"])
-    @login_required
-    def update_lan_network():
-        network, error = normalize_lan_network(request.form.get("lan_network", ""))
-        if error or network is None:
-            flash(error or "LAN 网段无效", "error")
-        else:
-            save_network_config(network)
-            flash(f"LAN 网段已保存为 {network}，下次开启热点时生效", "success")
-        return redirect(url_for("system_settings"))
-
-
     @app.route("/settings/reboot", methods=["POST"])
     @login_required
     def reboot_system():
@@ -139,7 +114,6 @@ def register_general_routes(app, login_required, is_async_request) -> None:
             flash(str(exc), "error")
             return redirect(url_for("system_settings"))
         return queued_response(operation, "设备重启已加入队列", "system_settings")
-
 
     @app.route("/system")
     @login_required
@@ -151,7 +125,6 @@ def register_general_routes(app, login_required, is_async_request) -> None:
             info = {}
         return render_template("system.html", info=info)
 
-
     @app.route("/wired")
     @login_required
     def wired_network():
@@ -160,7 +133,6 @@ def register_general_routes(app, login_required, is_async_request) -> None:
         except AgentError as exc:
             wired = {"devices": [], "errors": [str(exc)]}
         return render_template("wired.html", wired=wired)
-
 
     @app.route("/healthz")
     def healthz():

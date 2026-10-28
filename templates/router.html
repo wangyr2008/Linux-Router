@@ -1,0 +1,254 @@
+{% from "macros.html" import icon %}
+{% extends "base.html" %}
+{% set title = "路由 - Linux Router" %}
+{% block content %}
+{% set wan = status.wan or {} %}
+{% set lan = status.lan or {} %}
+{% set ipv6 = status.ipv6 or {} %}
+{% set dhcp = status.dhcp or {} %}
+{% set firewall = status.firewall or {} %}
+{% set forwarding = status.forwarding or {} %}
+{% set services = status.services or {} %}
+{% set dnsmasq_service = services.dnsmasq or {} %}
+{% set nftables_service = services.nftables or {} %}
+<section class="page-header">
+  <h2 class="section-title"><span>路由</span></h2>
+  <p class="muted">WAN 上行、LAN 局域网、IPv4/IPv6 双栈与 nftables NAT 转发</p>
+</section>
+
+<section class="card-grid">
+  <article class="card">
+    <h3 class="card-title">{{ icon("globe") }}<span>WAN 上行</span></h3>
+    <dl class="key-value">
+      <div>
+        <dt>接口</dt>
+        <dd class="mono-value">{{ wan.interface or '未选择' }}</dd>
+      </div>
+      <div>
+        <dt>状态</dt>
+        <dd>
+          <span class="status-badge status-{{ 'ok' if wan.online else 'warning' }}">{{ wan.state_label or '未知' }}</span>
+        </dd>
+      </div>
+      <div>
+        <dt>IPv4</dt>
+        <dd class="mono-value">
+          {% if wan.ipv4 %}
+            {% for address in wan.ipv4 %}{{ address }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+          {% else %}无{% endif %}
+        </dd>
+      </div>
+      <div>
+        <dt>IPv6</dt>
+        <dd class="mono-value">
+          {% if wan.ipv6 %}
+            {% for address in wan.ipv6 %}{{ address }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+          {% else %}无{% endif %}
+        </dd>
+      </div>
+      <div><dt>网关</dt><dd class="mono-value">{{ wan.gateway or '无' }}{% if wan.gateway6 %} / {{ wan.gateway6 }}{% endif %}</dd></div>
+      <div><dt>DNS</dt><dd class="mono-value">{{ wan.dns|join(', ') if wan.dns else '无' }}</dd></div>
+    </dl>
+  </article>
+
+  <article class="card">
+    <h3 class="card-title">{{ icon("network") }}<span>LAN 局域网</span></h3>
+    <dl class="key-value">
+      <div>
+        <dt>接口</dt>
+        <dd class="mono-value">{{ lan.interface or '未选择' }}</dd>
+      </div>
+      <div>
+        <dt>状态</dt>
+        <dd>
+          <span class="status-badge status-{{ 'ok' if lan.online else 'warning' }}">{{ lan.state_label or '未知' }}</span>
+        </dd>
+      </div>
+      <div>
+        <dt>IPv4</dt>
+        <dd class="mono-value">
+          {% if lan.ipv4 %}
+            {% for address in lan.ipv4 %}{{ address }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+          {% else %}无{% endif %}
+        </dd>
+      </div>
+      <div>
+        <dt>IPv6</dt>
+        <dd class="mono-value">
+          {% if lan.ipv6 %}
+            {% for address in lan.ipv6 %}{{ address }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+          {% else %}无{% endif %}
+        </dd>
+      </div>
+      <div>
+        <dt>DHCP</dt>
+        <dd class="mono-value">
+          {% if dhcp.enabled %}{{ dhcp.start }} - {{ dhcp.end }}{% else %}已关闭{% endif %}
+        </dd>
+      </div>
+      <div><dt>DHCP 租约</dt><dd class="numeric-value">{{ dhcp.lease_count }} 个</dd></div>
+    </dl>
+  </article>
+
+  <article class="card">
+    <h3 class="card-title">{{ icon("share-2") }}<span>IPv6 双栈</span></h3>
+    <dl class="key-value">
+      <div><dt>模式</dt><dd>{{ ipv6.mode_label or '未知' }}</dd></div>
+      <div><dt>LAN 前缀</dt><dd class="mono-value">{{ ipv6.prefix or '无' }}</dd></div>
+      <div><dt>LAN 地址</dt><dd class="mono-value">{{ ipv6.lan_address or '无' }}</dd></div>
+      <div>
+        <dt>NAT66</dt>
+        <dd>
+          <span class="status-badge status-{{ 'ok' if ipv6.nat else 'warning' }}">{{ '已启用' if ipv6.nat else '未启用' }}</span>
+        </dd>
+      </div>
+      <div>
+        <dt>WAN 公网 IPv6</dt>
+        <dd class="mono-value">
+          {% if ipv6.wan_addresses %}
+            {% for address in ipv6.wan_addresses %}{{ address }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+          {% else %}无{% endif %}
+        </dd>
+      </div>
+    </dl>
+  </article>
+
+  <article class="card">
+    <h3 class="card-title">{{ icon("activity") }}<span>转发与防火墙</span></h3>
+    <dl class="key-value">
+      <div>
+        <dt>dnsmasq</dt>
+        <dd>
+          <span class="status-badge status-{{ 'ok' if dnsmasq_service.active else 'error' }}">{{ '运行中' if dnsmasq_service.active else '未运行' }}</span>
+        </dd>
+      </div>
+      <div>
+        <dt>nftables</dt>
+        <dd>
+          <span class="status-badge status-{{ 'ok' if firewall.nat4 else 'error' }}">{{ '规则已加载' if firewall.nat4 else '规则缺失' }}</span>
+        </dd>
+      </div>
+      <div>
+        <dt>IPv4 转发</dt>
+        <dd>
+          <span class="status-badge status-{{ 'ok' if forwarding.ipv4 == '1' else 'error' }}">{{ '已启用' if forwarding.ipv4 == '1' else '未启用' }}</span>
+        </dd>
+      </div>
+      <div>
+        <dt>IPv6 转发</dt>
+        <dd>
+          <span class="status-badge status-{{ 'ok' if forwarding.ipv6 == '1' else 'error' }}">{{ '已启用' if forwarding.ipv6 == '1' else '未启用' }}</span>
+        </dd>
+      </div>
+      <div><dt>IPv4 NAT</dt><dd class="numeric-value">{{ firewall.nat4_packets }} 个包</dd></div>
+      <div><dt>IPv6 NAT66</dt><dd class="numeric-value">{{ firewall.nat6_packets }} 个包</dd></div>
+    </dl>
+  </article>
+
+  {% if status.errors %}
+  <article class="card card-wide">
+    <h3 class="card-title">{{ icon("server") }}<span>读取异常</span></h3>
+    {% for error in status.errors %}
+      <p class="alert compact">{{ error }}</p>
+    {% endfor %}
+  </article>
+  {% endif %}
+
+  <article class="card card-wide">
+    <h3 class="card-title">{{ icon("wrench") }}<span>路由配置</span></h3>
+    <form
+      action="{{ url_for('router_apply') }}"
+      method="post"
+      class="login-form"
+      data-agent-operation-form
+    >
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="form-grid">
+        <label>
+          WAN 上行接口
+          <select name="wan_interface" required>
+            <option value="">请选择</option>
+            {% for item in status.interfaces %}
+            <option value="{{ item.name }}" {{ 'selected' if item.name == config.wan_interface else '' }}>{{ item.name }}（{{ item.link_speed or '未知' }}）</option>
+            {% endfor %}
+          </select>
+          <p class="muted form-hint">连接光猫/上级路由的网口，IPv4 由 DHCP 或静态配置决定</p>
+        </label>
+        <label>
+          LAN 局域网接口
+          <select name="lan_interface" required>
+            <option value="">请选择</option>
+            {% for item in status.interfaces %}
+            <option value="{{ item.name }}" {{ 'selected' if item.name == config.lan_interface else '' }}>{{ item.name }}（{{ item.link_speed or '未知' }}）</option>
+            {% endfor %}
+          </select>
+          <p class="muted form-hint">接交换机/终端的网口，本机会在此接口上做网关</p>
+        </label>
+        <label>
+          LAN IPv4 网段
+          <input type="text" class="mono-value" name="lan_network" value="{{ config.lan_network }}" placeholder="192.168.50.0/24" required>
+          <p class="muted form-hint">网关固定为网段第一个可用地址</p>
+        </label>
+        <label>
+          MTU（可选）
+          <input type="number" class="mono-value" name="mtu" value="{{ config.mtu }}" min="576" max="9000" placeholder="留空使用默认 1500">
+        </label>
+      </div>
+
+      <div class="form-grid">
+        <label class="checkbox-field">
+          <input type="checkbox" name="dhcp_enabled" value="1" {{ 'checked' if config.dhcp_enabled else '' }}>
+          <span>启用 DHCPv4 服务（dnsmasq）</span>
+        </label>
+        <label class="checkbox-field">
+          <input type="checkbox" name="wan_ipv6_auto" value="1" {{ 'checked' if config.wan_ipv6_auto else '' }}>
+          <span>WAN 自动获取 IPv6（SLAAC / DHCPv6）</span>
+        </label>
+        <label>
+          DHCP 起始地址
+          <input type="text" class="mono-value" name="dhcp_start" value="{{ config.dhcp_start }}" placeholder="自动分配">
+        </label>
+        <label>
+          DHCP 结束地址
+          <input type="text" class="mono-value" name="dhcp_end" value="{{ config.dhcp_end }}" placeholder="自动分配">
+        </label>
+        <label>
+          DHCP 租期
+          <input type="text" class="mono-value" name="dhcp_lease" value="{{ config.dhcp_lease }}" placeholder="12h">
+        </label>
+        <label>
+          上游 DNS（可选）
+          <input type="text" class="mono-value" name="dns_upstream" value="{{ config.dns_upstream }}" placeholder="留空则使用 WAN 下发的 DNS">
+        </label>
+      </div>
+
+      <div class="form-grid">
+        <label>
+          IPv6 模式
+          <select name="ipv6_mode">
+            {% for value, label in ipv6_modes.items() %}
+            <option value="{{ value }}" {{ 'selected' if value == config.ipv6_mode else '' }}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <p class="muted form-hint">ULA 模式无需运营商支持，配合 NAT66 即可让内网设备用 IPv6 上网</p>
+        </label>
+        <label>
+          LAN IPv6 前缀
+          <input type="text" class="mono-value" name="ipv6_prefix" value="{{ config.ipv6_prefix }}" placeholder="fd00:50::/64 或 2408:8207:1234:5600::/64">
+          <p class="muted form-hint">留空时 ULA 模式会自动生成私有前缀；全局前缀模式必须填写运营商分配的 /64</p>
+        </label>
+        <label class="checkbox-field">
+          <input type="checkbox" name="ipv6_nat" value="1" {{ 'checked' if config.ipv6_nat else '' }}>
+          <span>启用 IPv6 NAT66（ULA 模式需要）</span>
+        </label>
+      </div>
+
+      <p class="muted form-hint">
+        应用配置会写入 NetworkManager 的 LAN 连接、dnsmasq 与 nftables 规则。
+        若修改了 LAN 地址，当前页面需要用新地址重新访问。
+      </p>
+      <button type="submit">应用路由配置</button>
+    </form>
+  </article>
+</section>
+{% endblock %}

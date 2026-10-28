@@ -6,7 +6,6 @@ import socket
 from concurrent.futures import ThreadPoolExecutor
 
 from .core import (
-    HOTSPOT_CONNECTION_NAME,
     SYSTEM_STATIC_CACHE_TTL,
     format_bytes,
     format_uptime,
@@ -21,24 +20,25 @@ from .core import (
 )
 from .contracts import SystemInfo
 from .network import get_active_connections
+from .routing import load_router_config
 
 
-def summarize_network_status(active_connections: list[dict[str, str]]) -> dict[str, bool]:
+def summarize_network_status(
+    active_connections: list[dict[str, str]],
+    router_config: dict | None = None,
+) -> dict[str, bool]:
+    router_config = router_config or {}
+    wan_interface = str(router_config.get("wan_interface", "") or "")
+    lan_interface = str(router_config.get("lan_interface", "") or "")
+    ethernet_devices = {
+        connection.get("device", "")
+        for connection in active_connections
+        if connection.get("type") == "802-3-ethernet"
+    }
     return {
-        "wired": any(
-            connection.get("type") == "802-3-ethernet"
-            for connection in active_connections
-        ),
-        "wireless": any(
-            connection.get("type") == "802-11-wireless"
-            and connection.get("name") != HOTSPOT_CONNECTION_NAME
-            for connection in active_connections
-        ),
-        "hotspot": any(
-            connection.get("type") == "802-11-wireless"
-            and connection.get("name") == HOTSPOT_CONNECTION_NAME
-            for connection in active_connections
-        ),
+        "wan": bool(wan_interface and wan_interface in ethernet_devices),
+        "lan": bool(lan_interface and lan_interface in ethernet_devices),
+        "wired": bool(ethernet_devices),
     }
 
 
@@ -73,7 +73,7 @@ def get_static_system_info() -> dict[str, str]:
     return static_info
 
 
-def get_interface_addresses() -> tuple[list[str], dict[str, list[str]]]:
+def get_interface_addresses() -> tuple[list[str], dict[str, dict[str, list[str]]]]:
     result = run_command(["ip", "-j", "address", "show"])
     if not result.ok or not result.output:
         return [], {}
@@ -84,7 +84,7 @@ def get_interface_addresses() -> tuple[list[str], dict[str, list[str]]]:
         return [], {}
 
     ip_addresses: list[str] = []
-    ipv4_by_interface: dict[str, list[str]] = {}
+    addresses_by_interface: dict[str, dict[str, list[str]]] = {}
     for interface in interfaces:
         ifname = str(interface.get("ifname", "")).strip()
         if not ifname or ifname == "lo":
@@ -100,15 +100,17 @@ def get_interface_addresses() -> tuple[list[str], dict[str, list[str]]]:
             if scope == "global" and local not in ip_addresses:
                 ip_addresses.append(local)
 
-            if family != "inet" or scope == "host":
+            if scope == "host":
                 continue
             prefixlen = address.get("prefixlen")
             formatted = f"{local}/{prefixlen}" if prefixlen is not None else local
-            addresses = ipv4_by_interface.setdefault(ifname, [])
-            if formatted not in addresses:
-                addresses.append(formatted)
+            bucket = addresses_by_interface.setdefault(ifname, {"ipv4": [], "ipv6": []})
+            if family == "inet":
+                bucket["ipv4"].append(formatted)
+            elif family == "inet6" and not local.lower().startswith("fe80:"):
+                bucket["ipv6"].append(formatted)
 
-    return ip_addresses, ipv4_by_interface
+    return ip_addresses, addresses_by_interface
 
 
 def gather_system_info() -> SystemInfo:
@@ -132,20 +134,15 @@ def gather_system_info() -> SystemInfo:
 
         static_info = static_info_future.result()
         active_connections = active_connections_future.result()
-        ip_addresses, ipv4_by_interface = interface_addresses_future.result()
+        ip_addresses, addresses_by_interface = interface_addresses_future.result()
         network_interfaces = network_interfaces_future.result()
 
+    router_config = load_router_config()
     active_connections = [
         {
             **connection,
-            "ip_addresses": (
-                ipv4_by_interface.get(connection.get("device", ""), [])
-                if connection.get("name") == HOTSPOT_CONNECTION_NAME
-                else [
-                    address.split("/", 1)[0]
-                    for address in ipv4_by_interface.get(connection.get("device", ""), [])
-                ]
-            ),
+            "ipv4_addresses": addresses_by_interface.get(connection.get("device", ""), {}).get("ipv4", []),
+            "ipv6_addresses": addresses_by_interface.get(connection.get("device", ""), {}).get("ipv6", []),
         }
         for connection in active_connections
     ]
@@ -159,9 +156,10 @@ def gather_system_info() -> SystemInfo:
         "disk_free": format_bytes(disk_free),
         "ip_addresses": ip_addresses,
         "active_connections": active_connections,
-        "network_status": summarize_network_status(active_connections),
+        "network_status": summarize_network_status(active_connections, router_config),
         "network_interfaces": network_interfaces,
     }
+
 
 __all__ = [
     "get_static_system_info",

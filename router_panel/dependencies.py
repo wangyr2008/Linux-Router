@@ -8,14 +8,14 @@ from typing import Any
 
 from .core import (
     APT_TIMEOUT,
-    CommandResult,
-    HOTSPOT_CONNECTION_NAME,
+    DNSMASQ_RULESET_PATH,
     NETPLAN_DIR,
     NETWORKMANAGER_CONFIG_PATH,
     NETWORKMANAGER_CONF_DIR,
     REQUIRED_PACKAGES,
     ROUTER_PANEL_SYSCTL_PATH,
     SYSTEM_COMMAND_TIMEOUT,
+    CommandResult,
     atomic_write_text,
     command_exists,
     file_update_lock,
@@ -26,7 +26,19 @@ from .core import (
     read_text,
     run_command,
 )
-from .network import gather_wired_network_info, get_active_connections
+from .firewall import apply_ruleset, get_firewall_status, render_nftables_ruleset
+from .network import gather_wired_network_info
+from .routing import (
+    build_dnsmasq_config,
+    ensure_dnsmasq_include,
+    ensure_forwarding,
+    ensure_lan_connection,
+    lan_gateway_ipv4,
+    lan_ipv6_address,
+    lan_ipv6_network,
+    load_router_config,
+    save_router_config,
+)
 
 
 def get_networkmanager_managed_setting() -> str:
@@ -61,9 +73,9 @@ def get_netplan_renderer_summary() -> dict[str, Any]:
     files = get_netplan_files()
     if not files:
         return {
-            "ok": False,
-            "level": "warning",
-            "summary": "未找到 netplan 配置文件",
+            "ok": True,
+            "level": "ok",
+            "summary": "未找到 netplan 配置文件（Debian 最小安装通常不使用 netplan）",
             "details": [],
         }
 
@@ -111,15 +123,10 @@ def get_netplan_renderer_summary() -> dict[str, Any]:
 
 
 def get_ip_forward_status() -> dict[str, str]:
-    runtime = read_text("/proc/sys/net/ipv4/ip_forward") or "0"
-    persistent = ""
-    try:
-        persistent = ROUTER_PANEL_SYSCTL_PATH.read_text(encoding="utf-8").strip()
-    except OSError:
-        persistent = ""
     return {
-        "runtime": runtime,
-        "persistent": persistent,
+        "ipv4": read_text("/proc/sys/net/ipv4/ip_forward") or "0",
+        "ipv6": read_text("/proc/sys/net/ipv6/conf/all/forwarding") or "0",
+        "persistent": read_text(str(ROUTER_PANEL_SYSCTL_PATH)),
     }
 
 
@@ -135,53 +142,50 @@ def get_default_route_interface() -> str:
     return ""
 
 
-def get_active_hotspot_connection() -> dict[str, str]:
-    for item in get_active_connections():
-        if item.get("name") == HOTSPOT_CONNECTION_NAME:
-            return item
-    return {}
+def get_router_nat_status() -> dict[str, Any]:
+    """Compare the configured router setup with what nftables actually holds."""
+    config = load_router_config()
+    firewall = get_firewall_status()
+    wan = str(config.get("wan_interface", "") or "")
+    lan = str(config.get("lan_interface", "") or "")
+    ipv6_nat_expected = bool(config.get("ipv6_nat")) and str(config.get("ipv6_mode", "")) == "ula"
 
-
-def get_hotspot_nat_status() -> dict[str, str]:
-    hotspot = get_active_hotspot_connection()
-    hotspot_ifname = hotspot.get("device", "").strip()
-    if not hotspot_ifname:
+    if not wan or not lan:
         return {
             "level": "warning",
-            "summary": "当前没有运行中的热点",
-            "details": "启动热点后才能检查共享规则",
+            "summary": "尚未配置 WAN/LAN 接口",
+            "details": "在“路由”页面选择接口后即可自动生成 NAT 规则",
+            "action": "",
         }
-
-    uplink_ifname = get_default_route_interface().strip()
-    if not uplink_ifname or uplink_ifname == hotspot_ifname:
+    if not firewall["available"]:
+        return {
+            "level": "error",
+            "summary": "系统缺少 nftables",
+            "details": "",
+            "action": "install_packages",
+        }
+    if not firewall["nat4"]:
+        return {
+            "level": "error",
+            "summary": "IPv4 NAT 规则未加载",
+            "details": f"{lan} → {wan} 缺少 masquerade 规则",
+            "action": "apply_firewall",
+        }
+    if ipv6_nat_expected and not firewall["nat6"]:
         return {
             "level": "warning",
-            "summary": "当前没有可用的上联网卡",
-            "details": "请先确保 STA 或有线网络已经联网",
+            "summary": "IPv6 NAT66 规则未加载",
+            "details": "LAN 使用 ULA 前缀，需要 NAT66 才能访问 IPv6 外网",
+            "action": "apply_firewall",
         }
-
-    method = run_command(
-        [
-            "nmcli",
-            "-g",
-            "ipv4.method",
-            "connection",
-            "show",
-            "id",
-            HOTSPOT_CONNECTION_NAME,
-        ],
-        timeout=5,
-    )
-    if method.ok and method.output.strip() == "shared":
-        return {
-            "level": "ok",
-            "summary": "NetworkManager 热点共享已启用",
-            "details": f"{hotspot_ifname} -> {uplink_ifname}",
-        }
+    details = f"{lan} → {wan}，已转发 IPv4 {firewall['nat4_packets']} 个包"
+    if ipv6_nat_expected:
+        details += f"，IPv6 {firewall['nat6_packets']} 个包"
     return {
-        "level": "error",
-        "summary": "热点未启用 NetworkManager 共享模式",
-        "details": f"{hotspot_ifname} -> {uplink_ifname}",
+        "level": "ok",
+        "summary": "nftables NAT 规则已加载",
+        "details": details,
+        "action": "",
     }
 
 
@@ -359,13 +363,6 @@ def _rollback_network_configuration(
     return "; ".join(errors)
 
 
-def _restore_runtime_ip_forward(value: str) -> str:
-    if value not in {"0", "1"}:
-        return ""
-    restored = run_command(["sysctl", "-w", f"net.ipv4.ip_forward={value}"], timeout=10)
-    return "" if restored.ok else (restored.output or "IPv4 转发运行状态恢复失败")
-
-
 def restart_service(service_name: str) -> CommandResult:
     return run_command(["systemctl", "restart", service_name], timeout=SYSTEM_COMMAND_TIMEOUT)
 
@@ -379,22 +376,6 @@ def disable_service(service_name: str) -> CommandResult:
         ["systemctl", "disable", "--now", service_name],
         timeout=SYSTEM_COMMAND_TIMEOUT,
     )
-
-
-def ensure_ip_forward_enabled() -> CommandResult:
-    try:
-        atomic_write_text(
-            ROUTER_PANEL_SYSCTL_PATH,
-            "net.ipv4.ip_forward=1\n",
-            mode=0o644,
-        )
-    except OSError as exc:
-        return CommandResult(False, str(exc))
-
-    runtime = run_command(["sysctl", "-w", "net.ipv4.ip_forward=1"], timeout=10)
-    if not runtime.ok:
-        return runtime
-    return CommandResult(True, "已启用 IPv4 转发并写入持久配置")
 
 
 def install_missing_packages() -> CommandResult:
@@ -419,7 +400,8 @@ def install_missing_packages() -> CommandResult:
 
 
 def get_dependency_rows() -> list[dict[str, Any]]:
-    wired_info = gather_wired_network_info()
+    config = load_router_config()
+    wired_info = gather_wired_network_info(config)
     wired_devices = wired_info.get("devices", [])
     unmanaged_wired = [device.get("device", "") for device in wired_devices if device.get("state") == "unmanaged"]
     active_nm = is_service_active("NetworkManager")
@@ -427,20 +409,23 @@ def get_dependency_rows() -> list[dict[str, Any]]:
     active_panel = is_service_active("router-panel.service")
     enabled_panel = is_service_enabled("router-panel.service")
     active_dhcpcd = is_service_active("dhcpcd.service")
+    active_resolved = is_service_active("systemd-resolved.service")
+    active_dnsmasq = is_service_active("dnsmasq.service")
+    enabled_dnsmasq = is_service_enabled("dnsmasq.service")
     nm_managed = get_networkmanager_managed_setting() == "true"
     netplan = get_netplan_renderer_summary()
-    ip_forward = get_ip_forward_status()
-    hotspot_nat = get_hotspot_nat_status()
+    forwarding = get_ip_forward_status()
+    nat = get_router_nat_status()
+    firewall = get_firewall_status()
+    lan_configured = _lan_has_address(config)
     package_details = {
         "python3-flask": "提供网页运行框架",
         "gunicorn": "运行网页服务",
         "network-manager": "管理系统网络连接",
-        "dnsmasq-base": "为热点分配地址",
+        "dnsmasq": "提供 LAN 的 DHCP / DNS / RA",
+        "nftables": "提供 NAT 与转发规则",
         "iproute2": "读取 IP 和路由",
-        "iptables": "提供网络转发规则",
-        "iw": "读取无线网卡能力",
         "udev": "读取硬件信息",
-        "wpasupplicant": "扫描并连接无线网络",
     }
 
     rows = [
@@ -463,7 +448,7 @@ def get_dependency_rows() -> list[dict[str, Any]]:
                 "name": package_name,
                 "status": "已安装" if installed else "未安装",
                 "level": "ok" if installed else "error",
-                "detail": package_details[package_name],
+                "detail": package_details.get(package_name, ""),
                 "action": "install_packages" if not installed else "",
                 "action_label": "安装依赖",
             }
@@ -479,6 +464,24 @@ def get_dependency_rows() -> list[dict[str, Any]]:
                 "detail": "管理系统网络连接",
                 "action": "repair_network_stack" if not (active_nm and enabled_nm) else "restart_networkmanager",
                 "action_label": "修复网络栈" if not (active_nm and enabled_nm) else "重启服务",
+            },
+            {
+                "group": "服务状态",
+                "name": "dnsmasq.service",
+                "status": "无异常" if active_dnsmasq and enabled_dnsmasq else "有异常",
+                "level": "ok" if active_dnsmasq and enabled_dnsmasq else "error",
+                "detail": "为 LAN 提供 DHCP / DNS / RA",
+                "action": "restart_dnsmasq" if not (active_dnsmasq and enabled_dnsmasq) else "",
+                "action_label": "启动服务",
+            },
+            {
+                "group": "服务状态",
+                "name": "nftables.service",
+                "status": "无异常" if firewall["service_active"] and firewall["service_enabled"] else "有异常",
+                "level": "ok" if firewall["service_active"] and firewall["service_enabled"] else "error",
+                "detail": "开机加载 NAT 与转发规则",
+                "action": "apply_firewall" if not (firewall["service_active"] and firewall["service_enabled"]) else "",
+                "action_label": "重新加载规则",
             },
             {
                 "group": "服务状态",
@@ -509,13 +512,22 @@ def get_dependency_rows() -> list[dict[str, Any]]:
             },
             {
                 "group": "网络接管",
+                "name": "systemd-resolved 端口冲突",
+                "status": "有异常" if active_resolved else "无异常",
+                "level": "warning" if active_resolved else "ok",
+                "detail": "resolved 与 dnsmasq 会争用 53 端口",
+                "action": "",
+                "action_label": "",
+            },
+            {
+                "group": "网络接管",
                 "name": "netplan renderer",
                 "status": "无异常" if netplan["ok"] else "需处理",
                 "level": netplan["level"],
                 "detail": "统一网络配置后端",
                 "extra_details": [f"{item['path']}: {item['renderer']}" for item in netplan["details"]],
-                "action": "repair_network_stack" if not netplan["ok"] else "apply_netplan",
-                "action_label": "修复网络栈" if not netplan["ok"] else "重新应用",
+                "action": "repair_network_stack" if not netplan["ok"] else "",
+                "action_label": "修复网络栈",
             },
             {
                 "group": "网络接管",
@@ -527,28 +539,64 @@ def get_dependency_rows() -> list[dict[str, Any]]:
                 "action_label": "修复网络栈",
             },
             {
-                "group": "热点共享",
+                "group": "路由转发",
                 "name": "IPv4 转发",
-                "status": "已启用" if ip_forward["runtime"] == "1" else "未启用",
-                "level": "ok" if ip_forward["runtime"] == "1" else "error",
-                "detail": "允许设备访问外网",
-                "action": "fix_ip_forward" if ip_forward["runtime"] != "1" or "net.ipv4.ip_forward=1" not in ip_forward["persistent"] else "",
+                "status": "已启用" if forwarding["ipv4"] == "1" else "未启用",
+                "level": "ok" if forwarding["ipv4"] == "1" else "error",
+                "detail": "允许 LAN 设备访问 IPv4 外网",
+                "action": "fix_forwarding" if forwarding["ipv4"] != "1" else "",
                 "action_label": "启用转发",
             },
             {
-                "group": "热点共享",
-                "name": "热点 NAT/FORWARD",
-                "status": "无异常" if hotspot_nat["level"] == "ok" else "需处理",
-                "level": hotspot_nat["level"],
-                "detail": "共享上游网络连接",
-                "extra_details": [hotspot_nat["details"]] if hotspot_nat["details"] else [],
-                "extra_details_mono": hotspot_nat["level"] == "ok",
-                "action": "",
-                "action_label": "",
+                "group": "路由转发",
+                "name": "IPv6 转发",
+                "status": "已启用" if forwarding["ipv6"] == "1" else "未启用",
+                "level": "ok" if forwarding["ipv6"] == "1" else "error",
+                "detail": "允许 LAN 设备访问 IPv6 外网",
+                "action": "fix_forwarding" if forwarding["ipv6"] != "1" else "",
+                "action_label": "启用转发",
+            },
+            {
+                "group": "路由转发",
+                "name": "nftables NAT/FORWARD",
+                "status": "无异常" if nat["level"] == "ok" else "需处理",
+                "level": nat["level"],
+                "detail": nat["summary"],
+                "extra_details": [nat["details"]] if nat["details"] else [],
+                "action": nat["action"],
+                "action_label": "重新加载规则" if nat["action"] == "apply_firewall" else ("安装依赖" if nat["action"] == "install_packages" else ""),
+            },
+            {
+                "group": "路由转发",
+                "name": "LAN 接口地址",
+                "status": "已配置" if lan_configured else "未配置",
+                "level": "ok" if lan_configured else "warning",
+                "detail": _lan_address_summary(config),
+                "action": "" if lan_configured else "fix_lan_interface",
+                "action_label": "写入 LAN 配置",
             },
         ]
     )
     return rows
+
+
+def _lan_has_address(config: dict[str, Any]) -> bool:
+    lan = str(config.get("lan_interface", "") or "")
+    if not lan:
+        return False
+    result = run_command(["ip", "-4", "address", "show", "dev", lan], timeout=5)
+    return result.ok and str(lan_gateway_ipv4(config)) in result.output
+
+
+def _lan_address_summary(config: dict[str, Any]) -> str:
+    if not config.get("lan_interface"):
+        return "尚未选择 LAN 接口"
+    parts = [f"IPv4 {lan_gateway_ipv4(config)}"]
+    ipv6_address = lan_ipv6_address(config)
+    ipv6_network = lan_ipv6_network(config)
+    if ipv6_address and ipv6_network:
+        parts.append(f"IPv6 {ipv6_address}/{ipv6_network.prefixlen}")
+    return "，".join(parts)
 
 
 def gather_dependency_status() -> dict[str, Any]:
@@ -601,29 +649,31 @@ def _run_dependency_action(action: str) -> CommandResult:
         return enable_service("router-panel.service")
     if action == "disable_dhcpcd":
         return disable_service("dhcpcd.service")
-    if action == "fix_ip_forward":
+    if action == "fix_forwarding":
+        return ensure_forwarding()
+    if action == "apply_firewall":
+        config = load_router_config()
+        if not config.get("wan_interface") or not config.get("lan_interface"):
+            return CommandResult(False, "请先在“路由”页面选择 WAN 和 LAN 接口")
+        return apply_ruleset(render_nftables_ruleset(config))
+    if action == "restart_dnsmasq":
+        config = load_router_config()
+        include = ensure_dnsmasq_include()
+        if not include.ok:
+            return include
         try:
-            snapshot = _snapshot_paths([ROUTER_PANEL_SYSCTL_PATH])
+            atomic_write_text(DNSMASQ_RULESET_PATH, build_dnsmasq_config(config), mode=0o644)
         except OSError as exc:
-            return CommandResult(False, f"无法备份 IPv4 转发配置：{exc}")
-        runtime_before = run_command(["sysctl", "-n", "net.ipv4.ip_forward"], timeout=10)
-        if not runtime_before.ok:
-            return runtime_before
-        result = ensure_ip_forward_enabled()
+            return CommandResult(False, f"写入 dnsmasq 配置失败：{exc}")
+        enable_service("dnsmasq.service")
+        return restart_service("dnsmasq.service")
+    if action == "fix_lan_interface":
+        config = load_router_config()
+        if not config.get("lan_interface"):
+            return CommandResult(False, "请先在“路由”页面选择 LAN 接口")
+        result = ensure_lan_connection(config)
         if result.ok:
-            return result
-        rollback_error = _rollback_network_configuration(
-            snapshot,
-            apply_netplan_config=False,
-            restart_networkmanager=False,
-        )
-        runtime_error = _restore_runtime_ip_forward(runtime_before.output)
-        rollback_errors = "; ".join(item for item in (rollback_error, runtime_error) if item)
-        if rollback_errors:
-            return CommandResult(
-                False,
-                f"{result.output or 'IPv4 转发修复失败'}；回滚失败：{rollback_errors}",
-            )
+            save_router_config(config)
         return result
     if action == "repair_network_stack":
         networkmanager_state = (
@@ -685,21 +735,20 @@ def _run_dependency_action(action: str) -> CommandResult:
 def run_dependency_action(action: str) -> CommandResult:
     return _run_dependency_action(action)
 
+
 __all__ = [
     "get_networkmanager_managed_setting",
     "get_netplan_files",
     "get_netplan_renderer_summary",
     "get_ip_forward_status",
     "get_default_route_interface",
-    "get_active_hotspot_connection",
-    "get_hotspot_nat_status",
+    "get_router_nat_status",
     "ensure_networkmanager_managed_ifupdown",
     "ensure_netplan_networkmanager_renderer",
     "apply_netplan",
     "restart_service",
     "enable_service",
     "disable_service",
-    "ensure_ip_forward_enabled",
     "install_missing_packages",
     "get_dependency_rows",
     "gather_dependency_status",

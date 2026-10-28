@@ -6,8 +6,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title or "Linux Router" }}</title>
     <link rel="icon" href="{{ url_for('static', filename='favicon.ico', v='20260720-1') }}" sizes="any">
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20260718-95') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='responsive.css', v='20260718-13') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261028-1') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='responsive.css', v='20261028-1') }}">
   </head>
   <body>
     {% set flashes = get_flashed_messages(with_categories=true) %}
@@ -35,10 +35,9 @@
             <a href="{{ url_for('system_info') }}" class="{{ 'active' if current_path == url_for('system_info') else '' }}" aria-current="{{ 'page' if current_path == url_for('system_info') else 'false' }}">{{ icon("monitor") }}<span>概览</span></a>
             <a href="{{ url_for('dependencies_page') }}" class="{{ 'active' if current_path == url_for('dependencies_page') else '' }}" aria-current="{{ 'page' if current_path == url_for('dependencies_page') else 'false' }}">{{ icon("package") }}<span>依赖</span></a>
             <a href="{{ url_for('wired_network') }}" class="{{ 'active' if current_path == url_for('wired_network') else '' }}" aria-current="{{ 'page' if current_path == url_for('wired_network') else 'false' }}">{{ icon("ethernet-port") }}<span>有线</span></a>
-            <a href="{{ url_for('wifi_page') }}" class="{{ 'active' if current_path == url_for('wifi_page') else '' }}" aria-current="{{ 'page' if current_path == url_for('wifi_page') else 'false' }}">{{ icon("wifi") }}<span>无线</span></a>
-            <a href="{{ url_for('hotspot_page') }}" class="{{ 'active' if current_path == url_for('hotspot_page') else '' }}" aria-current="{{ 'page' if current_path == url_for('hotspot_page') else 'false' }}">{{ icon("radio-tower") }}<span>热点</span></a>
+            <a href="{{ url_for('router_page') }}" class="{{ 'active' if current_path == url_for('router_page') else '' }}" aria-current="{{ 'page' if current_path == url_for('router_page') else 'false' }}">{{ icon("git-branch") }}<span>路由</span></a>
+            <a href="{{ url_for('clients_page') }}" class="{{ 'active' if current_path == url_for('clients_page') else '' }}" aria-current="{{ 'page' if current_path == url_for('clients_page') else 'false' }}">{{ icon("smartphone") }}<span>设备</span></a>
             <a href="{{ url_for('tools_page') }}" class="{{ 'active' if current_path == url_for('tools_page') else '' }}" aria-current="{{ 'page' if current_path == url_for('tools_page') else 'false' }}">{{ icon("wrench") }}<span>工具</span></a>
-            <a href="{{ url_for('hotspot_clients_page') }}" class="{{ 'active' if current_path == url_for('hotspot_clients_page') else '' }}" aria-current="{{ 'page' if current_path == url_for('hotspot_clients_page') else 'false' }}">{{ icon("smartphone") }}<span>设备</span></a>
             <a href="{{ url_for('system_settings') }}" class="{{ 'active' if current_path == url_for('system_settings') else '' }}" aria-current="{{ 'page' if current_path == url_for('system_settings') else 'false' }}">{{ icon("settings") }}<span>设置</span></a>
           </nav>
         </div>

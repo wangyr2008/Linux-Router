@@ -4,77 +4,63 @@
 {% block content %}
 <section class="page-header">
   <h2 class="section-title"><span>设备</span></h2>
-  <p class="muted">当前共 <span id="hotspot-client-total" class="numeric-value">{{ status.total_clients }}</span> 台设备连接到本机热点</p>
+  <p class="muted">
+    共 <span class="numeric-value">{{ status.total }}</span> 台设备，
+    <span class="numeric-value">{{ status.online }}</span> 台当前在线
+    {% if status.lan_interface %}（LAN {{ status.lan_interface }}）{% endif %}
+  </p>
 </section>
 
 <section class="card-grid">
-  <div class="wide-slot" id="hotspot-client-list-slot">
-    {% if status.hotspots %}
-    <div class="device-list hotspot-client-list">
-      {% for hotspot in status.hotspots %}
-      <section class="device-card hotspot-client-group">
+  <div class="wide-slot">
+    {% if status.clients %}
+    <div class="device-list">
+      <section class="device-card">
         <div class="device-head">
-          <h3 class="card-title card-primary-heading">{{ icon("radio-tower") }}<span>{{ hotspot.ssid }}</span></h3>
+          <h3 class="card-title card-primary-heading">{{ icon("smartphone") }}<span>局域网设备</span></h3>
         </div>
-        {% if hotspot.clients %}
         <div class="table-scroll">
-          <table class="table hotspot-client-table responsive-detail-table">
+          <table class="table responsive-detail-table">
             <thead>
               <tr>
                 <th>设备</th>
-                <th>信号</th>
-                <th>下行速率</th>
-                <th>上行速率</th>
-                <th>在线时长</th>
-                <th>最近活动</th>
+                <th>IPv4</th>
+                <th>IPv6</th>
+                <th>MAC</th>
+                <th>租约剩余</th>
+                <th>状态</th>
               </tr>
             </thead>
             <tbody>
-              {% for client in hotspot.clients %}
+              {% for client in status.clients %}
               <tr>
                 <td data-label="设备">
-                  <strong class="mono-value">{{ client.mac_address }}</strong>
-                  <span class="client-cell-detail">{{ client.device_name }}</span>
+                  <strong>{{ client.name }}</strong>
+                  {% if client.hostname %}<span class="client-cell-detail mono-value">{{ client.mac_address or client.duid }}</span>{% endif %}
                 </td>
-                <td data-label="信号">
-                  <span class="status-badge client-signal-status status-{{ client.signal_level }}">{{ client.signal_label }}</span>
-                  <span class="client-cell-detail numeric-value">{{ client.signal }}</span>
+                <td class="mono-value" data-label="IPv4">{{ client.ipv4 or '无' }}</td>
+                <td class="mono-value" data-label="IPv6">{{ client.ipv6_label or '无' }}</td>
+                <td class="mono-value" data-label="MAC">{{ client.mac_address or '未知' }}</td>
+                <td data-label="租约剩余">{{ client.lease or '未知' }}</td>
+                <td data-label="状态">
+                  <span class="status-badge status-{{ 'ok' if client.online == '1' else 'warning' }}">{{ '在线' if client.online == '1' else '空闲' }}</span>
                 </td>
-                <td class="numeric-value client-rate-cell" data-label="下行速率">
-                  <span class="client-rate-primary">{{ client.downlink_rate }}</span>
-                  {% if client.downlink_rate_detail %}<span class="client-cell-detail">{{ client.downlink_rate_detail }}</span>{% endif %}
-                </td>
-                <td class="numeric-value client-rate-cell" data-label="上行速率">
-                  <span class="client-rate-primary">{{ client.uplink_rate }}</span>
-                  {% if client.uplink_rate_detail %}<span class="client-cell-detail">{{ client.uplink_rate_detail }}</span>{% endif %}
-                </td>
-                <td data-label="在线时长">
-                  {{ client.connected_time }}
-                  <span class="client-cell-detail mono-value">{{ client.ip_address }}</span>
-                </td>
-                <td data-label="最近活动">{{ client.inactive_time }} 前</td>
               </tr>
               {% endfor %}
             </tbody>
           </table>
         </div>
-        {% else %}
-        <div class="client-empty-state">
-          <p class="muted">热点正在运行，当前没有已连接设备</p>
-        </div>
-        {% endif %}
       </section>
-      {% endfor %}
     </div>
     {% else %}
     <article class="card card-wide">
-      <h3 class="card-title">{{ icon("radio-tower") }}<span>热点未运行</span></h3>
-      <p class="muted">开启热点后，已连接设备会显示在这里</p>
+      <h3 class="card-title">{{ icon("smartphone") }}<span>暂无设备</span></h3>
+      <p class="muted">LAN 接口上没有读取到 DHCP 租约或邻居表记录。设备接入并获取地址后会显示在这里。</p>
     </article>
     {% endif %}
   </div>
 
-  <div class="card-slot" id="hotspot-client-errors-slot">
+  <div class="card-slot">
     {% if status.errors %}
     <article class="card card-wide">
       <h3 class="card-title">{{ icon("server") }}<span>读取异常</span></h3>

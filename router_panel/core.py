@@ -21,33 +21,38 @@ from werkzeug.security import generate_password_hash
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("LINUX_ROUTER_DATA_DIR", BASE_DIR / "data")).expanduser()
 AUTH_PATH = DATA_DIR / "auth.json"
-NETWORK_CONFIG_PATH = DATA_DIR / "network.json"
+ROUTER_CONFIG_PATH = DATA_DIR / "router.json"
+LEGACY_NETWORK_CONFIG_PATH = DATA_DIR / "network.json"
 PASSWORD_HINT_PATH = DATA_DIR / "initial_password.txt"
 SECRET_KEY_PATH = DATA_DIR / "secret_key"
 BUILD_INFO_PATH = BASE_DIR / "BUILD_INFO"
-HOTSPOT_CONNECTION_NAME = "DebianRouterHotspot"
-HOTSPOT_DEFAULT_SSID = "DebianRouter"
-HOTSPOT_VIRTUAL_INTERFACE_PREFIX = "ap-"
 DEFAULT_LAN_NETWORK = "192.168.50.0/24"
+LAN_CONNECTION_NAME = "linux-router-lan"
 NETWORKMANAGER_CONFIG_PATH = Path("/etc/NetworkManager/NetworkManager.conf")
 NETWORKMANAGER_CONF_DIR = Path("/etc/NetworkManager/conf.d")
 NETPLAN_DIR = Path("/etc/netplan")
 ROUTER_PANEL_SYSCTL_PATH = Path("/etc/sysctl.d/90-router-panel.conf")
+NFTABLES_CONFIG_PATH = Path("/etc/nftables.conf")
+NFTABLES_CONF_DIR = Path("/etc/nftables.d")
+NFTABLES_RULESET_PATH = NFTABLES_CONF_DIR / "90-linux-router.nft"
+DNSMASQ_CONFIG_PATH = Path("/etc/dnsmasq.conf")
+DNSMASQ_CONF_DIR = Path("/etc/dnsmasq.d")
+DNSMASQ_RULESET_PATH = DNSMASQ_CONF_DIR / "linux-router.conf"
+DNSMASQ_LEASE_PATH = Path("/var/lib/misc/dnsmasq.leases")
 HARDWARE_INFO_CACHE_TTL = 15
-WIRELESS_PHY_CACHE_TTL = 15
 SYSTEM_STATIC_CACHE_TTL = 3600
 APT_TIMEOUT = 300
 SYSTEM_COMMAND_TIMEOUT = 30
+# Debian 13 minimal install already provides the kernel side of routing
+# (nftables + dnsmasq are the only extra userland pieces the router needs).
 REQUIRED_PACKAGES = (
     "python3-flask",
     "gunicorn",
     "network-manager",
-    "dnsmasq-base",
+    "dnsmasq",
+    "nftables",
     "iproute2",
-    "iptables",
-    "iw",
     "udev",
-    "wpasupplicant",
 )
 
 
@@ -241,41 +246,6 @@ def python_module_available(module_name: str) -> bool:
     except ImportError:
         return False
     return True
-
-
-def is_hotspot_virtual_interface(ifname: str) -> bool:
-    return ifname.startswith(HOTSPOT_VIRTUAL_INTERFACE_PREFIX)
-
-
-def get_hotspot_virtual_interface_name(parent_ifname: str) -> str:
-    return f"{HOTSPOT_VIRTUAL_INTERFACE_PREFIX}{parent_ifname}"[:15]
-
-
-def format_hotspot_error(message: str, ifname: str) -> str:
-    normalized = (message or "").strip()
-    if not normalized:
-        return "开启热点失败"
-    if any(
-        marker in normalized
-        for marker in (
-            "；应用 WPA2 兼容配置失败：",
-            "；WPA2 兼容模式重试失败：",
-        )
-    ):
-        return normalized
-
-    lowered = normalized.lower()
-    timeout_markers = (
-        "802.1x supplicant took too long to authenticate",
-        "hotspot network creation took too long",
-        "supplicant-timeout",
-    )
-    if any(marker in lowered for marker in timeout_markers):
-        return (
-            f"NetworkManager 启动 {ifname} 热点超时；这通常是网卡或驱动切换到 AP 模式失败。"
-            "请稍后重试，必要时改用 2.4 GHz 频段或另一张无线网卡"
-        )
-    return normalized
 
 
 def get_timed_cache(key: str, ttl: int) -> Any | None:
@@ -503,10 +473,12 @@ def get_network_interface_hardware() -> list[dict[str, Any]]:
         if not permanent_mac_address:
             permanent_mac_address = normalize_mac_address(current_mac_address)
 
+        is_wireless = (interface_dir / "wireless").exists()
         interfaces.append(
             {
                 "name": ifname,
-                "role_label": "无线网卡" if (interface_dir / "wireless").exists() else "有线网卡",
+                "role_label": "无线网卡" if is_wireless else "有线网卡",
+                "wireless": is_wireless,
                 "bus_label": translate_bus_label(bus),
                 "vendor": vendor,
                 "model": model,
@@ -630,7 +602,7 @@ def normalize_lan_network(value: str) -> tuple[IPv4Network | None, str | None]:
         return None, "请输入有效的 IPv4 网段，例如 192.168.50.0/24"
 
     if not isinstance(network, IPv4Network):
-        return None, "LAN 网段仅支持 IPv4"
+        return None, "LAN 网段仅支持 IPv4，IPv6 请使用单独的 IPv6 前缀设置"
     if not 16 <= network.prefixlen <= 30:
         return None, "LAN 网段前缀长度必须在 /16 到 /30 之间"
 
@@ -642,32 +614,6 @@ def normalize_lan_network(value: str) -> tuple[IPv4Network | None, str | None]:
     if not any(network.subnet_of(private_range) for private_range in private_ranges):
         return None, "LAN 必须使用 10/8、172.16/12 或 192.168/16 私有网段"
     return network, None
-
-
-def load_network_config() -> dict[str, str]:
-    try:
-        config = json.loads(NETWORK_CONFIG_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        config = {}
-
-    network, _ = normalize_lan_network(config.get("lan_network", DEFAULT_LAN_NETWORK))
-    if network is None:
-        network = IPv4Network(DEFAULT_LAN_NETWORK)
-    gateway = next(network.hosts())
-    return {
-        "lan_network": str(network),
-        "lan_gateway": str(gateway),
-        "lan_address": f"{gateway}/{network.prefixlen}",
-    }
-
-
-def save_network_config(lan_network: IPv4Network) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(
-        NETWORK_CONFIG_PATH,
-        json.dumps({"lan_network": str(lan_network)}, ensure_ascii=False, indent=2),
-        mode=0o600,
-    )
 
 
 def get_build_info() -> dict[str, str]:
@@ -702,20 +648,25 @@ __all__ = [
     "BASE_DIR",
     "DATA_DIR",
     "AUTH_PATH",
-    "NETWORK_CONFIG_PATH",
+    "ROUTER_CONFIG_PATH",
+    "LEGACY_NETWORK_CONFIG_PATH",
     "PASSWORD_HINT_PATH",
     "SECRET_KEY_PATH",
     "BUILD_INFO_PATH",
-    "HOTSPOT_CONNECTION_NAME",
-    "HOTSPOT_DEFAULT_SSID",
-    "HOTSPOT_VIRTUAL_INTERFACE_PREFIX",
     "DEFAULT_LAN_NETWORK",
+    "LAN_CONNECTION_NAME",
     "NETWORKMANAGER_CONFIG_PATH",
     "NETWORKMANAGER_CONF_DIR",
     "NETPLAN_DIR",
     "ROUTER_PANEL_SYSCTL_PATH",
+    "NFTABLES_CONFIG_PATH",
+    "NFTABLES_CONF_DIR",
+    "NFTABLES_RULESET_PATH",
+    "DNSMASQ_CONFIG_PATH",
+    "DNSMASQ_CONF_DIR",
+    "DNSMASQ_RULESET_PATH",
+    "DNSMASQ_LEASE_PATH",
     "HARDWARE_INFO_CACHE_TTL",
-    "WIRELESS_PHY_CACHE_TTL",
     "SYSTEM_STATIC_CACHE_TTL",
     "APT_TIMEOUT",
     "SYSTEM_COMMAND_TIMEOUT",
@@ -729,9 +680,6 @@ __all__ = [
     "command_exists",
     "package_installed",
     "python_module_available",
-    "is_hotspot_virtual_interface",
-    "get_hotspot_virtual_interface_name",
-    "format_hotspot_error",
     "get_timed_cache",
     "set_timed_cache",
     "clear_timed_cache",
@@ -753,8 +701,6 @@ __all__ = [
     "load_auth_config",
     "save_auth_config",
     "normalize_lan_network",
-    "load_network_config",
-    "save_network_config",
     "get_build_info",
     "is_service_active",
     "is_service_enabled",

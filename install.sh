@@ -1,15 +1,30 @@
 #!/usr/bin/env bash
+#
+# Linux Router installer - Debian 13 (trixie) x86 router edition.
+#
+# Differences from upstream:
+#   * wired-only: no Wi-Fi, hostapd, wpa_supplicant or iw dependency
+#   * nftables (Debian 13 default) instead of iptables for NAT/forwarding
+#   * IPv4 + IPv6 dual stack, dnsmasq provides DHCPv4 / SLAAC / DHCPv6
 set -Eeuo pipefail
 
 REPO_URL="${LINUX_ROUTER_REPO_URL:-https://github.com/Jaksay/Linux-Router.git}"
 BRANCH="${LINUX_ROUTER_BRANCH:-main}"
 ARCHIVE_URL="${LINUX_ROUTER_ARCHIVE_URL:-}"
+SOURCE_DIR="${LINUX_ROUTER_SOURCE_DIR:-}"
 INSTALL_DIR="${LINUX_ROUTER_INSTALL_DIR:-/opt/linux-router}"
 DATA_DIR="${LINUX_ROUTER_DATA_DIR:-/var/lib/linux-router}"
 INSTALL_STATE_DIR="$DATA_DIR/.linux-router-installer"
 SERVICE_NAME="router-panel.service"
 AGENT_SERVICE_NAME="router-panel-agent.service"
 SERVICE_USER="router-panel"
+NFTABLES_DIR="/etc/nftables.d"
+NFTABLES_FILE="$NFTABLES_DIR/90-linux-router.nft"
+NFTABLES_CONF="/etc/nftables.conf"
+DNSMASQ_DIR="/etc/dnsmasq.d"
+DNSMASQ_FILE="$DNSMASQ_DIR/linux-router.conf"
+DNSMASQ_CONF="/etc/dnsmasq.conf"
+SYSCTL_FILE="/etc/sysctl.d/90-router-panel.conf"
 CONFIGURE_NETWORK=1
 NETWORK_APPLY_MODE="auto"
 ACTION=""
@@ -31,10 +46,17 @@ NETWORK_APPLIED=0
 NETPLAN_GENERATED=0
 DATA_TOUCHED=0
 ORIGINAL_IP_FORWARD=""
+ORIGINAL_IPV6_FORWARD=""
 NETWORKMANAGER_WAS_ACTIVE=0
 NETWORKMANAGER_WAS_ENABLED=0
 DHCPCD_WAS_ACTIVE=0
 DHCPCD_WAS_ENABLED=0
+RESOLVED_WAS_ACTIVE=0
+RESOLVED_WAS_ENABLED=0
+DNSMASQ_WAS_ACTIVE=0
+DNSMASQ_WAS_ENABLED=0
+NFTABLES_WAS_ACTIVE=0
+NFTABLES_WAS_ENABLED=0
 WEB_WAS_ACTIVE=0
 WEB_WAS_ENABLED=0
 AGENT_WAS_ACTIVE=0
@@ -84,10 +106,12 @@ persist_install_state() {
   local state_previous="${INSTALL_STATE_DIR}.previous"
   rm -rf "$state_tmp" "$state_previous"
   install -d -o root -g root -m 0700 "$state_tmp"
-  printf 'version=1\ndhcpcd_was_active=%s\ndhcpcd_was_enabled=%s\nip_forward=%s\n' \
-    "$DHCPCD_WAS_ACTIVE" "$DHCPCD_WAS_ENABLED" "$ORIGINAL_IP_FORWARD" \
+  printf 'version=1\ndhcpcd_was_active=%s\ndhcpcd_was_enabled=%s\nresolved_was_active=%s\nresolved_was_enabled=%s\nip_forward=%s\nipv6_forward=%s\n' \
+    "$DHCPCD_WAS_ACTIVE" "$DHCPCD_WAS_ENABLED" \
+    "$RESOLVED_WAS_ACTIVE" "$RESOLVED_WAS_ENABLED" \
+    "$ORIGINAL_IP_FORWARD" "$ORIGINAL_IPV6_FORWARD" \
     > "$state_tmp/state.base"
-  for name in networkmanager.conf netplan.yaml sysctl.conf; do
+  for name in networkmanager.conf netplan.yaml sysctl.conf nftables.conf dnsmasq.conf; do
     if [[ -e "$ROLLBACK_DIR/$name" ]]; then
       cp -a "$ROLLBACK_DIR/$name" "$state_tmp/$name"
     else
@@ -155,6 +179,10 @@ restore_service_state() {
   fi
 }
 
+remove_router_rule_files() {
+  rm -f "$NFTABLES_FILE" "$DNSMASQ_FILE"
+}
+
 rollback_install() {
   log "Installation failed; restoring the previous system state"
   systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -181,9 +209,12 @@ rollback_install() {
   restore_file "/etc/systemd/system/$SERVICE_NAME" "web.service"
   restore_file "/etc/systemd/system/$AGENT_SERVICE_NAME" "agent.service"
   if [[ "$ACTION" == "install" ]]; then
-    restore_file "/etc/sysctl.d/90-router-panel.conf" "sysctl.conf"
+    restore_file "$SYSCTL_FILE" "sysctl.conf"
     restore_file "/etc/NetworkManager/conf.d/90-linux-router.conf" "networkmanager.conf"
     restore_file "/etc/netplan/90-linux-router.yaml" "netplan.yaml"
+    restore_file "$NFTABLES_CONF" "nftables.conf"
+    restore_file "$DNSMASQ_CONF" "dnsmasq.conf"
+    remove_router_rule_files
   fi
 
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -197,8 +228,14 @@ rollback_install() {
     if [[ -n "$ORIGINAL_IP_FORWARD" ]]; then
       sysctl -w "net.ipv4.ip_forward=$ORIGINAL_IP_FORWARD" >/dev/null 2>&1 || true
     fi
+    if [[ -n "$ORIGINAL_IPV6_FORWARD" ]]; then
+      sysctl -w "net.ipv6.conf.all.forwarding=$ORIGINAL_IPV6_FORWARD" >/dev/null 2>&1 || true
+    fi
     restore_service_state "NetworkManager.service" "$NETWORKMANAGER_WAS_ENABLED" "$NETWORKMANAGER_WAS_ACTIVE"
     restore_service_state "dhcpcd.service" "$DHCPCD_WAS_ENABLED" "$DHCPCD_WAS_ACTIVE"
+    restore_service_state "systemd-resolved.service" "$RESOLVED_WAS_ENABLED" "$RESOLVED_WAS_ACTIVE"
+    restore_service_state "dnsmasq.service" "$DNSMASQ_WAS_ENABLED" "$DNSMASQ_WAS_ACTIVE"
+    restore_service_state "nftables.service" "$NFTABLES_WAS_ENABLED" "$NFTABLES_WAS_ACTIVE"
   fi
   restore_service_state "$AGENT_SERVICE_NAME" "$AGENT_WAS_ENABLED" "$AGENT_WAS_ACTIVE"
   restore_service_state "$SERVICE_NAME" "$WEB_WAS_ENABLED" "$WEB_WAS_ACTIVE"
@@ -249,14 +286,83 @@ should_apply_network_now() {
   [[ -z "${SSH_CONNECTION:-}" ]]
 }
 
+# Bootstrap nftables: our rules live in /etc/nftables.d and are pulled in from
+# /etc/nftables.conf. Until the panel writes the real WAN/LAN rules the file only
+# contains a forwarding chain, so nothing is blocked.
+write_nftables_bootstrap() {
+  install -d -m 0755 "$NFTABLES_DIR"
+  if [[ ! -e "$NFTABLES_CONF" ]]; then
+    cat > "$NFTABLES_CONF" <<'EOF'
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+include "/etc/nftables.d/*.nft"
+EOF
+    chmod 0755 "$NFTABLES_CONF"
+  elif ! grep -q 'nftables.d' "$NFTABLES_CONF"; then
+    python3 - "$NFTABLES_CONF" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+lines = path.read_text(encoding="utf-8").splitlines()
+insert_at = len(lines)
+for index, line in enumerate(lines):
+    if line.split("#", 1)[0].strip() == "flush ruleset":
+        insert_at = index + 1
+        break
+lines.insert(insert_at, 'include "/etc/nftables.d/*.nft"')
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+  fi
+
+  cat > "$NFTABLES_FILE" <<'EOF'
+#!/usr/sbin/nft -f
+# Placeholder generated by the Linux Router installer.
+# Open the panel -> 路由 and apply the router configuration to replace this file.
+table inet lr_forward {
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        ct state established,related accept
+    }
+}
+EOF
+  chmod 0644 "$NFTABLES_FILE"
+}
+
+# Bootstrap dnsmasq so it listens on loopback only until the LAN is configured.
+write_dnsmasq_bootstrap() {
+  install -d -m 0755 "$DNSMASQ_DIR"
+  if [[ ! -e "$DNSMASQ_CONF" ]]; then
+    cat > "$DNSMASQ_CONF" <<'EOF'
+# Generated by the Linux Router installer.
+conf-dir=/etc/dnsmasq.d/,*.conf
+EOF
+    chmod 0644 "$DNSMASQ_CONF"
+  elif ! grep -q 'dnsmasq.d' "$DNSMASQ_CONF"; then
+    printf '\n# Linux Router\nconf-dir=/etc/dnsmasq.d/,*.conf\n' >> "$DNSMASQ_CONF"
+  fi
+
+  cat > "$DNSMASQ_FILE" <<'EOF'
+# Placeholder generated by the Linux Router installer.
+# Apply the router configuration in the panel to write the real LAN settings.
+bind-dynamic
+interface=lo
+EOF
+  chmod 0644 "$DNSMASQ_FILE"
+}
+
 uninstall_router_panel() {
-  local interface_path
   local netplan_changed=0
   local networkmanager_changed=0
   local has_install_state=0
   local original_dhcpcd_active=0
   local original_dhcpcd_enabled=0
+  local original_resolved_active=0
+  local original_resolved_enabled=0
   local original_ip_forward=""
+  local original_ipv6_forward=""
   log "Uninstalling Linux Router"
 
   if ! state_file_is_valid "$INSTALL_STATE_DIR" && state_file_is_valid "${INSTALL_STATE_DIR}.previous"; then
@@ -266,20 +372,14 @@ uninstall_router_panel() {
     has_install_state=1
     original_dhcpcd_active="$(state_value dhcpcd_was_active || printf '0')"
     original_dhcpcd_enabled="$(state_value dhcpcd_was_enabled || printf '0')"
+    original_resolved_active="$(state_value resolved_was_active || printf '0')"
+    original_resolved_enabled="$(state_value resolved_was_enabled || printf '0')"
     original_ip_forward="$(state_value ip_forward || true)"
+    original_ipv6_forward="$(state_value ipv6_forward || true)"
     [[ "$original_dhcpcd_active" =~ ^[01]$ ]] || original_dhcpcd_active=0
     [[ "$original_dhcpcd_enabled" =~ ^[01]$ ]] || original_dhcpcd_enabled=0
-  fi
-
-  if command -v nmcli >/dev/null 2>&1; then
-    nmcli connection down id DebianRouterHotspot >/dev/null 2>&1 || true
-    nmcli connection delete id DebianRouterHotspot >/dev/null 2>&1 || true
-  fi
-  if command -v iw >/dev/null 2>&1; then
-    for interface_path in /sys/class/net/ap-*; do
-      [[ -e "$interface_path" ]] || continue
-      iw dev "$(basename "$interface_path")" del >/dev/null 2>&1 || true
-    done
+    [[ "$original_resolved_active" =~ ^[01]$ ]] || original_resolved_active=0
+    [[ "$original_resolved_enabled" =~ ^[01]$ ]] || original_resolved_enabled=0
   fi
 
   systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -289,7 +389,7 @@ uninstall_router_panel() {
   systemctl daemon-reload
   systemctl reset-failed "$SERVICE_NAME" "$AGENT_SERVICE_NAME" >/dev/null 2>&1 || true
 
-  rm -f /etc/sysctl.d/90-router-panel.conf
+  rm -f "$SYSCTL_FILE"
   if [[ "$has_install_state" -eq 1 ]]; then
     if restore_persisted_file "/etc/NetworkManager/conf.d/90-linux-router.conf" "networkmanager.conf"; then
       networkmanager_changed=1
@@ -298,8 +398,14 @@ uninstall_router_panel() {
       netplan_changed=1
       networkmanager_changed=1
     fi
-    if ! restore_persisted_file "/etc/sysctl.d/90-router-panel.conf" "sysctl.conf"; then
+    if ! restore_persisted_file "$SYSCTL_FILE" "sysctl.conf"; then
       log "WARNING: original sysctl configuration backup is missing"
+    fi
+    if ! restore_persisted_file "$NFTABLES_CONF" "nftables.conf"; then
+      log "WARNING: original nftables.conf backup is missing"
+    fi
+    if ! restore_persisted_file "$DNSMASQ_CONF" "dnsmasq.conf"; then
+      log "WARNING: original dnsmasq.conf backup is missing"
     fi
   else
     if [[ -e /etc/NetworkManager/conf.d/90-linux-router.conf ]]; then
@@ -311,6 +417,13 @@ uninstall_router_panel() {
       netplan_changed=1
       networkmanager_changed=1
     fi
+  fi
+
+  remove_router_rule_files
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table inet lr_forward >/dev/null 2>&1 || true
+    nft delete table ip lr_nat >/dev/null 2>&1 || true
+    nft delete table ip6 lr_nat6 >/dev/null 2>&1 || true
   fi
 
   if [[ "$networkmanager_changed" -eq 1 ]] && should_apply_network_now; then
@@ -329,10 +442,17 @@ uninstall_router_panel() {
       sysctl -w "net.ipv4.ip_forward=$original_ip_forward" >/dev/null 2>&1 || \
         log "WARNING: could not restore net.ipv4.ip_forward"
     fi
+    if [[ -n "$original_ipv6_forward" ]]; then
+      sysctl -w "net.ipv6.conf.all.forwarding=$original_ipv6_forward" >/dev/null 2>&1 || \
+        log "WARNING: could not restore net.ipv6.conf.all.forwarding"
+    fi
     restore_service_state dhcpcd.service "$original_dhcpcd_enabled" "$original_dhcpcd_active"
+    restore_service_state systemd-resolved.service "$original_resolved_enabled" "$original_resolved_active"
+    systemctl disable --now dnsmasq.service >/dev/null 2>&1 || true
+    systemctl restart nftables.service >/dev/null 2>&1 || true
     rm -rf "$DATA_DIR/.linux-router-installer" "$DATA_DIR/.linux-router-installer.previous"
   elif [[ "$has_install_state" -eq 1 ]]; then
-    log "dhcpcd and IPv4 forwarding restoration was deferred; rerun uninstall with --apply-network-now"
+    log "dhcpcd, resolved and forwarding restoration was deferred; rerun uninstall with --apply-network-now"
   fi
 
   rm -rf "$INSTALL_DIR"
@@ -356,7 +476,7 @@ uninstall_router_panel() {
   fi
 
   log "Linux Router has been uninstalled"
-  log "Installed apt packages and the current runtime IPv4 forwarding value were left unchanged"
+  log "Installed apt packages and the current runtime forwarding values were left unchanged"
 }
 
 cleanup() {
@@ -380,7 +500,7 @@ trap cleanup EXIT
 
 usage() {
   cat <<'EOF'
-Install, upgrade, or uninstall Linux Router on Debian/Armbian.
+Install, upgrade, or uninstall Linux Router (Debian 13, wired, nftables, IPv4+IPv6).
 
 Usage: sudo bash install.sh <command> [options]
 
@@ -394,6 +514,7 @@ Options:
   --repo URL                 GitHub repository URL
   --branch NAME              GitHub branch (default: main)
   --archive-url URL          Download a specific source archive instead
+  --source-dir PATH          Install from a local source directory (no download)
   --install-dir PATH         Application directory (default: /opt/linux-router)
   --data-dir PATH            Persistent data directory (default: /var/lib/linux-router)
   --no-network-config        Do not write NetworkManager or netplan configuration
@@ -430,6 +551,11 @@ while [[ $# -gt 0 ]]; do
     --archive-url)
       [[ $# -ge 2 ]] || die "--archive-url requires a value"
       ARCHIVE_URL="$2"
+      shift 2
+      ;;
+    --source-dir)
+      [[ $# -ge 2 ]] || die "--source-dir requires a value"
+      SOURCE_DIR="${2%/}"
       shift 2
       ;;
     --install-dir)
@@ -506,7 +632,7 @@ fi
 
 [[ ${EUID} -eq 0 ]] || die "run this installer as root"
 [[ -d /run/systemd/system ]] || die "systemd is required"
-command -v apt-get >/dev/null 2>&1 || die "only apt-based Debian/Armbian systems are supported"
+command -v apt-get >/dev/null 2>&1 || die "only apt-based Debian systems are supported"
 
 if [[ "$ACTION" == "uninstall" && "$PURGE_DATA" -eq 1 ]] && ! should_apply_network_now; then
   die "--purge-data requires --apply-network-now when network changes are deferred"
@@ -518,52 +644,67 @@ if [[ "$ACTION" == "uninstall" ]]; then
   exit 0
 fi
 
-if [[ -z "$ARCHIVE_URL" ]]; then
-  ARCHIVE_URL="${REPO_URL%.git}/archive/refs/heads/$BRANCH.tar.gz"
+if [[ -n "$SOURCE_DIR" ]]; then
+  [[ -d "$SOURCE_DIR" ]] || die "source directory not found: $SOURCE_DIR"
+  [[ -f "$SOURCE_DIR/app.py" ]] || die "source directory does not contain app.py: $SOURCE_DIR"
+  BUILD_ID="local"
+  log "Using local source directory $SOURCE_DIR"
+else
+  if [[ -z "$ARCHIVE_URL" ]]; then
+    ARCHIVE_URL="${REPO_URL%.git}/archive/refs/heads/$BRANCH.tar.gz"
+  fi
+  [[ "$ARCHIVE_URL" =~ ^https:// ]] || die "archive URL must use HTTPS"
 fi
-[[ "$ARCHIVE_URL" =~ ^https:// ]] || die "archive URL must use HTTPS"
 
 if [[ "$ACTION" == "install" ]]; then
   export DEBIAN_FRONTEND=noninteractive
   log "Installing system packages"
   apt-get update
+  # Deliberately no iptables, iw, wpasupplicant or hostapd: this build is wired-only
+  # and uses the nftables stack that ships with Debian 13.
   apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
-    dnsmasq-base \
+    dnsmasq \
     gunicorn \
     iproute2 \
-    iptables \
-    iw \
+    nftables \
     network-manager \
     python3 \
     python3-flask \
     tar \
-    udev \
-    wpasupplicant
+    udev
 else
-  for command_name in curl tar python3 gunicorn systemd-analyze; do
+  for command_name in curl tar python3 gunicorn systemd-analyze nft dnsmasq; do
     command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name"
   done
 fi
 
-log "Resolving $BRANCH branch build"
-REPO_PATH="${REPO_URL#https://github.com/}"
-REPO_PATH="${REPO_PATH%.git}"
-REF_JSON="$(curl --fail --location --silent --show-error --retry 3 \
-  "https://api.github.com/repos/$REPO_PATH/git/ref/heads/$BRANCH")" || \
-  die "could not resolve branch: $BRANCH"
-REMOTE_COMMIT="$(REF_JSON="$REF_JSON" python3 -c 'import json, os; print(json.loads(os.environ["REF_JSON"])["object"]["sha"])')" || \
-  die "could not parse branch metadata: $BRANCH"
-[[ -n "$REMOTE_COMMIT" ]] || die "could not resolve branch: $BRANCH"
-BUILD_ID="${REMOTE_COMMIT:0:7}"
+if [[ -n "$SOURCE_DIR" ]]; then
+  log "Copying application files from $SOURCE_DIR"
+  WORK_DIR="$(mktemp -d /tmp/linux-router-install.XXXXXX)"
+  install -d -m 0755 "$WORK_DIR/source"
+  cp -a "$SOURCE_DIR/." "$WORK_DIR/source/"
+  rm -rf "$WORK_DIR/source/.git"
+else
+  log "Resolving $BRANCH branch build"
+  REPO_PATH="${REPO_URL#https://github.com/}"
+  REPO_PATH="${REPO_PATH%.git}"
+  REF_JSON="$(curl --fail --location --silent --show-error --retry 3 \
+    "https://api.github.com/repos/$REPO_PATH/git/ref/heads/$BRANCH")" || \
+    die "could not resolve branch: $BRANCH"
+  REMOTE_COMMIT="$(REF_JSON="$REF_JSON" python3 -c 'import json, os; print(json.loads(os.environ["REF_JSON"])["object"]["sha"])')" || \
+    die "could not parse branch metadata: $BRANCH"
+  [[ -n "$REMOTE_COMMIT" ]] || die "could not resolve branch: $BRANCH"
+  BUILD_ID="${REMOTE_COMMIT:0:7}"
 
-log "Downloading application archive"
-WORK_DIR="$(mktemp -d /tmp/linux-router-install.XXXXXX)"
-install -d -m 0755 "$WORK_DIR/source"
-curl --fail --location --silent --show-error --retry 3 \
-  --output "$WORK_DIR/source.tar.gz" "$ARCHIVE_URL"
-tar -xzf "$WORK_DIR/source.tar.gz" -C "$WORK_DIR/source" --strip-components=1
+  log "Downloading application archive"
+  WORK_DIR="$(mktemp -d /tmp/linux-router-install.XXXXXX)"
+  install -d -m 0755 "$WORK_DIR/source"
+  curl --fail --location --silent --show-error --retry 3 \
+    --output "$WORK_DIR/source.tar.gz" "$ARCHIVE_URL"
+  tar -xzf "$WORK_DIR/source.tar.gz" -C "$WORK_DIR/source" --strip-components=1
+fi
 
 [[ -f "$WORK_DIR/source/app.py" ]] || die "downloaded archive does not contain app.py"
 [[ -f "$WORK_DIR/source/router-panel.service" ]] || die "downloaded archive does not contain router-panel.service"
@@ -594,10 +735,19 @@ if [[ "$ACTION" == "install" ]]; then
   service_is_enabled NetworkManager.service && NETWORKMANAGER_WAS_ENABLED=1
   service_is_active dhcpcd.service && DHCPCD_WAS_ACTIVE=1
   service_is_enabled dhcpcd.service && DHCPCD_WAS_ENABLED=1
+  service_is_active systemd-resolved.service && RESOLVED_WAS_ACTIVE=1
+  service_is_enabled systemd-resolved.service && RESOLVED_WAS_ENABLED=1
+  service_is_active dnsmasq.service && DNSMASQ_WAS_ACTIVE=1
+  service_is_enabled dnsmasq.service && DNSMASQ_WAS_ENABLED=1
+  service_is_active nftables.service && NFTABLES_WAS_ACTIVE=1
+  service_is_enabled nftables.service && NFTABLES_WAS_ENABLED=1
   ORIGINAL_IP_FORWARD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || true)"
-  backup_file "/etc/sysctl.d/90-router-panel.conf" "sysctl.conf"
+  ORIGINAL_IPV6_FORWARD="$(sysctl -n net.ipv6.conf.all.forwarding 2>/dev/null || true)"
+  backup_file "$SYSCTL_FILE" "sysctl.conf"
   backup_file "/etc/NetworkManager/conf.d/90-linux-router.conf" "networkmanager.conf"
   backup_file "/etc/netplan/90-linux-router.yaml" "netplan.yaml"
+  backup_file "$NFTABLES_CONF" "nftables.conf"
+  backup_file "$DNSMASQ_CONF" "dnsmasq.conf"
 fi
 INSTALL_STARTED=1
 
@@ -615,6 +765,7 @@ rm -f \
   "$STAGING_DIR/data/auth.json" \
   "$STAGING_DIR/data/initial_password.txt" \
   "$STAGING_DIR/data/secret_key" \
+  "$STAGING_DIR/data/router.json" \
   "$STAGING_DIR/data/network.json"
 
 if [[ -e "$INSTALL_DIR" ]]; then
@@ -657,9 +808,29 @@ chmod 0700 "$DATA_DIR"
 find "$DATA_DIR" -type f -exec chmod 0600 {} +
 persist_install_state
 
-log "Enabling IPv4 forwarding"
-printf 'net.ipv4.ip_forward=1\n' > /etc/sysctl.d/90-router-panel.conf
+log "Enabling IPv4 and IPv6 forwarding"
+cat > "$SYSCTL_FILE" <<'EOF'
+# Generated by Linux Router
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+chmod 0644 "$SYSCTL_FILE"
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+
+log "Writing nftables and dnsmasq bootstrap configuration"
+write_nftables_bootstrap
+write_dnsmasq_bootstrap
+systemctl enable nftables.service >/dev/null
+systemctl restart nftables.service
+
+# dnsmasq and systemd-resolved both want port 53.
+if service_is_enabled systemd-resolved.service || service_is_active systemd-resolved.service; then
+  log "Disabling systemd-resolved so dnsmasq can own port 53"
+  systemctl disable --now systemd-resolved.service >/dev/null 2>&1 || true
+fi
+systemctl enable dnsmasq.service >/dev/null
+systemctl restart dnsmasq.service || log "WARNING: dnsmasq failed to start; check journalctl -u dnsmasq"
 
 systemctl enable NetworkManager.service >/dev/null
 systemctl start NetworkManager.service
@@ -718,6 +889,9 @@ if [[ -n "$NEW_PASSWORD" ]]; then
   printf '\nInitial login:\n  Username: admin\n  Password: %s\n' "$NEW_PASSWORD"
   printf 'Credentials are also stored in %s/initial_password.txt\n' "$DATA_DIR"
 fi
+printf '\nNext step: open the panel -> 路由, pick the WAN and LAN NICs, then apply.\n'
+printf 'That writes the NetworkManager LAN profile, /etc/dnsmasq.d/linux-router.conf\n'
+printf 'and /etc/nftables.d/90-linux-router.nft (NAT + forwarding, IPv4 and IPv6).\n'
 if [[ "$CONFIGURE_NETWORK" -eq 1 && "$NETWORK_APPLY_MODE" != "now" && -n "${SSH_CONNECTION:-}" ]]; then
   printf '\nNetwork changes were deferred because the installer detected an SSH session.\n'
   printf 'During a maintenance window, disable dhcpcd, run "netplan apply" (when available), and restart NetworkManager.\n'

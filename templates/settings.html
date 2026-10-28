@@ -9,23 +9,9 @@
 
 <section class="settings-card-list">
   <article class="card">
-    <h3 class="card-title">{{ icon("network") }}<span>LAN 网段</span></h3>
-    <form action="{{ url_for('update_lan_network') }}" method="post" class="login-form">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <label>
-        IPv4 网段
-        <input
-          type="text"
-          class="mono-value"
-          name="lan_network"
-          value="{{ network.lan_network }}"
-          placeholder="192.168.50.0/24"
-          required
-        >
-        <p class="muted form-hint">网关 {{ network.lan_gateway }}，下次开启热点时生效</p>
-      </label>
-      <button type="submit">保存 LAN 设置</button>
-    </form>
+    <h3 class="card-title">{{ icon("network") }}<span>路由与 LAN 设置</span></h3>
+    <p class="muted">WAN/LAN 接口、LAN 网段、DHCP 地址池和 IPv6 双栈参数已统一放到“路由”页面管理。</p>
+    <p><a class="table-link" href="{{ url_for('router_page') }}">前往路由配置 →</a></p>
   </article>
 
   <article class="card">

@@ -13,35 +13,32 @@ DATA_DIR=/home/router-panel/data
 
 ## 1. 系统要求
 
-目标系统为 Debian 13 或基于 Debian 的 Armbian，并使用 systemd、apt 和 NetworkManager。
+目标系统为 Debian 13（x86_64）最小化安装，并使用 systemd、apt 和 NetworkManager。本分支只支持有线组网，不安装 `iw`、`wpasupplicant`、`hostapd` 或 `iptables`。
 
 安装依赖：
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y \
+sudo apt-get install -y --no-install-recommends \
   python3 \
   python3-flask \
   gunicorn \
   network-manager \
-  dnsmasq-base \
-  iptables \
-  iw \
+  dnsmasq \
+  nftables \
   iproute2 \
   udev \
-  wpasupplicant \
-  curl
+  curl \
+  ca-certificates
 ```
 
 组件用途：
 
 - `python3-flask`、`gunicorn`：运行 Web 服务；
-- `network-manager`：管理有线、Wi-Fi 和热点连接；
-- `dnsmasq-base`：提供 NetworkManager shared 热点所需的 DHCP/DNS 能力；
-- `iptables`：NetworkManager shared 模式使用的系统转发后端；
-- `iw`：读取无线接口、PHY 和 AP+STA 能力；
-- `iproute2`、`udev`：系统网络和硬件信息查询；
-- `wpasupplicant`：为 NetworkManager 提供 Wi-Fi 扫描、认证和连接后端。
+- `network-manager`：管理有线接口、WAN 的 DHCP 客户端与 LAN 的静态地址；
+- `dnsmasq`：为 LAN 提供 DHCPv4、RA、DHCPv6 与 DNS；
+- `nftables`：提供 NAT 与 forward 规则（内核侧 `nf_tables`/`nf_nat` 由 Debian 内核自带）；
+- `iproute2`、`udev`：系统网络和硬件信息查询。
 
 项目不要求目标设备安装 Git。安装器和手动部署都可以使用源码目录或 GitHub 源码压缩包。
 
@@ -155,23 +152,53 @@ sudo systemctl disable --now dhcpcd.service
 
 不要让 `dhcpcd`、`systemd-networkd` 和 NetworkManager 同时管理同一接口。
 
-## 5. 配置 IPv4 转发
+## 5. 配置 IPv4/IPv6 转发
 
-热点共享需要 IPv4 转发：
+双栈路由需要同时开启两个转发开关：
 
 ```bash
-printf 'net.ipv4.ip_forward=1\n' | sudo tee /etc/sysctl.d/90-router-panel.conf
+sudo tee /etc/sysctl.d/90-router-panel.conf >/dev/null <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
 sudo sysctl --system
-sudo sysctl -n net.ipv4.ip_forward
+sysctl -n net.ipv4.ip_forward net.ipv6.conf.all.forwarding
 ```
 
 期望输出：
 
 ```text
 1
+1
 ```
 
-## 6. 安装并启动 systemd 服务
+## 6. 配置 nftables 与 dnsmasq
+
+面板生成两个文件，安装器负责把目录引入主配置：
+
+```bash
+# nftables：/etc/nftables.conf 需包含
+include "/etc/nftables.d/*.nft"
+
+# dnsmasq：/etc/dnsmasq.conf 需包含
+conf-dir=/etc/dnsmasq.d/,*.conf
+```
+
+随后启用服务：
+
+```bash
+sudo systemctl enable --now nftables.service dnsmasq.service
+```
+
+如果系统启用了 `systemd-resolved`，它和 dnsmasq 会争用 53 端口，需要先停用：
+
+```bash
+sudo systemctl disable --now systemd-resolved.service
+```
+
+`/etc/nftables.d/90-linux-router.nft` 与 `/etc/dnsmasq.d/linux-router.conf` 的最终内容由面板的“路由”页面生成，手动部署时可以先用安装器写入的占位文件。
+
+## 7. 安装并启动 systemd 服务
 
 服务模板包含 `@INSTALL_DIR@` 和 `@DATA_DIR@` 占位符。生成实际 unit：
 
@@ -216,7 +243,7 @@ curl -sS http://127.0.0.1/healthz
 
 Web 服务默认监听 TCP `80` 端口。服务需要绑定低端口能力，unit 中已配置 `CAP_NET_BIND_SERVICE`。
 
-## 7. 首次登录和运行数据
+## 8. 首次登录和运行数据
 
 安装或初始化完成后：
 
@@ -229,49 +256,43 @@ Web 服务默认监听 TCP `80` 端口。服务需要绑定低端口能力，uni
 ```text
 $DATA_DIR/auth.json
 $DATA_DIR/secret_key
-$DATA_DIR/network.json
-$DATA_DIR/hotspot_keepalive.json
+$DATA_DIR/router.json
 ```
 
-## 8. 热点和共享网络检查
+## 9. 路由、NAT 与双栈检查
 
-热点使用 NetworkManager 的 `ipv4.method shared`，项目不直接维护一套独立的 NAT 规则。启动热点前确认：
+WAN/LAN 角色、LAN 网段、DHCP 与 IPv6 参数保存在 `$DATA_DIR/router.json`，由面板“路由”页面写入。应用配置时面板会：
 
-热点首先使用 NetworkManager 默认安全参数激活；如果配置已写入但激活失败，会自动改用 WPA2-RSN、CCMP 并关闭 PMF 重试一次。第二次失败时会同时保留两次错误信息。
+1. 写 `/etc/dnsmasq.d/linux-router.conf` 并 `dnsmasq --test` 校验；
+2. 创建或修改 NetworkManager 连接 `linux-router-lan`（静态地址 + `never-default`）；
+3. 写 `/etc/nftables.d/90-linux-router.nft`，用 `nft -c -f` 校验后 `nft -f` 加载；
+4. 写 `/etc/sysctl.d/90-router-panel.conf` 并应用 IPv4/IPv6 转发；
+5. 启用并重启 `dnsmasq.service`，必要时把 WAN 连接的 `ipv6.method` 改为 `auto`。
+
+检查命令：
 
 ```bash
-systemctl is-active NetworkManager.service
-command -v nmcli
-command -v iw
-command -v iptables
-dpkg-query -W dnsmasq-base
-sysctl -n net.ipv4.ip_forward
+nmcli connection show linux-router-lan
+ip -br addr show <LAN接口>
+ip -6 route show default
+
+nft list chain inet lr_forward forward
+nft list chain ip lr_nat postrouting
+nft list chain ip6 lr_nat6 postrouting
+
+sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding
+cat /var/lib/misc/dnsmasq.leases
 ```
 
-查看活动连接和热点配置：
+IPv6 模式说明：
 
-```bash
-nmcli -f NAME,TYPE,DEVICE connection show --active
-nmcli connection show DebianRouterHotspot
-nmcli -g ipv4.method connection show id DebianRouterHotspot
-```
+- `ULA + NAT66`：LAN 用 `fdxx::/64`，nftables 生成 `lr_nat6` 做 masquerade，不依赖运营商；
+- `全局前缀`：把运营商分配或自行委派得到的 /64 填进去，不做 NAT66，只做转发；
+- `关闭`：dnsmasq 不发 RA，`lr_nat6` 表会被删除。
 
-热点共享正常时，最后一条命令应返回：
+NetworkManager 不实现前缀委派（PD）。需要 PD 时在系统里另行运行 `dhcpcd` 或 `odhcp6c` 取前缀，再把 /64 填到“全局前缀”模式。
 
-```text
-shared
-```
-
-查看无线接口和驱动能力：
-
-```bash
-iw dev
-iw phy
-```
-
-并发 AP+STA 是否可用取决于无线驱动。许多设备只支持 AP 与 STA 使用同一频段或同一信道；连接不同信道的上游 Wi-Fi 时，热点可能无法启动或连接可能失败。
-
-## 9. 常见故障排查
+## 10. 常见故障排查
 
 ### Web 页面无法打开
 
@@ -302,32 +323,48 @@ sudo udevadm info -q property -p /sys/class/net/<接口名> | grep NM_UNMANAGED
 
 确认 NetworkManager 使用 `managed=true`，netplan renderer 为 `NetworkManager`，并且没有其他服务接管同一接口。修改后在维护窗口执行 `netplan generate`、`netplan apply` 和 NetworkManager 重启。
 
-### 无线网卡显示为 unavailable
+### LAN 设备拿不到地址
 
 ```bash
-dpkg-query -W -f='${db:Status-Abbrev} ${Version}\n' wpasupplicant
-nmcli radio wifi
-rfkill list
-ip link show <接口名>
-sudo dmesg | grep -iE 'firmware|wifi|wlan|iwl'
+systemctl status dnsmasq.service --no-pager
+journalctl -u dnsmasq -n 50 --no-pager
+ss -lunp | grep ':53'
+cat /etc/dnsmasq.d/linux-router.conf
 ```
 
-确认 `wpasupplicant` 已完整安装、Wi-Fi 射频已开启、rfkill 未屏蔽设备，并检查内核日志中是否存在驱动或固件加载失败。Intel 无线网卡缺少固件时可安装 `firmware-iwlwifi`；其他芯片应安装与硬件对应的固件包。
+确认 `interface=` 是 LAN 网口、`dhcp-range` 在 LAN 网段内、53 端口没有被 `systemd-resolved` 占用。修改配置后在面板“路由”页面重新应用。
 
-### 热点能连接但无法上网
+### 有地址但上不了网
 
 依次确认：
 
-1. 上游 Wi-Fi 或有线接口已连接并拥有默认路由；
-2. `DebianRouterHotspot` 的 IPv4 方法为 `shared`；
-3. `dnsmasq-base`、`iptables` 已安装；
-4. `net.ipv4.ip_forward` 为 `1`。
+1. WAN 接口有默认路由（`ip route`、`ip -6 route`）；
+2. `net.ipv4.ip_forward` 为 `1`；
+3. `nft list chain ip lr_nat postrouting` 里有 masquerade 规则；
+4. LAN 网卡地址与 DHCP 网关一致。
 
 ```bash
-ip route
-nmcli -g ipv4.method connection show id DebianRouterHotspot
-systemctl status NetworkManager.service --no-pager
+ip route; ip -6 route
+sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding
+nft list ruleset | sed -n '/lr_nat/,/}/p'
+nmcli -g ipv4.addresses,ipv4.never-default connection show linux-router-lan
 ```
+
+如果面板“依赖”页提示 NAT 规则未加载，点“重新加载规则”即可（等价于 `nft -f /etc/nftables.d/90-linux-router.nft`）。
+
+### IPv6 不通
+
+```bash
+ip -6 addr show <LAN接口>
+ip -6 route show default
+sysctl net.ipv6.conf.all.forwarding
+nft list chain ip6 lr_nat6 postrouting   # 仅 ULA 模式存在
+rdisc6 <LAN接口>                          # 可选，查看 RA
+```
+
+- ULA 模式：LAN 必须有 `fdxx::1/64`，且 `lr_nat6` 表存在；
+- 全局前缀模式：WAN 必须拿到公网 IPv6 且默认路由存在，LAN 前缀必须与运营商分配一致；
+- 客户端只拿到 `fe80::` 说明 RA 没有发出，检查 `enable-ra` 与 LAN 接口地址。
 
 ### 修改配置后未生效
 
@@ -338,7 +375,7 @@ sudo systemctl restart router-panel-agent.service
 
 修改 `static/style.css` 后，还需递增 `templates/base.html` 中 CSS URL 的 `v` 参数。
 
-## 10. 卸载和恢复
+## 11. 卸载和恢复
 
 如果程序由安装器部署，推荐使用安装器卸载：
 
@@ -348,7 +385,7 @@ sudo bash install.sh uninstall \
   --data-dir /home/router-panel/data
 ```
 
-默认卸载保留账号、密钥和 LAN 配置，并恢复安装器记录的 NetworkManager、netplan、sysctl、IPv4 转发和 `dhcpcd` 状态。使用 `--purge-data` 会删除全部运行数据，且不可恢复。
+默认卸载保留账号、密钥和路由配置，删除 `/etc/nftables.d/90-linux-router.nft` 与 `/etc/dnsmasq.d/linux-router.conf`，并恢复安装器记录的 `nftables.conf`、`dnsmasq.conf`、NetworkManager、netplan、sysctl、IPv4/IPv6 转发以及 `dhcpcd`、`systemd-resolved` 状态。使用 `--purge-data` 会删除全部运行数据，且不可恢复。
 
 通过 SSH 卸载时，网络运行状态可能被延迟恢复。确认维护窗口后，使用：
 
@@ -361,7 +398,7 @@ sudo bash install.sh uninstall \
 
 如果安装或升级在健康检查前失败，安装器会尝试恢复应用目录、数据目录、项目网络配置和服务状态。恢复后仍应检查 `systemctl`、`nmcli` 和默认路由。
 
-## 11. 开发验证
+## 12. 开发验证
 
 开发环境可分别启动 Agent 和 Web：
 
