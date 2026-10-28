@@ -28,6 +28,8 @@ SYSCTL_FILE="/etc/sysctl.d/90-router-panel.conf"
 CONFIGURE_NETWORK=1
 NETWORK_APPLY_MODE="auto"
 WITH_PD=0
+REMOTE_SOURCE_REQUESTED=0
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 ACTION=""
 PURGE_DATA=0
 NEW_PASSWORD=""
@@ -545,6 +547,7 @@ while [[ $# -gt 0 ]]; do
     --repo)
       [[ $# -ge 2 ]] || die "--repo requires a value"
       REPO_URL="$2"
+      REMOTE_SOURCE_REQUESTED=1
       shift 2
       ;;
     --purge-data)
@@ -554,11 +557,13 @@ while [[ $# -gt 0 ]]; do
     --branch)
       [[ $# -ge 2 ]] || die "--branch requires a value"
       BRANCH="$2"
+      REMOTE_SOURCE_REQUESTED=1
       shift 2
       ;;
     --archive-url)
       [[ $# -ge 2 ]] || die "--archive-url requires a value"
       ARCHIVE_URL="$2"
+      REMOTE_SOURCE_REQUESTED=1
       shift 2
       ;;
     --source-dir)
@@ -654,6 +659,13 @@ if [[ "$ACTION" == "uninstall" ]]; then
   uninstall_router_panel
   INSTALL_COMMITTED=1
   exit 0
+fi
+
+if [[ -z "$SOURCE_DIR" && "$REMOTE_SOURCE_REQUESTED" -eq 0 ]] \
+  && [[ -f "$SCRIPT_DIR/app.py" && -d "$SCRIPT_DIR/router_panel" && -d "$SCRIPT_DIR/templates" ]]; then
+  SOURCE_DIR="$SCRIPT_DIR"
+  log "Detected a local source tree, installing from $SOURCE_DIR"
+  log "(pass --repo/--branch/--archive-url to install from GitHub instead)"
 fi
 
 if [[ -n "$SOURCE_DIR" ]]; then

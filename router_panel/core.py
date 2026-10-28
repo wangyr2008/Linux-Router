@@ -477,7 +477,7 @@ def get_network_interface_hardware() -> list[dict[str, Any]]:
         interfaces.append(
             {
                 "name": ifname,
-                "role_label": "无线网卡" if is_wireless else "有线网卡",
+                "role_label": "无线网卡（本版本未使用）" if is_wireless else "有线网卡",
                 "wireless": is_wireless,
                 "bus_label": translate_bus_label(bus),
                 "vendor": vendor,
