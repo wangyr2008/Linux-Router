@@ -128,7 +128,9 @@ sudo systemctl enable --now systemd-resolved.service
 | 文件 | 内容 |
 | --- | --- |
 | `10-linux-router-wan.network` | WAN 的 DHCP/SLAAC（PPPoE 模式不生成） |
-| `20-linux-router-lan.network` | LAN 静态 IPv4、IPv6 地址、RA/RDNSS、`DHCPPrefixDelegation` |
+| `20-linux-router-lan.network` | LAN 静态 IPv4、IPv6 地址、RA/RDNSS、`DHCPPrefixDelegation`（桥接时 `Name=br-lan`） |
+| `05-linux-router-br.netdev` | LAN 网桥 `br-lan`（仅在选中 2 个及以上网口时生成） |
+| `40-linux-router-lan-<网口>.network` | 桥接成员口，只写 `Bridge=br-lan` |
 | `30-linux-router-ppp.network` | 只匹配 `ppp0`，`DHCP=ipv6` + `WithoutRA=solicit` |
 | `/etc/ppp/peers/linux-router` | PPPoE 会话参数（`plugin rp-pppoe.so`、账号、MTU 1492） |
 | `/etc/ppp/chap-secrets`、`pap-secrets` | 宽带账号口令，权限 0600 |

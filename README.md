@@ -138,6 +138,30 @@ reopen it on the new address.
 
 NetworkManager, dhcpcd and ifupdown are not used.
 
+### Multiple LAN ports (bridge)
+
+Industrial PCs usually have four to six NICs. The LAN selector is a checkbox group:
+
+| Selected | Behaviour |
+| --- | --- |
+| 1 port | that NIC is the LAN interface (`lan_interface=<nic>`) |
+| 2 or more | a `br-lan` bridge is created, every selected NIC becomes a member, and the LAN address, DHCP, RAs and firewall rules all live on `br-lan` |
+
+Effectively the selected ports act as one switch. Generated files:
+
+| File | Purpose |
+| --- | --- |
+| `05-linux-router-br.netdev` | the `br-lan` bridge (`Kind=bridge`, `STP=no`) |
+| `20-linux-router-lan.network` | addresses, IPv6 RA, prefix delegation on the bridge |
+| `40-linux-router-lan-<nic>.network` | one line per member: `Bridge=br-lan` |
+
+Notes:
+
+- Switching to a bridge renames the LAN interface to `br-lan`, so **the page drops once when you apply**; reopen `192.168.50.1`
+- All members share one broadcast domain — **no VLAN isolation**. Need separation? Use another subnet instead of a bridge
+- Removing a port deletes its member file; going back to a single port also removes the bridge
+- The NIC currently used as WAN is disabled in the checkbox list
+
 ## IPv6 modes
 
 | Mode | Use case | LAN prefix | NAT66 |

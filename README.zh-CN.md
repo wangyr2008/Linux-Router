@@ -131,6 +131,30 @@ sudo bash install.sh install --repo https://github.com/<你>/Linux-Router.git --
 
 NetworkManager、dhcpcd、ifupdown 都不再使用。
 
+### 多网口 LAN（桥接）
+
+工控机一般有 4~6 个网口，路由页的「LAN 网口」是多选：
+
+| 选中数量 | 行为 |
+| --- | --- |
+| 1 个 | 该网口直接作为 LAN 接口（`lan_interface=<网口>`） |
+| 2 个及以上 | 自动创建网桥 `br-lan`，选中的网口都成为成员口，LAN 的 IP / DHCP / RA / 防火墙规则全部挂在 `br-lan` 上 |
+
+相当于把这几个口当成一台交换机用。生成的配置文件：
+
+| 文件 | 作用 |
+| --- | --- |
+| `05-linux-router-br.netdev` | `br-lan` 网桥定义（`Kind=bridge`、`STP=no`） |
+| `20-linux-router-lan.network` | `br-lan` 的地址、IPv6 RA、前缀委派 |
+| `40-linux-router-lan-<网口>.network` | 每个成员口只写一行 `Bridge=br-lan` |
+
+注意：
+
+- 改成桥接后 LAN 的接口名从 `<网口>` 变成 `br-lan`，**点应用的一瞬间会断一次**，用 `192.168.50.1` 重新打开即可
+- 所有成员口在同一个广播域，**没有 VLAN 隔离**；需要隔离就别桥接，另开一个网段
+- 取消某个网口时，对应的 `40-linux-router-lan-*.network` 会自动删除；全部取消回到单口时，网桥文件也会被清理
+- WAN 用的网口在界面上会自动禁选，不会让你把它同时选成 LAN
+
 ## IPv6 四种模式
 
 | 模式 | 适用场景 | LAN 前缀 | NAT66 |
