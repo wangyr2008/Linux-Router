@@ -67,6 +67,8 @@ IPV6_MODE_LABELS = {
 DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "wan_interface": "",
     "lan_interface": "",
+    # One entry = the NIC itself; two or more = bridged into br-lan.
+    "lan_ports": [],
     "wan_mode": networkd.WAN_MODE_DHCP,
     "pppoe_username": "",
     "pppoe_password": "",
@@ -207,6 +209,25 @@ def _normalize_ipv6_prefix(raw: str, mode: str) -> tuple[str, str | None]:
     return str(network), None
 
 
+def _normalize_lan_ports(raw: Any, fallback: str = "") -> list[str]:
+    """Accept a list (checkbox form) or a comma separated string."""
+    if isinstance(raw, str):
+        items = re.split(r"[\s,]+", raw)
+    elif isinstance(raw, (list, tuple)):
+        items = [str(item) for item in raw]
+    else:
+        items = []
+
+    ports: list[str] = []
+    for item in items:
+        name = item.strip()
+        if name and name not in ports:
+            ports.append(name)
+    if not ports and fallback and fallback != networkd.BRIDGE_NAME:
+        ports = [fallback]
+    return ports
+
+
 def normalize_router_config(
     payload: dict[str, Any],
     existing: dict[str, Any] | None = None,
@@ -235,6 +256,8 @@ def normalize_router_config(
     pppoe_username = get("pppoe_username")
     pppoe_password = get("pppoe_password")
 
+    lan_ports = _normalize_lan_ports(payload.get("lan_ports", base.get("lan_ports", [])), lan)
+
     if wan_mode == networkd.WAN_MODE_PPPOE:
         if not pppoe_username:
             return config, "PPPoE 账号不能为空"
@@ -242,8 +265,8 @@ def normalize_router_config(
             return config, "请选择 PPPoE 拨号所用的物理网口"
         if available_interfaces and pppoe_nic not in available_interfaces:
             return config, f"PPPoE 物理网口 {pppoe_nic} 不存在或不是有线网卡"
-        if pppoe_nic == lan:
-            return config, "PPPoE 物理网口不能和 LAN 是同一块网卡"
+        if pppoe_nic in lan_ports:
+            return config, f"网口 {pppoe_nic} 不能同时用于 PPPoE 拨号和 LAN"
         wan = networkd.PPPOE_INTERFACE
     else:
         pppoe_nic = ""
@@ -252,12 +275,17 @@ def normalize_router_config(
         if available_wan_interfaces and wan and wan not in available_wan_interfaces:
             return config, f"WAN 接口 {wan} 不存在"
 
-    if lan and not IFNAME_RE.fullmatch(lan):
-        return config, f"LAN 接口名称无效：{lan}"
-    if wan and wan == lan:
-        return config, "WAN 和 LAN 不能是同一块网卡"
-    if available_interfaces and lan and lan not in available_interfaces:
-        return config, f"LAN 接口 {lan} 不存在或不是有线网卡"
+    if not lan_ports:
+        return config, "请至少选择一块 LAN 网口"
+    for port in lan_ports:
+        if not IFNAME_RE.fullmatch(port):
+            return config, f"LAN 网口名称无效：{port}"
+        if available_interfaces and port not in available_interfaces:
+            return config, f"LAN 网口 {port} 不存在或不是有线网卡"
+        if wan and port == wan:
+            return config, f"LAN 网口 {port} 不能同时作为 WAN"
+    # Two or more ports are bridged; the L3 name becomes br-lan.
+    lan = networkd.BRIDGE_NAME if len(lan_ports) > 1 else lan_ports[0]
 
     network, error = normalize_lan_network(get("lan_network"))
     if error or network is None:
@@ -314,6 +342,7 @@ def normalize_router_config(
         {
             "wan_interface": wan,
             "lan_interface": lan,
+            "lan_ports": lan_ports,
             "wan_mode": wan_mode,
             "pppoe_username": pppoe_username,
             "pppoe_password": pppoe_password,

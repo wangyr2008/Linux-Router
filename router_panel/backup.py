@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,8 @@ from .core import (
     run_command,
 )
 from .networkd import (
+    BRIDGE_NETDEV_PATH,
+    NETWORKD_DIR,
     DNS_SCRIPT_PATH,
     DNS_SERVICE_NAME,
     DNS_SERVICE_PATH,
@@ -51,6 +54,11 @@ MAX_BACKUP_BYTES = 2 * 1024 * 1024
 OPTIONAL_PACKAGES = ("ppp",)
 
 SERVICE_MONITOR_CONFIG_PATH = DATA_DIR / "service-monitor.json"
+# Per-port bridge members are generated from the configured NIC names, so they are
+# allowlisted by pattern instead of by an explicit list.
+PORT_NETWORK_RE = re.compile(
+    r"^/etc/systemd/network/40-linux-router-lan-[A-Za-z0-9_.@-]{1,15}\.network$"
+)
 TAILSCALE_CONFIG_PATH = DATA_DIR / "tailscale.json"
 
 _EXTRA_UNITS = (
@@ -76,6 +84,7 @@ def backup_paths() -> list[Path]:
         TAILSCALE_CONFIG_PATH,
         WAN_NETWORK_PATH,
         LAN_NETWORK_PATH,
+        BRIDGE_NETDEV_PATH,
         PPP_NETWORK_PATH,
         PPPOE_PEER_PATH,
         PPPOE_CHAP_PATH,
@@ -93,6 +102,9 @@ def backup_paths() -> list[Path]:
         DNS_TIMER_PATH,
         *_EXTRA_UNITS,
     ]
+    # Bridge member files only exist while more than one LAN port is configured.
+    candidates.extend(sorted(NETWORKD_DIR.glob("40-linux-router-lan-*.network")))
+
     # Deduplicate while keeping a stable order.
     seen: set[str] = set()
     ordered: list[Path] = []
@@ -154,7 +166,9 @@ def validate_backup(payload: Any) -> tuple[dict[str, Any], str | None]:
         return {}, "备份文件里没有任何配置"
 
     allowed = {str(path) for path in backup_paths()}
-    unknown = [name for name in files if name not in allowed]
+    unknown = [
+        name for name in files if name not in allowed and not PORT_NETWORK_RE.match(name)
+    ]
     if unknown:
         return {}, f"备份文件包含未知路径：{unknown[0]}"
 

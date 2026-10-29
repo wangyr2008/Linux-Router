@@ -109,7 +109,7 @@ class RouterConfigTests(unittest.TestCase):
         _, error = routing.normalize_router_config(
             {"wan_interface": "eth0", "lan_interface": "eth0"}
         )
-        self.assertIn("同一块网卡", error)
+        self.assertIn("不能同时作为 WAN", error)
 
     def test_interface_must_exist(self):
         _, error = routing.normalize_router_config(
@@ -484,6 +484,197 @@ class DeviceLabelTests(unittest.TestCase):
         self.assertEqual(status["devices"][0]["label"], "打印机")
         self.assertEqual(status["devices"][0]["ip"], "")
         self.assertEqual(status["devices"][0]["current_ip"], "")
+
+
+class LanBridgeTests(unittest.TestCase):
+    def config(self, ports, **overrides):
+        payload = {
+            "wan_interface": "ens3",
+            "lan_ports": ports,
+            "lan_network": "192.168.50.0/24",
+            "ipv6_mode": "off",
+        }
+        payload.update(overrides)
+        config, error = routing.normalize_router_config(payload)
+        assert error is None, error
+        return config
+
+    def test_single_port_stays_direct(self):
+        config = self.config(["ens4"])
+        self.assertEqual(config["lan_interface"], "ens4")
+        self.assertFalse(networkd.is_bridging(config))
+        self.assertIn("Name=ens4", networkd.render_lan_network(config))
+
+    def test_two_ports_are_bridged(self):
+        config = self.config(["ens4", "ens5"])
+        self.assertEqual(config["lan_interface"], networkd.BRIDGE_NAME)
+        self.assertTrue(networkd.is_bridging(config))
+        # The L3 interface is the bridge, not either NIC.
+        lan_network = networkd.render_lan_network(config)
+        self.assertIn(f"Name={networkd.BRIDGE_NAME}", lan_network)
+        self.assertIn("Address=192.168.50.1/24", lan_network)
+
+        netdev = networkd.render_lan_bridge_netdev(config)
+        self.assertIn(f"Name={networkd.BRIDGE_NAME}", netdev)
+        self.assertIn("Kind=bridge", netdev)
+
+        member = networkd.render_lan_port_network("ens5")
+        self.assertIn("Name=ens5", member)
+        self.assertIn(f"Bridge={networkd.BRIDGE_NAME}", member)
+
+    def test_duplicate_ports_are_collapsed(self):
+        config = self.config(["ens4", "ens4"])
+        self.assertEqual(config["lan_ports"], ["ens4"])
+        self.assertFalse(networkd.is_bridging(config))
+
+    def test_no_ports_is_rejected(self):
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "ens3", "lan_ports": []}
+        )
+        self.assertIn("至少选择一块 LAN 网口", error)
+
+    def test_wan_cannot_be_a_lan_port(self):
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "ens3", "lan_ports": ["ens3", "ens4"]}
+        )
+        self.assertIn("不能同时作为 WAN", error)
+
+    def test_unknown_port_is_rejected(self):
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "ens3", "lan_ports": ["ens4", "ens9"]},
+            available_interfaces=["ens3", "ens4"],
+        )
+        self.assertIn("ens9", error)
+
+    def test_comma_separated_string_is_accepted(self):
+        config = self.config("ens4, ens5")
+        self.assertEqual(config["lan_ports"], ["ens4", "ens5"])
+        self.assertTrue(networkd.is_bridging(config))
+
+    def test_dnsmasq_and_firewall_follow_the_bridge(self):
+        config = self.config(["ens4", "ens5"], dhcp_enabled="1")
+        dnsmasq = routing.build_dnsmasq_config(config)
+        self.assertIn(f"interface={networkd.BRIDGE_NAME}", dnsmasq)
+        self.assertIn("listen-address=192.168.50.1", dnsmasq)
+
+        rules = firewall.render_nftables_ruleset(config)
+        self.assertIn(f'iifname "{networkd.BRIDGE_NAME}"', rules)
+
+    def test_apply_writes_bridge_and_member_files(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "bridge"
+        workdir.mkdir(exist_ok=True)
+        for stale in workdir.glob("40-linux-router-lan-*.network"):
+            stale.unlink()
+        config = self.config(["ens4", "ens5"])
+
+        with patch.object(networkd, "NETWORKD_DIR", workdir), patch.object(
+            networkd, "BRIDGE_NETDEV_PATH", workdir / "05-linux-router-br.netdev"
+        ), patch.object(
+            networkd, "LAN_NETWORK_PATH", workdir / "20-linux-router-lan.network"
+        ), patch.object(
+            networkd, "WAN_NETWORK_PATH", workdir / "10-linux-router-wan.network"
+        ), patch.object(
+            networkd, "PPP_NETWORK_PATH", workdir / "30-linux-router-ppp.network"
+        ), patch.object(
+            networkd, "DNS_SCRIPT_PATH", workdir / "dns.sh"
+        ), patch.object(
+            networkd, "DNS_SERVICE_PATH", workdir / "dns.service"
+        ), patch.object(
+            networkd, "DNS_TIMER_PATH", workdir / "dns.timer"
+        ), patch.object(
+            networkd, "command_exists", return_value=True
+        ), patch.object(
+            networkd, "is_service_active", return_value=False
+        ), patch.object(
+            networkd, "is_service_enabled", return_value=False
+        ), patch.object(
+            networkd, "run_command", return_value=ok()
+        ):
+            result = networkd.apply_networkd(config)
+
+        self.assertTrue(result.ok, result.output)
+        self.assertTrue((workdir / "05-linux-router-br.netdev").exists())
+        self.assertTrue((workdir / "40-linux-router-lan-ens4.network").exists())
+        self.assertTrue((workdir / "40-linux-router-lan-ens5.network").exists())
+
+    def test_switching_back_to_one_port_removes_the_bridge(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "bridge-undo"
+        workdir.mkdir(exist_ok=True)
+        netdev = workdir / "05-linux-router-br.netdev"
+        netdev.write_text("[NetDev]\n", encoding="utf-8")
+        member = workdir / "40-linux-router-lan-ens5.network"
+        member.write_text("[Match]\n", encoding="utf-8")
+
+        config = self.config(["ens4"])
+        with patch.object(networkd, "NETWORKD_DIR", workdir), patch.object(
+            networkd, "BRIDGE_NETDEV_PATH", netdev
+        ), patch.object(
+            networkd, "LAN_NETWORK_PATH", workdir / "20-linux-router-lan.network"
+        ), patch.object(
+            networkd, "WAN_NETWORK_PATH", workdir / "10-linux-router-wan.network"
+        ), patch.object(
+            networkd, "PPP_NETWORK_PATH", workdir / "30-linux-router-ppp.network"
+        ), patch.object(
+            networkd, "DNS_SCRIPT_PATH", workdir / "dns.sh"
+        ), patch.object(
+            networkd, "DNS_SERVICE_PATH", workdir / "dns.service"
+        ), patch.object(
+            networkd, "DNS_TIMER_PATH", workdir / "dns.timer"
+        ), patch.object(
+            networkd, "command_exists", return_value=True
+        ), patch.object(
+            networkd, "is_service_active", return_value=False
+        ), patch.object(
+            networkd, "is_service_enabled", return_value=False
+        ), patch.object(
+            networkd, "run_command", return_value=ok()
+        ):
+            result = networkd.apply_networkd(config)
+
+        self.assertTrue(result.ok, result.output)
+        self.assertFalse(netdev.exists(), "桥接 netdev 应被删除")
+        self.assertFalse(member.exists(), "成员口 network 应被删除")
+
+    def test_router_page_renders_lan_checkboxes(self):
+        application.app.config["TESTING"] = True
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        config = self.config(["ens4", "ens5"])
+        status = {
+            "config": config,
+            "interfaces": [
+                {"name": "ens4", "link_speed": "1 Gbps"},
+                {"name": "ens5", "link_speed": "1 Gbps"},
+                {"name": "ens6", "link_speed": "100 Mbps"},
+            ],
+            "wan_candidates": [{"name": "ens3"}],
+            "backend": {"service_active": True},
+            "wan": {}, "lan": {}, "ipv6": {}, "dhcp": {}, "firewall": {},
+            "forwarding": {}, "services": {}, "pd": {}, "errors": [],
+        }
+        with patch.object(web_routing, "query_agent", return_value=status):
+            body = client.get("/router").get_data(as_text=True)
+
+        self.assertIn('name="lan_ports"', body)
+        self.assertIn('value="ens4"', body)
+        self.assertIn('value="ens5"', body)
+        # The two configured ports are pre-checked, the spare one is not.
+        checked = [line for line in body.splitlines() if "data-lan-port" in line or "checked" in line]
+        self.assertTrue(any("checked" in line for line in checked))
+        self.assertIn("br-lan", body)
+
+    def test_backup_accepts_generated_member_files(self):
+        self.assertTrue(
+            backup_client.PORT_NETWORK_RE.match(
+                "/etc/systemd/network/40-linux-router-lan-ens5.network"
+            )
+        )
+        self.assertFalse(
+            backup_client.PORT_NETWORK_RE.match("/etc/systemd/network/40-linux-router-lan-../passwd")
+        )
 
 
 class StaticLeaseTests(unittest.TestCase):
@@ -1525,7 +1716,7 @@ class NetworkdBackendTests(unittest.TestCase):
                 "pppoe_nic": "eth1",
             }
         )
-        self.assertIn("不能和 LAN", error)
+        self.assertIn("不能同时用于 PPPoE 拨号和 LAN", error)
 
     def test_ppp_ipup_hook_restores_cake_and_dns(self):
         """A redial recreates ppp0, so shaping and DNS must be restored at once."""

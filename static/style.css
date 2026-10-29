@@ -1648,3 +1648,42 @@ code {
 .brand-title {
   gap: 8px;
 }
+
+/* Multi-select LAN ports (two or more are bridged into br-lan). */
+.checkbox-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+/* Scoped one level deeper than `.login-form label`, which sets display: grid. */
+.checkbox-grid .checkbox-option {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.checkbox-option input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.checkbox-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--info-bg);
+}
+
+.checkbox-option:has(input:disabled) {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

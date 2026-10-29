@@ -213,7 +213,7 @@
         </label>
         <label class="field" data-wan-field="dhcp">
           <span class="field-label">WAN 上行网口</span>
-          <select name="wan_interface">
+          <select name="wan_interface" data-wan-interface>
             <option value="">请选择</option>
             {% for item in status.wan_candidates %}
             <option value="{{ item.name }}" {{ 'selected' if item.name == config.wan_interface else '' }}>{{ item.name }}{% if item.default_route %} · 当前默认路由{% endif %}{% if item.ipv4 %} · {{ item.ipv4[0] }}{% endif %}</option>
@@ -241,16 +241,26 @@
           <input type="password" class="mono-value" name="pppoe_password" value="{{ config.pppoe_password }}" placeholder="宽带密码">
           <span class="field-hint">写入 /etc/ppp/chap-secrets（权限 600）</span>
         </label>
-        <label class="field">
-          <span class="field-label">LAN 局域网接口</span>
-          <select name="lan_interface" required>
-            <option value="">请选择</option>
+        <div class="field">
+          <span class="field-label">LAN 网口（可多选）</span>
+          <div class="checkbox-grid">
+            {% set active_ports = config.lan_ports or [config.lan_interface] %}
             {% for item in status.interfaces %}
-            <option value="{{ item.name }}" {{ 'selected' if item.name == config.lan_interface else '' }}>{{ item.name }}（{{ item.link_speed or '未知' }}）</option>
+            <label class="checkbox-option">
+              <input
+                type="checkbox"
+                name="lan_ports"
+                value="{{ item.name }}"
+                data-lan-port="{{ item.name }}"
+                {{ 'checked' if item.name in active_ports else '' }}
+              >
+              <span class="mono-value">{{ item.name }}</span>
+              <span class="muted">{{ item.link_speed or '未知' }}</span>
+            </label>
             {% endfor %}
-          </select>
-          <span class="field-hint">接交换机/终端的网口，本机在此接口上做网关</span>
-        </label>
+          </div>
+          <span class="field-hint">选一块直接用；选两块以上自动桥接成 br-lan，相当于把这几个口当成一台交换机</span>
+        </div>
         <label class="field">
           <span class="field-label">LAN IPv4 网段</span>
           <input type="text" class="mono-value" name="lan_network" value="{{ config.lan_network }}" placeholder="192.168.50.0/24" required>

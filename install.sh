@@ -405,7 +405,9 @@ uninstall_router_panel() {
   rm -rf /etc/linux-router /run/linux-router
   rm -f /etc/systemd/network/10-linux-router-wan.network \
         /etc/systemd/network/20-linux-router-lan.network \
-        /etc/systemd/network/30-linux-router-ppp.network
+        /etc/systemd/network/30-linux-router-ppp.network \
+        /etc/systemd/network/05-linux-router-br.netdev
+  rm -f /etc/systemd/network/40-linux-router-lan-*.network
   rm -f /etc/ppp/peers/linux-router /etc/ppp/ip-up.d/90-linux-router
   rm -f /etc/ppp/chap-secrets /etc/ppp/pap-secrets
   rm -f /usr/lib/dhcpcd/dhcpcd-hooks/99-linux-router

@@ -124,6 +124,8 @@ def register_routing_routes(app, login_required, is_async_request) -> None:
         params = {
             "wan_interface": request.form.get("wan_interface", "").strip(),
             "lan_interface": request.form.get("lan_interface", "").strip(),
+            # Checkbox group: one entry per LAN port, two or more are bridged.
+            "lan_ports": [item.strip() for item in request.form.getlist("lan_ports") if item.strip()],
             "lan_network": request.form.get("lan_network", "").strip(),
             "dhcp_enabled": form_flag("dhcp_enabled"),
             "dhcp_start": request.form.get("dhcp_start", "").strip(),

@@ -349,6 +349,7 @@ def gather_wired_network_info(router_config: dict[str, Any] | None = None) -> di
     router_config = router_config or {}
     wan_interface = str(router_config.get("wan_interface", "") or "")
     lan_interface = str(router_config.get("lan_interface", "") or "")
+    lan_ports = [str(item) for item in (router_config.get("lan_ports") or []) if str(item).strip()]
     pppoe_nic = str(router_config.get("pppoe_nic", "") or "")
     connection_methods = get_all_connection_methods()
 
@@ -373,8 +374,9 @@ def gather_wired_network_info(router_config: dict[str, Any] | None = None) -> di
 
         if ifname and ifname == pppoe_nic:
             role, role_label = "pppoe", "PPPoE 物理口"
-        elif ifname and ifname == lan_interface:
-            role, role_label = "lan", "LAN 局域网"
+        elif ifname and (ifname == lan_interface or ifname in lan_ports):
+            bridged = len(lan_ports) > 1
+            role, role_label = "lan", ("LAN 桥接成员" if bridged else "LAN 局域网")
         elif ifname and ifname == wan_interface:
             role, role_label = "wan", "WAN 上行"
         else:

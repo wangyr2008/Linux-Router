@@ -95,3 +95,19 @@
   selector.addEventListener("change", sync);
   sync();
 })();
+
+// A NIC cannot be WAN and LAN at the same time: disable its checkbox.
+(function () {
+  const wan = document.querySelector("[data-wan-interface]");
+  if (!wan) return;
+  const boxes = document.querySelectorAll("[data-lan-port]");
+  const sync = () => {
+    boxes.forEach((box) => {
+      const isWan = box.dataset.lanPort === wan.value;
+      if (isWan && box.checked) box.checked = false;
+      box.disabled = isWan;
+    });
+  };
+  wan.addEventListener("change", sync);
+  sync();
+})();
