@@ -26,6 +26,11 @@ from .core import (
     run_command,
 )
 from .networkd import (
+    DNS_SCRIPT_PATH,
+    DNS_SERVICE_NAME,
+    DNS_SERVICE_PATH,
+    DNS_TIMER_NAME,
+    DNS_TIMER_PATH,
     LAN_NETWORK_PATH,
     PPP_NETWORK_PATH,
     PPPOE_CHAP_PATH,
@@ -50,6 +55,8 @@ _EXTRA_UNITS = (
     Path("/etc/systemd/system/linux-router-cake.service"),
     Path("/etc/systemd/system/linux-router-cake.timer"),
     Path("/etc/systemd/system/linux-router-pppoe.service"),
+    Path("/etc/systemd/system/linux-router-dns.service"),
+    Path("/etc/systemd/system/linux-router-dns.timer"),
 )
 
 
@@ -78,6 +85,9 @@ def backup_paths() -> list[Path]:
         CAKE_SERVICE_PATH,
         CAKE_TIMER_PATH,
         PPPOE_SERVICE_PATH,
+        DNS_SCRIPT_PATH,
+        DNS_SERVICE_PATH,
+        DNS_TIMER_PATH,
         *_EXTRA_UNITS,
     ]
     # Deduplicate while keeping a stable order.
@@ -195,6 +205,14 @@ def _reload_services(restored: set[str]) -> list[str]:
 
     if str(PPPOE_SERVICE_PATH) in restored:
         notes.append(f"PPPoE 配置已更新，必要时 systemctl restart {PPPOE_SERVICE_NAME}")
+
+    # The DNS sync units are only useful once enabled; run one pass immediately so
+    # /etc/resolv.conf matches the restored configuration without waiting a cycle.
+    if str(DNS_TIMER_PATH) in restored or str(DNS_SCRIPT_PATH) in restored:
+        run_command(["systemctl", "enable", DNS_SERVICE_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
+        run_command(["systemctl", "enable", "--now", DNS_TIMER_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
+        run_command(["systemctl", "start", DNS_SERVICE_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
+        notes.append("上游 DNS 已重新同步")
 
     return notes
 
