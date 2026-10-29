@@ -180,6 +180,30 @@ remove_router_rule_files() {
   rm -f "$NFTABLES_FILE" "$DNSMASQ_FILE"
 }
 
+remove_legacy_artifacts() {
+  # Builds before the networkd switch ran a dedicated dhcpcd for prefix delegation.
+  # Upgrading from one of those would otherwise leave a service fighting for the WAN.
+  local removed=0
+  if [[ -e "/etc/systemd/system/linux-router-pd.service" ]]; then
+    systemctl disable --now linux-router-pd.service >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/linux-router-pd.service"
+    removed=1
+  fi
+  for stale in \
+    /usr/lib/dhcpcd/dhcpcd-hooks/99-linux-router \
+    /etc/linux-router/dhcpcd.conf \
+    "$DATA_DIR/pd.json"; do
+    if [[ -e "$stale" ]]; then
+      rm -f "$stale"
+      removed=1
+    fi
+  done
+  if [[ "$removed" -eq 1 ]]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    log "Removed artifacts left by the previous dhcpcd-based build"
+  fi
+}
+
 rollback_install() {
   log "Installation failed; restoring the previous system state"
   systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -478,7 +502,8 @@ Usage: sudo bash install.sh <command> [options]
 
 Commands:
   install                    Perform a new installation
-  upgrade                    Upgrade an existing installation
+  upgrade                    Update program files and units in place; network
+                             configuration, data and rule files are left untouched
   uninstall                  Remove the installation and preserve user data
 
 Options:
@@ -630,36 +655,56 @@ else
   [[ "$ARCHIVE_URL" =~ ^https:// ]] || die "archive URL must use HTTPS"
 fi
 
-if [[ "$ACTION" == "install" ]]; then
-  export DEBIAN_FRONTEND=noninteractive
-  log "Installing system packages"
+export DEBIAN_FRONTEND=noninteractive
+# Deliberately no iptables, iw, wpasupplicant or hostapd: this build is wired-only
+# and uses the nftables stack that ships with Debian 13. `ppp` is only exercised in
+# the PPPoE uplink mode, but a later mode switch should not need another apt run.
+REQUIRED_PACKAGES=(
+  ca-certificates
+  curl
+  dnsmasq
+  gunicorn
+  iproute2
+  nftables
+  ppp
+  python3
+  python3-flask
+  tar
+  udev
+)
+
+package_is_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
+}
+
+missing_packages=()
+for package in "${REQUIRED_PACKAGES[@]}"; do
+  package_is_installed "$package" || missing_packages+=("$package")
+done
+
+if [[ "$ACTION" == "install" || ${#missing_packages[@]} -gt 0 ]]; then
+  if [[ ${#missing_packages[@]} -gt 0 ]]; then
+    log "Installing missing packages: ${missing_packages[*]}"
+  else
+    log "Installing system packages"
+  fi
   # A stale cdrom:// entry (common after a DVD install) makes apt-get update
   # return non-zero even though the network mirrors work, so do not abort here.
   if ! apt-get update; then
     log "WARNING: apt-get update reported failures, continuing anyway"
   fi
-  # Deliberately no iptables, iw, wpasupplicant or hostapd: this build is wired-only
-  # and uses the nftables stack that ships with Debian 13.
-  install_packages=(
-    ca-certificates
-    curl
-    dnsmasq
-    gunicorn
-    iproute2
-    nftables
-    ppp
-    python3
-    python3-flask
-    tar
-    udev
-  )
-  # Optional: only needed for the "运营商 PD 自动" IPv6 mode.
-  apt-get install -y --no-install-recommends "${install_packages[@]}"
-else
-  for command_name in curl tar python3 gunicorn systemd-analyze nft dnsmasq; do
-    command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name"
-  done
+  if [[ ${#missing_packages[@]} -gt 0 ]]; then
+    apt-get install -y --no-install-recommends "${missing_packages[@]}"
+  else
+    apt-get install -y --no-install-recommends "${REQUIRED_PACKAGES[@]}"
+  fi
+elif [[ "$ACTION" == "upgrade" ]]; then
+  log "All required packages are already installed"
 fi
+
+for command_name in curl tar python3 gunicorn systemd-analyze nft dnsmasq; do
+  command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name"
+done
 
 if [[ -n "$SOURCE_DIR" ]]; then
   log "Copying application files from $SOURCE_DIR"
@@ -771,7 +816,9 @@ if [[ "$ACTION" == "upgrade" ]]; then
   log "Installing upgraded services"
   install_service_units
   INSTALL_COMMITTED=1
-  log "Linux Router upgrade completed"
+  log "Linux Router upgrade completed (build $BUILD_ID)"
+  log "Network configuration, data and /etc/nftables.d, /etc/dnsmasq.d were left untouched"
+  log "Re-apply the router config from the panel if you also changed networkd or PPPoE settings"
   exit 0
 fi
 
@@ -829,6 +876,8 @@ systemctl restart systemd-networkd.service
 # panel writes its own .network files. Applying the router config takes the
 # interfaces over (stops NetworkManager/dhcpcd/ifupdown for those NICs).
 log "networkd is ready; the panel will take the NICs over when you apply"
+
+remove_legacy_artifacts
 
 log "Installing systemd services"
 install_service_units
