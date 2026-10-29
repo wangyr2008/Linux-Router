@@ -84,8 +84,13 @@ while [[ $# -gt 0 ]]; do
       exit 0
       ;;
     -h|--help)
-      usage
-      exit 0
+      # Only the bootstrap's own help; after a command, forward it to install.sh.
+      if [[ ${#FORWARD[@]} -eq 0 ]]; then
+        usage
+        exit 0
+      fi
+      FORWARD+=("$1")
+      shift
       ;;
     *)
       FORWARD+=("$1")
