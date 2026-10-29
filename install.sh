@@ -266,6 +266,13 @@ install_service_units() {
   systemctl daemon-reload
   systemctl enable "$AGENT_SERVICE_NAME" >/dev/null
   systemctl enable "$SERVICE_NAME" >/dev/null
+
+  # The agent runs as root, so files it wrote (restore, config saves) may be
+  # root-owned; the panel reads secret_key at boot and would fail to start.
+  if getent passwd "$SERVICE_USER" >/dev/null && [[ -d "$DATA_DIR" ]]; then
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
+  fi
+
   systemctl restart "$AGENT_SERVICE_NAME"
   systemctl restart "$SERVICE_NAME"
 

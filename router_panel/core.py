@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import json
 import fcntl
+import grp
+import json
 import os
+import pwd
 import secrets
 import shutil
 import subprocess
@@ -31,6 +33,9 @@ LAN_CONNECTION_NAME = "linux-router-lan"
 NETWORKMANAGER_CONFIG_PATH = Path("/etc/NetworkManager/NetworkManager.conf")
 NETWORKMANAGER_CONF_DIR = Path("/etc/NetworkManager/conf.d")
 NETPLAN_DIR = Path("/etc/netplan")
+# The panel service account. Data files must stay readable by it, but the agent
+# runs as root, so anything it writes into DATA_DIR needs its owner reset.
+SERVICE_USER = "router-panel"
 IFUPDOWN_INTERFACES_PATH = Path("/etc/network/interfaces")
 IFUPDOWN_INTERFACES_DIR = Path("/etc/network/interfaces.d")
 DHCPCD_RUN_DIR = Path("/run/dhcpcd")
@@ -171,6 +176,24 @@ def atomic_write_text(
                 os.close(directory_fd)
         finally:
             temporary_path.unlink(missing_ok=True)
+
+
+def chown_service_user(path: Path) -> bool:
+    """Hand a data file back to the panel account after the root agent wrote it.
+
+    Without this, `secret_key` (read by the panel at boot) and `auth.json` end up
+    owned by root with mode 0600 and the panel fails to start.
+    """
+    try:
+        uid = pwd.getpwnam(SERVICE_USER).pw_uid
+        gid = grp.getgrnam(SERVICE_USER).gr_gid
+    except KeyError:
+        return False
+    try:
+        os.chown(path, uid, gid)
+        return True
+    except OSError:
+        return False
 
 
 def run_command(
@@ -732,6 +755,8 @@ __all__ = [
     "NETWORKMANAGER_CONFIG_PATH",
     "NETWORKMANAGER_CONF_DIR",
     "NETPLAN_DIR",
+    "SERVICE_USER",
+    "chown_service_user",
     "IFUPDOWN_INTERFACES_PATH",
     "IFUPDOWN_INTERFACES_DIR",
     "DHCPCD_RUN_DIR",

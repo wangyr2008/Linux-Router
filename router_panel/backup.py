@@ -21,6 +21,7 @@ from .core import (
     SYSTEM_COMMAND_TIMEOUT,
     CommandResult,
     atomic_write_text,
+    chown_service_user,
     get_build_info,
     package_installed,
     run_command,
@@ -234,6 +235,10 @@ def restore_backup(payload: Any, install_packages: bool = True) -> CommandResult
             atomic_write_text(path, item["content"], mode=mode)
         except OSError as exc:
             return CommandResult(False, f"写入 {name} 失败：{exc}")
+        # The agent runs as root; the panel reads secret_key/auth.json as its own
+        # account, so files inside the data dir must be handed back to it.
+        if DATA_DIR in path.parents:
+            chown_service_user(path)
         restored.add(name)
 
     notes: list[str] = []

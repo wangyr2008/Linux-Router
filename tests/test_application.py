@@ -1831,6 +1831,29 @@ class BackupRestoreTests(unittest.TestCase):
         with self.assertRaises(agent_server.ValidationError):
             agent_server._execute_backup_restore({"path": "/etc/passwd"})
 
+    def test_restore_hands_data_files_back_to_the_panel_user(self):
+        """The agent runs as root; secret_key/auth.json must stay panel-readable."""
+        payload = {
+            "format": backup_client.BACKUP_FORMAT,
+            "version": backup_client.BACKUP_VERSION,
+            "packages": [],
+            "files": {
+                str(core.ROUTER_CONFIG_PATH): {"content": "{}\n", "mode": "0600"},
+                "/etc/dnsmasq.d/linux-router.conf": {"content": "x\n", "mode": "0644"},
+            },
+        }
+        touched: list[str] = []
+
+        with patch.object(backup_client, "atomic_write_text"), patch.object(
+            backup_client, "run_command", return_value=ok()
+        ), patch.object(
+            backup_client, "chown_service_user", side_effect=lambda path: touched.append(str(path))
+        ):
+            result = backup_client.restore_backup(payload)
+
+        self.assertTrue(result.ok, result.output)
+        self.assertEqual(touched, [str(core.ROUTER_CONFIG_PATH)])
+
     def test_restore_operation_surfaces_the_summary(self):
         """The UI shows this message, so it must list what was restored."""
         upload = Path(core.DATA_DIR) / ".restore-test.json"
