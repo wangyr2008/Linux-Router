@@ -75,6 +75,38 @@
   </article>
 
   <article class="card">
+    <h3 class="card-title">{{ icon("package") }}<span>备份与恢复</span></h3>
+    <p class="muted">
+      备份内容为面板与系统里的配置文件（路由/DHCP/防火墙/CAKE/网络后端、账号与监控列表），
+      外加一份软件包名清单；恢复时会按清单重新安装缺失的包。
+    </p>
+
+    <div class="form-footer">
+      <p class="muted form-hint">备份文件含宽带账号与密码哈希，请妥善保管。</p>
+      <a class="button-link" href="{{ url_for('download_backup') }}">下载备份</a>
+    </div>
+
+    <form
+      action="{{ url_for('restore_backup') }}"
+      method="post"
+      enctype="multipart/form-data"
+      class="login-form"
+      onsubmit="return window.confirm('恢复会覆盖当前配置并重启相关服务，确定继续吗？')"
+    >
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="field">
+        <span class="field-label">恢复备份</span>
+        <input type="file" name="backup" accept="application/json,.json" required>
+        <span class="field-hint">选择之前下载的 .json 备份文件</span>
+      </label>
+      <div class="form-footer">
+        <p class="muted form-hint">恢复后 networkd / dnsmasq / nftables 会按备份内容重载。</p>
+        <button type="submit" class="button-danger-outline">上传并恢复</button>
+      </div>
+    </form>
+  </article>
+
+  <article class="card">
     <h3 class="card-title">{{ icon("key-round") }}<span>管理员密码</span></h3>
     <form action="{{ url_for('update_password') }}" method="post" class="login-form">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

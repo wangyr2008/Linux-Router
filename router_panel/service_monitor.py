@@ -10,6 +10,23 @@ from .core import DATA_DIR, CommandResult, atomic_write_text, run_command
 SERVICE_MONITOR_CONFIG_PATH = DATA_DIR / "service-monitor.json"
 DEFAULT_SERVICE_MONITOR_CONFIG = {"services": []}
 SERVICE_ACTIONS = {"start", "stop", "restart"}
+# `systemctl is-enabled` answers. "static"/"indirect"/"generated" mean the unit has
+# no [Install] section, so there is nothing to enable rather than a problem.
+ENABLED_LABELS = {
+    "enabled": "开机自启",
+    "enabled-runtime": "仅本次运行",
+    "disabled": "未自启",
+    "static": "静态（无自启项）",
+    "indirect": "间接",
+    "generated": "自动生成",
+    "alias": "别名",
+    "linked": "链接",
+    "masked": "已屏蔽",
+    "masked-runtime": "已屏蔽",
+    "not-found": "不存在",
+}
+ENABLED_OK = {"enabled", "static", "indirect", "generated", "alias", "linked"}
+ENABLED_WARNING = {"disabled", "enabled-runtime"}
 SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,128}\.service$")
 PROTECTED_SERVICE_NAMES = {
     "router-panel.service",
@@ -72,16 +89,44 @@ def save_service_monitor_config(config: dict[str, Any]) -> None:
     )
 
 
+def _first_line(result: CommandResult) -> str:
+    output = (result.output or result.stdout or "").strip()
+    return output.splitlines()[0] if output else ""
+
+
 def get_service_state(service: str) -> dict[str, str]:
     normalized, error = normalize_service_name(service)
     if error:
-        return {"name": service, "status": "unknown", "level": "error"}
+        return {
+            "name": service,
+            "status": "unknown",
+            "level": "error",
+            "enabled": "unknown",
+            "enabled_label": "未知",
+            "enabled_level": "error",
+        }
 
-    result = run_command(["systemctl", "is-active", normalized], timeout=8)
-    status = (result.output or result.stdout or "").strip().splitlines()
-    state = status[0] if status else "unknown"
+    active_result = run_command(["systemctl", "is-active", normalized], timeout=8)
+    state = _first_line(active_result) or "unknown"
     level = "ok" if state == "active" else "error"
-    return {"name": normalized, "status": state, "level": level}
+
+    enabled_result = run_command(["systemctl", "is-enabled", normalized], timeout=8)
+    enabled = _first_line(enabled_result) or "unknown"
+    if enabled in ENABLED_OK:
+        enabled_level = "ok"
+    elif enabled in ENABLED_WARNING:
+        enabled_level = "warning"
+    else:
+        enabled_level = "error"
+
+    return {
+        "name": normalized,
+        "status": state,
+        "level": level,
+        "enabled": enabled,
+        "enabled_label": ENABLED_LABELS.get(enabled, enabled),
+        "enabled_level": enabled_level,
+    }
 
 
 def gather_service_monitor_status() -> dict[str, Any]:
@@ -101,6 +146,7 @@ def run_service_action(service: str, action: str) -> CommandResult:
 
 __all__ = [
     "DEFAULT_SERVICE_MONITOR_CONFIG",
+    "ENABLED_LABELS",
     "SERVICE_MONITOR_CONFIG_PATH",
     "gather_service_monitor_status",
     "load_service_monitor_config",

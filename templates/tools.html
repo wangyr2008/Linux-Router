@@ -126,7 +126,8 @@
         <thead>
           <tr>
             <th>服务</th>
-            <th>状态</th>
+            <th>运行状态</th>
+            <th>开机自启</th>
             <th>操作</th>
           </tr>
         </thead>
@@ -134,8 +135,11 @@
           {% for service in service_monitor.status.services %}
           <tr>
             <td class="mono-value" data-label="服务">{{ service.name }}</td>
-            <td data-label="状态">
+            <td data-label="运行状态">
               <span class="status-badge status-{{ service.level }}">{{ service.status }}</span>
+            </td>
+            <td data-label="开机自启">
+              <span class="status-badge status-{{ service.enabled_level }}">{{ service.enabled_label }}</span>
             </td>
             <td data-label="操作">
               <div class="service-monitor-actions">

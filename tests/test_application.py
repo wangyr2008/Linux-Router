@@ -13,6 +13,7 @@ os.environ["LINUX_ROUTER_DATA_DIR"] = TEST_DATA_DIRECTORY.name
 
 import app as application
 from router_panel import agent_server
+from router_panel import backup as backup_client
 from router_panel import cake as cake_client
 from router_panel import core
 from router_panel import dependencies
@@ -21,8 +22,10 @@ from router_panel import network
 from router_panel import network_parsers
 from router_panel import networkd
 from router_panel import routing
+from router_panel import service_monitor
 from router_panel import system
 from router_panel import web_general
+from router_panel import web_tools
 from router_panel import web_routing
 from router_panel.core import CommandResult
 
@@ -39,6 +42,8 @@ EXPECTED_ROUTES = {
     "/router",
     "/router/apply",
     "/settings",
+    "/settings/backup",
+    "/settings/backup/restore",
     "/settings/cake",
     "/settings/password",
     "/settings/reboot",
@@ -1558,6 +1563,247 @@ class NetworkdBackendTests(unittest.TestCase):
         self.assertIn('name="wan_mode"', body)
         self.assertIn('name="pppoe_username"', body)
         self.assertIn("PPPoE 账号", body)
+
+
+class ServiceEnabledTests(unittest.TestCase):
+    def test_enabled_state_is_reported(self):
+        def fake_run(command, timeout=8, env=None):
+            if command[:2] == ["systemctl", "is-active"]:
+                return ok("active")
+            if command[:2] == ["systemctl", "is-enabled"]:
+                return ok("enabled")
+            return ok("")
+
+        with patch.object(service_monitor, "run_command", side_effect=fake_run):
+            state = service_monitor.get_service_state("nginx.service")
+
+        self.assertEqual(state["status"], "active")
+        self.assertEqual(state["level"], "ok")
+        self.assertEqual(state["enabled"], "enabled")
+        self.assertEqual(state["enabled_label"], "开机自启")
+        self.assertEqual(state["enabled_level"], "ok")
+
+    def test_disabled_unit_warns(self):
+        def fake_run(command, timeout=8, env=None):
+            if command[:2] == ["systemctl", "is-active"]:
+                return ok("active")
+            return ok("disabled")
+
+        with patch.object(service_monitor, "run_command", side_effect=fake_run):
+            state = service_monitor.get_service_state("nginx")
+
+        self.assertEqual(state["enabled_label"], "未自启")
+        self.assertEqual(state["enabled_level"], "warning")
+
+    def test_static_unit_is_not_a_problem(self):
+        def fake_run(command, timeout=8, env=None):
+            if command[:2] == ["systemctl", "is-active"]:
+                return ok("active")
+            return ok("static")
+
+        with patch.object(service_monitor, "run_command", side_effect=fake_run):
+            state = service_monitor.get_service_state("systemd-networkd.service")
+
+        self.assertEqual(state["enabled_level"], "ok")
+        self.assertIn("静态", state["enabled_label"])
+
+    def test_masked_unit_is_an_error(self):
+        def fake_run(command, timeout=8, env=None):
+            if command[:2] == ["systemctl", "is-active"]:
+                return ok("inactive")
+            return ok("masked")
+
+        with patch.object(service_monitor, "run_command", side_effect=fake_run):
+            state = service_monitor.get_service_state("bad.service")
+
+        self.assertEqual(state["enabled_level"], "error")
+        self.assertEqual(state["level"], "error")
+
+    def test_tools_page_renders_enabled_column(self):
+        application.app.config["TESTING"] = True
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        status = {
+            "config": {"services": ["nginx.service"]},
+            "status": {
+                "services": [
+                    {
+                        "name": "nginx.service",
+                        "status": "active",
+                        "level": "ok",
+                        "enabled": "enabled",
+                        "enabled_label": "开机自启",
+                        "enabled_level": "ok",
+                    }
+                ],
+                "errors": [],
+            },
+        }
+        with patch.object(web_tools, "query_agent", return_value=status["status"]):
+            body = client.get("/tools").get_data(as_text=True)
+        self.assertIn("开机自启", body)
+        self.assertIn("nginx.service", body)
+
+
+class BackupRestoreTests(unittest.TestCase):
+    def payload(self, **overrides):
+        backup = {
+            "format": backup_client.BACKUP_FORMAT,
+            "version": backup_client.BACKUP_VERSION,
+            "created_at": "2026-10-29T00:00:00+00:00",
+            "hostname": "router",
+            "build": {"branch": "main", "build": "local"},
+            "packages": ["dnsmasq"],
+            "files": {
+                str(self.router_json): {"content": '{"wan_interface": "eth0"}', "mode": "0600"}
+            },
+        }
+        backup.update(overrides)
+        return backup
+
+    def setUp(self):
+        self.workdir = Path(TEST_DATA_DIRECTORY.name) / "backup"
+        if not self.workdir.exists():
+            self.workdir.mkdir(parents=True)
+        self.router_json = self.workdir / "router.json"
+
+    def test_backup_paths_are_limited_to_our_files(self):
+        paths = {str(path) for path in backup_client.backup_paths()}
+        self.assertIn(str(core.ROUTER_CONFIG_PATH), paths)
+        self.assertIn(str(backup_client.CAKE_SCRIPT_PATH), paths)
+        for path in paths:
+            self.assertTrue(path.startswith(("/etc/", str(core.DATA_DIR))), path)
+
+    def test_create_backup_collects_existing_files(self):
+        self.router_json.write_text('{"wan_interface": "eth0"}\n', encoding="utf-8")
+        self.router_json.chmod(0o600)
+        with patch.object(backup_client, "backup_paths", return_value=[self.router_json]), patch.object(
+            backup_client, "installed_package_names", return_value=["dnsmasq", "nftables"]
+        ):
+            payload = backup_client.create_backup()
+
+        self.assertEqual(payload["format"], backup_client.BACKUP_FORMAT)
+        self.assertEqual(payload["packages"], ["dnsmasq", "nftables"])
+        entry = payload["files"][str(self.router_json)]
+        self.assertIn("eth0", entry["content"])
+        self.assertEqual(entry["mode"], "0600")
+
+    def test_validate_rejects_foreign_paths(self):
+        payload = self.payload(files={"/etc/passwd": {"content": "x", "mode": "0644"}})
+        _, error = backup_client.validate_backup(payload)
+        self.assertIn("未知路径", error)
+
+    def test_validate_rejects_wrong_format(self):
+        _, error = backup_client.validate_backup({"format": "something-else"})
+        self.assertIn("不是 Linux Router", error)
+        _, error = backup_client.validate_backup("nope")
+        self.assertIn("格式无效", error)
+
+    def test_validate_rejects_future_version(self):
+        _, error = backup_client.validate_backup(self.payload(version=99))
+        self.assertIn("版本", error)
+
+    def test_restore_writes_files_and_reloads(self):
+        self.router_json.write_text("old\n", encoding="utf-8")
+        commands = []
+
+        def fake_run(command, timeout=8, env=None):
+            commands.append(command)
+            return ok()
+
+        with patch.object(backup_client, "backup_paths", return_value=[self.router_json]), patch.object(
+            backup_client, "package_installed", return_value=True
+        ), patch.object(backup_client, "run_command", side_effect=fake_run):
+            result = backup_client.restore_backup(self.payload())
+
+        self.assertTrue(result.ok, result.output)
+        self.assertIn("eth0", self.router_json.read_text(encoding="utf-8"))
+        self.assertEqual(self.router_json.stat().st_mode & 0o777, 0o600)
+        flat = [" ".join(call) for call in commands]
+        self.assertTrue(any("daemon-reload" in item for item in flat))
+
+    def test_restore_installs_missing_packages(self):
+        commands = []
+
+        def fake_run(command, timeout=8, env=None):
+            commands.append(command)
+            return ok()
+
+        with patch.object(backup_client, "backup_paths", return_value=[self.router_json]), patch.object(
+            backup_client, "package_installed", return_value=False
+        ), patch.object(backup_client, "run_command", side_effect=fake_run):
+            result = backup_client.restore_backup(self.payload(packages=["dnsmasq", "ppp"]))
+
+        self.assertTrue(result.ok, result.output)
+        install = [call for call in commands if call[:2] == ["apt-get", "install"]]
+        self.assertEqual(len(install), 1)
+        self.assertIn("dnsmasq", install[0])
+        self.assertIn("ppp", install[0])
+
+    def test_restore_without_install_skips_apt(self):
+        commands = []
+
+        def fake_run(command, timeout=8, env=None):
+            commands.append(command)
+            return ok()
+
+        with patch.object(backup_client, "backup_paths", return_value=[self.router_json]), patch.object(
+            backup_client, "run_command", side_effect=fake_run
+        ):
+            result = backup_client.restore_backup(self.payload(), install_packages=False)
+
+        self.assertTrue(result.ok, result.output)
+        self.assertFalse([call for call in commands if call[:1] == ["apt-get"]])
+
+    def test_download_route_returns_json_attachment(self):
+        application.app.config["TESTING"] = True
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        with patch.object(web_general, "query_agent", return_value=self.payload()):
+            response = client.get("/settings/backup")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("attachment", response.headers["Content-Disposition"])
+        self.assertIn("linux-router-backup", response.headers["Content-Disposition"])
+        self.assertEqual(response.mimetype, "application/json")
+
+    def test_restore_route_requires_a_file(self):
+        application.app.config["TESTING"] = True
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        response = client.post("/settings/backup/restore", data={"csrf_token": "test-token"})
+        self.assertEqual(response.status_code, 302)
+
+    def test_restore_route_rejects_bad_json(self):
+        application.app.config["TESTING"] = True
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        import io
+
+        response = client.post(
+            "/settings/backup/restore",
+            data={
+                "csrf_token": "test-token",
+                "backup": (io.BytesIO(b"not json"), "backup.json"),
+            },
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 302)
+
+    def test_restore_operation_rejects_paths_outside_data_dir(self):
+        with self.assertRaises(agent_server.ValidationError):
+            agent_server._execute_backup_restore({"path": "/etc/passwd"})
 
 
 if __name__ == "__main__":

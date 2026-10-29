@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from flask import flash, redirect, render_template, request, session, url_for
+import json
+import os
+from datetime import datetime
+
+from flask import Response, flash, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from .agent_client import AgentError, query_agent, submit_operation
-from .core import load_auth_config, save_auth_config
+from .backup import MAX_BACKUP_BYTES
+from .core import DATA_DIR, load_auth_config, save_auth_config
 
 
 def register_general_routes(app, login_required, is_async_request) -> None:
@@ -88,6 +93,60 @@ def register_general_routes(app, login_required, is_async_request) -> None:
             flash(str(exc), "error")
             return redirect(url_for("dependencies_page"))
         return queued_response(operation, "依赖修复已加入队列", "dependencies_page")
+
+    @app.route("/settings/backup")
+    @login_required
+    def download_backup():
+        try:
+            payload = query_agent("backup_create")
+        except AgentError as exc:
+            flash(f"生成备份失败：{exc}", "error")
+            return redirect(url_for("system_settings"))
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return Response(
+            body,
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="linux-router-backup-{stamp}.json"'
+            },
+        )
+
+    @app.route("/settings/backup/restore", methods=["POST"])
+    @login_required
+    def restore_backup():
+        upload = request.files.get("backup")
+        if upload is None or not upload.filename:
+            flash("请先选择备份文件", "error")
+            return redirect(url_for("system_settings"))
+
+        raw = upload.read(MAX_BACKUP_BYTES + 1)
+        if len(raw) > MAX_BACKUP_BYTES:
+            flash("备份文件过大（上限 2 MB）", "error")
+            return redirect(url_for("system_settings"))
+        try:
+            json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            flash("备份文件不是有效的 JSON", "error")
+            return redirect(url_for("system_settings"))
+
+        target = DATA_DIR / ".restore-upload.json"
+        try:
+            target.write_bytes(raw)
+            os.chmod(target, 0o600)
+        except OSError as exc:
+            flash(f"保存上传文件失败：{exc}", "error")
+            return redirect(url_for("system_settings"))
+
+        try:
+            operation = submit_operation("backup_restore", {"path": str(target)}, scope="system")
+        except AgentError as exc:
+            target.unlink(missing_ok=True)
+            if is_async_request():
+                return {"ok": False, "pending": False, "message": str(exc)}, 503
+            flash(str(exc), "error")
+            return redirect(url_for("system_settings"))
+        return queued_response(operation, "配置恢复已加入队列", "system_settings")
 
     @app.route("/settings/password", methods=["POST"])
     @login_required

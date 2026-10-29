@@ -14,10 +14,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .core import (
+    DATA_DIR,
     CommandResult,
     get_network_interface_hardware,
     request_system_reboot,
 )
+from .backup import create_backup, restore_backup
 from .cake import apply_cake, get_cake_status
 from .dependencies import gather_dependency_status, run_dependency_action
 from .network import gather_wired_network_info, list_all_interfaces
@@ -233,6 +235,23 @@ def _execute_cake_apply(params: dict[str, Any]) -> dict[str, Any]:
     return _result(result, result.output or "CAKE 限速已应用", "应用 CAKE 限速失败")
 
 
+def _execute_backup_restore(params: dict[str, Any]) -> dict[str, Any]:
+    raw_path = _require_string(params, "path", maximum=512)
+    path = Path(raw_path).resolve()
+    # The web layer drops the upload here; nothing outside the data dir is readable.
+    if DATA_DIR.resolve() not in path.parents:
+        raise ValidationError("备份文件路径无效")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValidationError(f"读取备份文件失败：{exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValidationError("备份文件不是有效的 JSON") from exc
+    finally:
+        path.unlink(missing_ok=True)
+    return _result(restore_backup(payload), "配置已恢复", "恢复配置失败")
+
+
 def _execute_dependency(params: dict[str, Any]) -> dict[str, Any]:
     action = _require_string(params, "action", maximum=64)
     return _result(run_dependency_action(action), "处置完成", "处置失败")
@@ -267,6 +286,7 @@ def _execute_service_monitor_action(params: dict[str, Any]) -> dict[str, Any]:
 OPERATIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "router_apply": _execute_router_apply,
     "cake_apply": _execute_cake_apply,
+    "backup_restore": _execute_backup_restore,
     "dependency_fix": _execute_dependency,
     "system_reboot": _execute_reboot,
     "tailscale_login": _execute_tailscale_login,
@@ -290,6 +310,8 @@ def execute_query(name: str, params: dict[str, Any]) -> Any:
         return gather_client_status()
     if name == "cake_status":
         return get_cake_status(load_router_config())
+    if name == "backup_create":
+        return create_backup()
     if name == "tailscale_status":
         return gather_tailscale_status()
     if name == "service_monitor_status":
