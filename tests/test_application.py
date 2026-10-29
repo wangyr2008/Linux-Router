@@ -1831,6 +1831,32 @@ class BackupRestoreTests(unittest.TestCase):
         with self.assertRaises(agent_server.ValidationError):
             agent_server._execute_backup_restore({"path": "/etc/passwd"})
 
+    def test_restore_operation_surfaces_the_summary(self):
+        """The UI shows this message, so it must list what was restored."""
+        upload = Path(core.DATA_DIR) / ".restore-test.json"
+        upload.parent.mkdir(parents=True, exist_ok=True)
+        upload.write_text(
+            json.dumps(
+                {
+                    "format": backup_client.BACKUP_FORMAT,
+                    "version": backup_client.BACKUP_VERSION,
+                    "packages": [],
+                    "files": {
+                        str(core.ROUTER_CONFIG_PATH): {"content": "{}\n", "mode": "0600"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.object(backup_client, "atomic_write_text"), patch.object(
+            backup_client, "run_command", return_value=ok()
+        ):
+            result = agent_server._execute_backup_restore({"path": str(upload)})
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("已恢复 1 个配置文件", result["message"])
+        self.assertFalse(upload.exists(), "上传的临时文件必须被删除")
+
 
 class UpstreamDnsTests(unittest.TestCase):
     def setUp(self):

@@ -249,7 +249,13 @@ def _execute_backup_restore(params: dict[str, Any]) -> dict[str, Any]:
         raise ValidationError("备份文件不是有效的 JSON") from exc
     finally:
         path.unlink(missing_ok=True)
-    return _result(restore_backup(payload), "配置已恢复", "恢复配置失败")
+    result = restore_backup(payload)
+    # The restore summary lists the file count and the services it reloaded, so
+    # surface it instead of a generic "配置已恢复".
+    return {
+        "ok": result.ok,
+        "message": (result.output or "配置已恢复") if result.ok else (result.output or "恢复配置失败"),
+    }
 
 
 def _execute_dependency(params: dict[str, Any]) -> dict[str, Any]:
