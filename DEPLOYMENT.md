@@ -13,6 +13,9 @@ DATA_DIR=/home/router-panel/data
 
 如使用其他路径，必须同步修改环境变量、systemd unit 和后续命令。
 
+> 上机前的环境检查（sudo、DVD 源、时间、DNS、切换与回滚）见
+> [上机清单](docs/INSTALL-CHECKLIST.md)。
+
 ## 1. 系统要求
 
 目标系统为 Debian 13（x86_64）最小化安装，使用 systemd 与 **systemd-networkd**。

@@ -65,6 +65,10 @@ python3 python3-flask gunicorn systemd dnsmasq nftables iproute2 udev ppp curl t
 
 ## Install
 
+> Replacing an existing router? Follow [the on-site checklist](docs/INSTALL-CHECKLIST.md)
+> first: it covers the sudo / user-group quirks of a minimal install, the DVD source
+> error, clock and DNS checks, and the cut-over / rollback steps.
+
 ### 1. Bootstrap script (recommended behind restrictive networks)
 
 `get.sh` tries GitHub directly and then a few public mirrors, and passes the mirror

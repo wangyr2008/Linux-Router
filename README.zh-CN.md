@@ -63,6 +63,9 @@ python3 python3-flask gunicorn systemd dnsmasq nftables iproute2 udev ppp curl t
 
 ## 安装
 
+> 第一次上机、尤其是**替换现有软路由**时，建议照着 [上机清单](docs/INSTALL-CHECKLIST.md) 走：
+> 里面覆盖了最小化安装的 sudo / 用户组问题、DVD 源报错、时间与 DNS、切换与回滚步骤。
+
 ### 方式一：加速脚本（国内网络推荐）
 
 `get.sh` 会依次尝试 GitHub 直连和几个公共镜像，拿到 `install.sh` 后自动用同一个镜像下载源码包：

@@ -625,7 +625,9 @@ elif [[ "$ACTION" == "upgrade" ]]; then
   getent group "$SERVICE_USER" >/dev/null || die "service group not found: $SERVICE_USER"
 fi
 
-[[ ${EUID} -eq 0 ]] || die "run this installer as root"
+if [[ ${EUID} -ne 0 ]]; then
+  die "run this installer as root: either 'sudo bash $0 ...' or switch with 'su -' first"
+fi
 [[ -d /run/systemd/system ]] || die "systemd is required"
 command -v apt-get >/dev/null 2>&1 || die "only apt-based Debian systems are supported"
 
@@ -677,10 +679,45 @@ package_is_installed() {
   dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'
 }
 
+# A DVD install leaves `deb cdrom:[...]` in the sources list. Once the disc is out,
+# every apt-get update fails on that entry even though the network mirrors work.
+disable_cdrom_sources() {
+  local file changed=0
+  local files=(/etc/apt/sources.list)
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(find /etc/apt/sources.list.d -maxdepth 1 -name '*.list' -print0 2>/dev/null)
+
+  for file in "${files[@]}"; do
+    [[ -f "$file" ]] || continue
+    if grep -qE '^[[:space:]]*(deb|deb-src)[[:space:]]+cdrom:' "$file"; then
+      # Two expressions: '|' is both the sed delimiter and the alternation operator.
+      sed -i -E \
+        -e 's|^([[:space:]]*)deb cdrom:|# \1deb cdrom:|' \
+        -e 's|^([[:space:]]*)deb-src cdrom:|# \1deb-src cdrom:|' \
+        "$file"
+      changed=1
+      log "Commented out the CD-ROM entry in $file"
+    fi
+  done
+
+  # deb822 sources cannot be disabled one line at a time; only warn about them.
+  for file in /etc/apt/sources.list.d/*.sources; do
+    [[ -f "$file" ]] || continue
+    if grep -qE '^URIs:[[:space:]]*cdrom:' "$file"; then
+      log "WARNING: $file still points at the install DVD; remove that stanza if apt complains"
+    fi
+  done
+
+  [[ "$changed" -eq 0 ]] || log "apt will no longer try to read the installation DVD"
+}
+
 missing_packages=()
 for package in "${REQUIRED_PACKAGES[@]}"; do
   package_is_installed "$package" || missing_packages+=("$package")
 done
+
+disable_cdrom_sources
 
 if [[ "$ACTION" == "install" || ${#missing_packages[@]} -gt 0 ]]; then
   if [[ ${#missing_packages[@]} -gt 0 ]]; then
@@ -702,7 +739,11 @@ elif [[ "$ACTION" == "upgrade" ]]; then
   log "All required packages are already installed"
 fi
 
-for command_name in curl tar python3 gunicorn systemd-analyze nft dnsmasq; do
+# curl is also used by the health check, so it is required either way; tar is only
+# needed to unpack a downloaded archive.
+required_commands=(curl python3 gunicorn systemd-analyze nft dnsmasq)
+[[ -n "$SOURCE_DIR" ]] || required_commands+=(tar)
+for command_name in "${required_commands[@]}"; do
   command -v "$command_name" >/dev/null 2>&1 || die "required command is missing: $command_name"
 done
 
