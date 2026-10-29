@@ -32,15 +32,6 @@ def split_escaped(line: str, separator: str = ":") -> list[str]:
     return values
 
 
-def parse_nmcli_lines(raw: str, fields: list[str], separator: str = ":") -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for line in raw.splitlines():
-        values = split_escaped(line, separator)
-        padded = values + [""] * (len(fields) - len(values))
-        rows.append(dict(zip(fields, padded, strict=False)))
-    return rows
-
-
 def translate_device_state(value: str) -> str:
     mapping = {
         "connected": "已连接",
@@ -69,25 +60,6 @@ def parse_csv_values(raw: str) -> list[str]:
         return []
     values = raw.replace(";", ",").split(",")
     return [value.strip() for value in values if value.strip()]
-
-
-def normalize_nmcli_general_state(value: str) -> str:
-    try:
-        state_code = int(value.split(" ", 1)[0])
-    except (ValueError, IndexError):
-        return value.strip()
-
-    if state_code == 100:
-        return "connected"
-    if state_code == 30:
-        return "disconnected"
-    if state_code == 20:
-        return "unavailable"
-    if state_code == 10:
-        return "unmanaged"
-    if 40 <= state_code <= 110:
-        return "connecting"
-    return "unavailable" if state_code == 120 else value.strip()
 
 
 def format_lease_expiry(timestamp: str) -> dict[str, str]:
@@ -143,11 +115,9 @@ def parse_dnsmasq_leases(raw: str) -> list[dict[str, Any]]:
 
 __all__ = [
     "split_escaped",
-    "parse_nmcli_lines",
     "translate_device_state",
     "translate_connection_type",
     "parse_csv_values",
-    "normalize_nmcli_general_state",
     "format_lease_expiry",
     "parse_dnsmasq_leases",
 ]

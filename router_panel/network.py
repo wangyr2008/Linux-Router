@@ -9,6 +9,16 @@ from .network_parsers import translate_connection_type, translate_device_state
 
 ETHERNET_TYPE = "802-3-ethernet"
 PPP_TYPE = "ppp"
+BRIDGE_PREFIX = "br-"
+
+
+def is_bridge(ifname: str) -> bool:
+    """Bridges are never a WAN candidate: the LAN bridge is our own construct."""
+    if not ifname:
+        return False
+    if ifname.startswith(BRIDGE_PREFIX):
+        return True
+    return Path(f"/sys/class/net/{ifname}/bridge").is_dir()
 
 
 def link_type(ifname: str) -> str:
@@ -326,7 +336,7 @@ def list_all_interfaces() -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for interface in _ip_json("address", "show"):
         ifname = str(interface.get("ifname", "") or "")
-        if not ifname or ifname == "lo":
+        if not ifname or ifname == "lo" or is_bridge(ifname):
             continue
         ipv4, ipv6 = _addresses(interface)
         state = _operstate(interface)
@@ -435,6 +445,7 @@ __all__ = [
     "get_interface_addresses",
     "get_interface_neighbors",
     "get_default_route_devs",
+    "is_bridge",
     "list_all_interfaces",
     "get_all_connection_methods",
     "get_connection_methods",

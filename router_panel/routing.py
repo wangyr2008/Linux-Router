@@ -59,7 +59,7 @@ IPV6_MODE_PD = "pd"
 IPV6_MODES = (IPV6_MODE_ULA, IPV6_MODE_PD, IPV6_MODE_STATIC, IPV6_MODE_OFF)
 IPV6_MODE_LABELS = {
     IPV6_MODE_ULA: "ULA 私有前缀 + NAT66",
-    IPV6_MODE_PD: "运营商 PD 自动（dhcpcd）",
+    IPV6_MODE_PD: "运营商 PD 自动（networkd）",
     IPV6_MODE_STATIC: "运营商下发的全局前缀（纯路由）",
     IPV6_MODE_OFF: "关闭 IPv6",
 }
@@ -427,15 +427,23 @@ def load_router_config() -> dict[str, Any]:
 
     config, _ = normalize_router_config(payload)
     if config.get("ipv6_mode") == IPV6_MODE_PD:
-        # In PD mode the LAN /64 is owned by the delegation, not by the config file.
-        config["ipv6_prefix"] = pd_client.lan_prefix()
+        # In PD mode the LAN /64 comes from the delegation, not from the config file.
+        # Empty until the ISP hands one out; networkd assigns it as soon as it does.
+        config["ipv6_prefix"] = networkd.get_delegated_prefix(
+            str(config.get("lan_interface", "") or "")
+        )
     return config
 
 
 def save_router_config(config: dict[str, Any]) -> None:
+    payload = dict(config)
+    if payload.get("ipv6_mode") == IPV6_MODE_PD:
+        # The LAN /64 in PD mode is runtime state from the delegation, not config.
+        # Persisting it would make a later switch to ULA reuse a public prefix.
+        payload["ipv6_prefix"] = ""
     atomic_write_text(
         ROUTER_CONFIG_PATH,
-        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         mode=0o600,
     )
 
@@ -785,12 +793,6 @@ def gather_router_status() -> dict[str, Any]:
             "updated_at": "",
             "error": "" if backend["delegated"] else "尚未收到委派前缀",
         }
-    wan_owner = {
-        "interface": wan_name,
-        "managed_by": "systemd-networkd",
-        "method": str(config.get("wan_mode", networkd.WAN_MODE_DHCP)),
-        "dhcpcd_pid": 0,
-    }
 
     return {
         "config": config,
@@ -798,7 +800,6 @@ def gather_router_status() -> dict[str, Any]:
         "wan_candidates": wan_candidates,
         "wan": wan,
         "lan": lan,
-        "wan_owner": wan_owner,
         "ipv6": {
             "mode": config.get("ipv6_mode", IPV6_MODE_OFF),
             "mode_label": IPV6_MODE_LABELS.get(str(config.get("ipv6_mode", "")), "未知"),

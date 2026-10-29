@@ -486,6 +486,103 @@ class DeviceLabelTests(unittest.TestCase):
         self.assertEqual(status["devices"][0]["current_ip"], "")
 
 
+class RegressionTests(unittest.TestCase):
+    """Bugs found while reviewing: dead references after the networkd switch."""
+
+    def test_pd_mode_config_load_does_not_crash(self):
+        """load_router_config used to call the deleted pd module in PD mode."""
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "pd-load"
+        workdir.mkdir(exist_ok=True)
+        config_path = workdir / "router.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "wan_interface": "ppp0",
+                    "lan_interface": "ens4",
+                    "lan_ports": ["ens4"],
+                    "ipv6_mode": "pd",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.object(routing, "ROUTER_CONFIG_PATH", config_path), patch.object(
+            networkd, "get_delegated_prefix", return_value="2408:8207:6a1c:2f00::/64"
+        ):
+            config = routing.load_router_config()
+
+        self.assertEqual(config["ipv6_prefix"], "2408:8207:6a1c:2f00::/64")
+        # The LAN address follows the delegated prefix.
+        self.assertEqual(str(routing.lan_ipv6_address(config)), "2408:8207:6a1c:2f00::1")
+
+    def test_pd_prefix_is_never_persisted(self):
+        """The delegated /64 is runtime state; saving it would leak into ULA mode."""
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "pd-save"
+        workdir.mkdir(exist_ok=True)
+        config_path = workdir / "router.json"
+        with patch.object(routing, "ROUTER_CONFIG_PATH", config_path):
+            config, _ = routing.normalize_router_config(
+                {
+                    "wan_interface": "ppp0",
+                    "lan_ports": ["ens4"],
+                    "lan_network": "192.168.50.0/24",
+                    "ipv6_mode": "pd",
+                }
+            )
+            config["ipv6_prefix"] = "2408:8207:6a1c:2f00::/64"
+            routing.save_router_config(config)
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["ipv6_prefix"], "")
+        self.assertEqual(saved["ipv6_mode"], "pd")
+
+    def test_pd_mode_without_delegation_is_empty_not_fatal(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "pd-empty"
+        workdir.mkdir(exist_ok=True)
+        config_path = workdir / "router.json"
+        config_path.write_text(
+            json.dumps({"wan_interface": "ppp0", "lan_interface": "ens4", "lan_ports": ["ens4"], "ipv6_mode": "pd"}),
+            encoding="utf-8",
+        )
+        with patch.object(routing, "ROUTER_CONFIG_PATH", config_path), patch.object(
+            networkd, "get_delegated_prefix", return_value=""
+        ):
+            config = routing.load_router_config()
+
+        self.assertEqual(config["ipv6_prefix"], "")
+        self.assertIsNone(routing.lan_ipv6_address(config))
+
+    def test_fix_lan_interface_uses_networkd(self):
+        """That action used to call the removed NetworkManager helper."""
+        config, _ = routing.normalize_router_config(
+            {"wan_interface": "ens3", "lan_ports": ["ens4"], "lan_network": "192.168.50.0/24"}
+        )
+        with patch.object(dependencies, "load_router_config", return_value=config), patch.object(
+            dependencies.networkd, "apply_networkd", return_value=ok("applied")
+        ) as applied, patch.object(dependencies, "save_router_config"):
+            result = dependencies.run_dependency_action("fix_lan_interface")
+
+        self.assertTrue(result.ok, result.output)
+        applied.assert_called_once()
+
+    def test_bridge_is_not_a_wan_candidate(self):
+        self.assertTrue(network.is_bridge("br-lan"))
+        self.assertFalse(network.is_bridge("ens4"))
+        self.assertFalse(network.is_bridge(""))
+
+        interfaces = [
+            {"ifname": "lo", "link_type": "loopback"},
+            {"ifname": "ens3", "link_type": "ether", "operstate": "UP", "addr_info": []},
+            {"ifname": "br-lan", "link_type": "bridge", "operstate": "UP", "addr_info": []},
+            {"ifname": "ppp0", "link_type": "ppp", "operstate": "UNKNOWN", "addr_info": []},
+        ]
+        with patch.object(network, "_ip_json", return_value=interfaces), patch.object(
+            network, "get_default_route_devs", return_value={}
+        ):
+            names = [item["name"] for item in network.list_all_interfaces()]
+
+        self.assertEqual(names, ["ens3", "ppp0"])
+
+
 class LanBridgeTests(unittest.TestCase):
     def config(self, ports, **overrides):
         payload = {
@@ -1360,8 +1457,6 @@ class AccessControlTests(unittest.TestCase):
     def test_dependency_row_warns_when_public_ipv6_is_unfiltered(self):
         config = self.config()  # pd + open
         with patch.object(dependencies, "load_router_config", return_value=config), patch.object(
-            dependencies, "gather_wired_network_info", return_value={"devices": []}
-        ), patch.object(
             dependencies, "get_router_nat_status",
             return_value={"level": "ok", "summary": "", "details": "", "action": ""},
         ), patch.object(dependencies, "get_firewall_status", return_value={
@@ -1369,9 +1464,6 @@ class AccessControlTests(unittest.TestCase):
             "nat4": True, "nat6": False, "input_table": False, "nat4_packets": 0, "nat6_packets": 0, "errors": [],
         }), patch.object(dependencies, "_lan_has_address", return_value=True), patch.object(
             dependencies, "get_ip_forward_status", return_value={"ipv4": "1", "ipv6": "1", "persistent": ""}
-        ), patch.object(
-            dependencies, "get_netplan_renderer_summary",
-            return_value={"ok": True, "level": "ok", "summary": "", "details": []},
         ):
             rows = dependencies.get_dependency_rows()
 
@@ -1381,8 +1473,6 @@ class AccessControlTests(unittest.TestCase):
 
         protected_config = self.config(firewall_mode="protect")
         with patch.object(dependencies, "load_router_config", return_value=protected_config), patch.object(
-            dependencies, "gather_wired_network_info", return_value={"devices": []}
-        ), patch.object(
             dependencies, "get_router_nat_status",
             return_value={"level": "ok", "summary": "", "details": "", "action": ""},
         ), patch.object(dependencies, "get_firewall_status", return_value={
@@ -1390,9 +1480,6 @@ class AccessControlTests(unittest.TestCase):
             "nat4": True, "nat6": False, "input_table": True, "nat4_packets": 0, "nat6_packets": 0, "errors": [],
         }), patch.object(dependencies, "_lan_has_address", return_value=True), patch.object(
             dependencies, "get_ip_forward_status", return_value={"ipv4": "1", "ipv6": "1", "persistent": ""}
-        ), patch.object(
-            dependencies, "get_netplan_renderer_summary",
-            return_value={"ok": True, "level": "ok", "summary": "", "details": []},
         ):
             rows = dependencies.get_dependency_rows()
 

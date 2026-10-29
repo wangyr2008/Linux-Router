@@ -1,25 +1,17 @@
 from __future__ import annotations
 
 import os
-from configparser import ConfigParser
-from io import StringIO
-from pathlib import Path
 from typing import Any
 
 from .core import (
     APT_TIMEOUT,
     DNSMASQ_RULESET_PATH,
-    NETPLAN_DIR,
-    NETWORKMANAGER_CONFIG_PATH,
-    NETWORKMANAGER_CONF_DIR,
     REQUIRED_PACKAGES,
     ROUTER_PANEL_SYSCTL_PATH,
     SYSTEM_COMMAND_TIMEOUT,
     CommandResult,
     atomic_write_text,
-    command_exists,
     dhcpcd_instances,
-    file_update_lock,
     ifupdown_managed_interfaces,
     is_service_active,
     is_service_enabled,
@@ -29,7 +21,6 @@ from .core import (
     run_command,
 )
 from .firewall import apply_ruleset, get_firewall_status, render_nftables_ruleset
-from .network import gather_wired_network_info
 from . import networkd
 from .routing import (
     IPV6_MODE_PD,
@@ -42,87 +33,6 @@ from .routing import (
     load_router_config,
     save_router_config,
 )
-
-
-def get_networkmanager_managed_setting() -> str:
-    parser = ConfigParser(interpolation=None)
-    paths = [NETWORKMANAGER_CONFIG_PATH]
-    if NETWORKMANAGER_CONF_DIR.exists():
-        paths.extend(sorted(NETWORKMANAGER_CONF_DIR.glob("*.conf")))
-    parser.read([str(path) for path in paths if path.exists()], encoding="utf-8")
-    return parser.get("ifupdown", "managed", fallback="").strip().lower()
-
-
-def get_netplan_files() -> list[Path]:
-    if not NETPLAN_DIR.exists():
-        return []
-    return sorted(
-        [
-            *NETPLAN_DIR.glob("*.yaml"),
-            *NETPLAN_DIR.glob("*.yml"),
-        ]
-    )
-
-
-def get_netplan_renderer_summary() -> dict[str, Any]:
-    if not command_exists("netplan"):
-        return {
-            "ok": True,
-            "level": "ok",
-            "summary": "系统未安装 netplan，跳过 renderer 检查",
-            "details": [],
-        }
-
-    files = get_netplan_files()
-    if not files:
-        return {
-            "ok": True,
-            "level": "ok",
-            "summary": "未找到 netplan 配置文件（Debian 最小安装通常不使用 netplan）",
-            "details": [],
-        }
-
-    details: list[dict[str, str]] = []
-    normalized_renderers: set[str] = set()
-    for path in files:
-        renderer = ""
-        try:
-            for raw_line in path.read_text(encoding="utf-8").splitlines():
-                line = raw_line.split("#", 1)[0].strip()
-                if not line or ":" not in line:
-                    continue
-                key, value = line.split(":", 1)
-                if key.strip() != "renderer":
-                    continue
-                renderer = value.strip()
-                break
-        except OSError:
-            renderer = ""
-
-        details.append({"path": str(path), "renderer": renderer or "未设置"})
-        if renderer:
-            normalized_renderers.add(renderer.lower())
-
-    if normalized_renderers == {"networkmanager"}:
-        return {
-            "ok": True,
-            "level": "ok",
-            "summary": "netplan renderer 已设置为 NetworkManager",
-            "details": details,
-        }
-    if "networkmanager" in normalized_renderers:
-        return {
-            "ok": False,
-            "level": "warning",
-            "summary": "netplan renderer 存在混合配置",
-            "details": details,
-        }
-    return {
-        "ok": False,
-        "level": "error",
-        "summary": "netplan 未切到 NetworkManager",
-        "details": details,
-    }
 
 
 def get_ip_forward_status() -> dict[str, str]:
@@ -192,180 +102,6 @@ def get_router_nat_status() -> dict[str, Any]:
     }
 
 
-def ensure_networkmanager_managed_ifupdown() -> CommandResult:
-    with file_update_lock(NETWORKMANAGER_CONFIG_PATH) as acquired:
-        if not acquired:
-            return CommandResult(False, "NetworkManager 配置正在更新")
-
-        parser = ConfigParser(interpolation=None)
-        if NETWORKMANAGER_CONFIG_PATH.exists():
-            try:
-                with NETWORKMANAGER_CONFIG_PATH.open(encoding="utf-8") as handle:
-                    parser.read_file(handle)
-            except OSError as exc:
-                return CommandResult(False, str(exc))
-
-        if not parser.has_section("ifupdown"):
-            parser.add_section("ifupdown")
-        parser.set("ifupdown", "managed", "true")
-
-        output = StringIO()
-        parser.write(output)
-        try:
-            atomic_write_text(
-                NETWORKMANAGER_CONFIG_PATH,
-                output.getvalue(),
-                mode=0o644,
-            )
-        except OSError as exc:
-            return CommandResult(False, str(exc))
-    return CommandResult(True, "已写入 NetworkManager managed=true")
-
-
-def _netplan_with_networkmanager_renderer(content: str) -> tuple[str, bool]:
-    lines = content.splitlines(keepends=True)
-    changed = False
-    updated_lines: list[str] = []
-
-    for line in lines:
-        newline = ""
-        body = line
-        if body.endswith("\r\n"):
-            body = body[:-2]
-            newline = "\r\n"
-        elif body.endswith("\n"):
-            body = body[:-1]
-            newline = "\n"
-
-        uncommented, hash_mark, comment = body.partition("#")
-        key, delimiter, _value = uncommented.partition(":")
-        if delimiter and key.strip() == "renderer":
-            updated = f"{key}: NetworkManager"
-            if hash_mark:
-                updated = f"{updated}  #{comment.lstrip()}"
-            updated = f"{updated}{newline}"
-            if updated != line:
-                changed = True
-            updated_lines.append(updated)
-            continue
-
-        updated_lines.append(line)
-
-    return "".join(updated_lines), changed
-
-
-def ensure_netplan_networkmanager_renderer() -> CommandResult:
-    if not command_exists("netplan"):
-        return CommandResult(True, "系统未安装 netplan，已跳过 netplan 配置")
-
-    NETPLAN_DIR.mkdir(parents=True, exist_ok=True)
-    target = NETPLAN_DIR / "90-linux-router.yaml"
-    content = (
-        "network:\n"
-        "  version: 2\n"
-        "  renderer: NetworkManager\n"
-    )
-    updated_paths: list[str] = []
-    try:
-        for path in get_netplan_files():
-            try:
-                existing = path.read_text(encoding="utf-8")
-            except OSError as exc:
-                return CommandResult(False, str(exc))
-            updated, changed = _netplan_with_networkmanager_renderer(existing)
-            if changed:
-                atomic_write_text(path, updated)
-                updated_paths.append(str(path))
-
-        atomic_write_text(target, content, mode=0o600)
-        if str(target) not in updated_paths:
-            updated_paths.append(str(target))
-    except OSError as exc:
-        return CommandResult(False, str(exc))
-    return CommandResult(True, f"已写入 {', '.join(updated_paths)}")
-
-
-def apply_netplan() -> CommandResult:
-    if not command_exists("netplan"):
-        return CommandResult(True, "系统未安装 netplan，已跳过 netplan apply")
-
-    generate = run_command(["netplan", "generate"], timeout=SYSTEM_COMMAND_TIMEOUT)
-    if not generate.ok:
-        return generate
-    return run_command(["netplan", "apply"], timeout=SYSTEM_COMMAND_TIMEOUT)
-
-
-def _snapshot_paths(paths: list[Path]) -> dict[Path, tuple[str | None, int]]:
-    snapshot: dict[Path, tuple[str | None, int]] = {}
-    for path in dict.fromkeys(paths):
-        content = path.read_text(encoding="utf-8") if path.exists() else None
-        mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
-        snapshot[path] = (content, mode)
-    return snapshot
-
-
-def _snapshot_network_configuration() -> dict[Path, tuple[str | None, int]]:
-    return _snapshot_paths(
-        [NETWORKMANAGER_CONFIG_PATH, *get_netplan_files(), NETPLAN_DIR / "90-linux-router.yaml"]
-    )
-
-
-def _restore_network_configuration(snapshot: dict[Path, tuple[str | None, int]]) -> list[str]:
-    errors: list[str] = []
-    for path, (content, mode) in snapshot.items():
-        try:
-            if content is None:
-                path.unlink(missing_ok=True)
-            else:
-                atomic_write_text(path, content, mode=mode)
-        except OSError as exc:
-            errors.append(f"{path}: {exc}")
-    return errors
-
-
-def _rollback_network_configuration(
-    snapshot: dict[Path, tuple[str | None, int]],
-    *,
-    apply_netplan_config: bool,
-    networkmanager_state: tuple[bool, bool] | None = None,
-    restart_networkmanager: bool = True,
-) -> str:
-    errors = _restore_network_configuration(snapshot)
-    if apply_netplan_config and command_exists("netplan"):
-        generated = run_command(["netplan", "generate"], timeout=SYSTEM_COMMAND_TIMEOUT)
-        if not generated.ok:
-            errors.append(generated.output or "netplan generate 失败")
-        else:
-            applied = run_command(["netplan", "apply"], timeout=SYSTEM_COMMAND_TIMEOUT)
-            if not applied.ok:
-                errors.append(applied.output or "netplan apply 失败")
-    if restart_networkmanager:
-        restarted = restart_service("NetworkManager")
-        if not restarted.ok:
-            errors.append(restarted.output or "NetworkManager 重启失败")
-    if networkmanager_state is not None:
-        enabled, active = networkmanager_state
-        if enabled:
-            restored_enabled = enable_service("NetworkManager")
-        else:
-            restored_enabled = run_command(
-                ["systemctl", "disable", "NetworkManager"],
-                timeout=SYSTEM_COMMAND_TIMEOUT,
-            )
-        if not restored_enabled.ok:
-            errors.append(restored_enabled.output or "NetworkManager 启用状态恢复失败")
-        if active:
-            restored_active = restart_service("NetworkManager")
-        else:
-            restored_active = run_command(
-                ["systemctl", "stop", "NetworkManager"],
-                timeout=SYSTEM_COMMAND_TIMEOUT,
-            )
-        if not restored_active.ok:
-            errors.append(restored_active.output or "NetworkManager 运行状态恢复失败")
-    return "; ".join(errors)
-
-
 def restart_service(service_name: str) -> CommandResult:
     return run_command(["systemctl", "restart", service_name], timeout=SYSTEM_COMMAND_TIMEOUT)
 
@@ -430,14 +166,10 @@ def install_package(package: str) -> CommandResult:
 
 def get_dependency_rows() -> list[dict[str, Any]]:
     config = load_router_config()
-    wired_info = gather_wired_network_info(config)
-    wired_devices = wired_info.get("devices", [])
-    unmanaged_wired = [device.get("device", "") for device in wired_devices if device.get("state") == "unmanaged"]
     active_networkd = is_service_active(networkd.NETWORKD_SERVICE)
     enabled_networkd = is_service_enabled(networkd.NETWORKD_SERVICE)
     active_panel = is_service_active("router-panel.service")
     enabled_panel = is_service_enabled("router-panel.service")
-    active_resolved = is_service_active("systemd-resolved.service")
     active_dnsmasq = is_service_active("dnsmasq.service")
     enabled_dnsmasq = is_service_enabled("dnsmasq.service")
     forwarding = get_ip_forward_status()
@@ -704,38 +436,8 @@ def gather_dependency_status() -> dict[str, Any]:
 def _run_dependency_action(action: str) -> CommandResult:
     if action == "install_packages":
         return install_missing_packages()
-    if action == "fix_nm_managed":
-        networkmanager_state = (
-            is_service_enabled("NetworkManager"),
-            is_service_active("NetworkManager"),
-        )
-        try:
-            snapshot = _snapshot_network_configuration()
-        except OSError as exc:
-            return CommandResult(False, f"无法备份网络配置：{exc}")
-        result = ensure_networkmanager_managed_ifupdown()
-        if not result.ok:
-            return result
-        restart = restart_service("NetworkManager")
-        if not restart.ok:
-            rollback_error = _rollback_network_configuration(
-                snapshot,
-                apply_netplan_config=False,
-                networkmanager_state=networkmanager_state,
-            )
-            if rollback_error:
-                return CommandResult(
-                    False,
-                    f"{restart.output or 'NetworkManager 重启失败'}；网络配置回滚失败：{rollback_error}",
-                )
-            return restart
-        return CommandResult(True, "已写入 managed=true 并重启 NetworkManager")
-    if action == "apply_netplan":
-        return apply_netplan()
     if action == "enable_router_panel_service":
         return enable_service("router-panel.service")
-    if action == "disable_dhcpcd":
-        return disable_service("dhcpcd.service")
     if action == "fix_forwarding":
         return ensure_forwarding()
     if action == "install_ppp":
@@ -771,64 +473,11 @@ def _run_dependency_action(action: str) -> CommandResult:
         config = load_router_config()
         if not config.get("lan_interface"):
             return CommandResult(False, "请先在“路由”页面选择 LAN 接口")
-        result = ensure_lan_connection(config)
+        # LAN addresses live in systemd-networkd now; re-applying is the fix.
+        result = networkd.apply_networkd(config)
         if result.ok:
             save_router_config(config)
         return result
-    if action == "repair_network_stack":
-        networkmanager_state = (
-            is_service_enabled("NetworkManager"),
-            is_service_active("NetworkManager"),
-        )
-        try:
-            snapshot = _snapshot_network_configuration()
-        except OSError as exc:
-            return CommandResult(False, f"无法备份网络配置：{exc}")
-        for index, step in enumerate((
-            ensure_networkmanager_managed_ifupdown,
-            ensure_netplan_networkmanager_renderer,
-            apply_netplan,
-            lambda: enable_service("NetworkManager"),
-        )):
-            result = step()
-            if not result.ok:
-                if index == 0:
-                    rollback_error = _rollback_network_configuration(
-                        snapshot,
-                        apply_netplan_config=False,
-                        restart_networkmanager=False,
-                    )
-                    if rollback_error:
-                        return CommandResult(
-                            False,
-                            f"{result.output or '网络修复失败'}；网络配置回滚失败：{rollback_error}",
-                        )
-                    return result
-                rollback_error = _rollback_network_configuration(
-                    snapshot,
-                    apply_netplan_config=True,
-                    networkmanager_state=networkmanager_state,
-                )
-                if rollback_error:
-                    return CommandResult(
-                        False,
-                        f"{result.output or '网络修复失败'}；网络配置回滚失败：{rollback_error}",
-                    )
-                return result
-        restart = restart_service("NetworkManager")
-        if not restart.ok:
-            rollback_error = _rollback_network_configuration(
-                snapshot,
-                apply_netplan_config=True,
-                networkmanager_state=networkmanager_state,
-            )
-            if rollback_error:
-                return CommandResult(
-                    False,
-                    f"{restart.output or 'NetworkManager 重启失败'}；网络配置回滚失败：{rollback_error}",
-                )
-            return restart
-        return CommandResult(True, "已完成 NetworkManager 和 netplan 基础修复")
     return CommandResult(False, "不支持的修复动作")
 
 
@@ -837,15 +486,9 @@ def run_dependency_action(action: str) -> CommandResult:
 
 
 __all__ = [
-    "get_networkmanager_managed_setting",
-    "get_netplan_files",
-    "get_netplan_renderer_summary",
     "get_ip_forward_status",
     "get_default_route_interface",
     "get_router_nat_status",
-    "ensure_networkmanager_managed_ifupdown",
-    "ensure_netplan_networkmanager_renderer",
-    "apply_netplan",
     "restart_service",
     "enable_service",
     "disable_service",

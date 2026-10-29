@@ -30,9 +30,6 @@ SECRET_KEY_PATH = DATA_DIR / "secret_key"
 BUILD_INFO_PATH = BASE_DIR / "BUILD_INFO"
 DEFAULT_LAN_NETWORK = "192.168.50.0/24"
 LAN_CONNECTION_NAME = "linux-router-lan"
-NETWORKMANAGER_CONFIG_PATH = Path("/etc/NetworkManager/NetworkManager.conf")
-NETWORKMANAGER_CONF_DIR = Path("/etc/NetworkManager/conf.d")
-NETPLAN_DIR = Path("/etc/netplan")
 # Display name and project link. Renaming the project only needs these two lines
 # changed; the service names and paths (linux-router-*) stay for upgrade safety.
 APP_NAME = "Linux Router"
@@ -758,9 +755,6 @@ __all__ = [
     "BUILD_INFO_PATH",
     "DEFAULT_LAN_NETWORK",
     "LAN_CONNECTION_NAME",
-    "NETWORKMANAGER_CONFIG_PATH",
-    "NETWORKMANAGER_CONF_DIR",
-    "NETPLAN_DIR",
     "APP_NAME",
     "APP_TAGLINE",
     "PROJECT_URL",

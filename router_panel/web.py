@@ -4,7 +4,7 @@ import secrets
 from functools import wraps
 from typing import Any
 
-from flask import abort, redirect, render_template, request, session, url_for
+from flask import abort, redirect, request, session, url_for
 
 from .agent_client import AgentError, get_operation, query_agent
 from .core import APP_NAME, APP_TAGLINE, PASSWORD_HINT_PATH, PROJECT_URL, get_build_info

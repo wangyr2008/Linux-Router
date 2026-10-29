@@ -225,20 +225,6 @@ def render_lan_network(config: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _lan_ipv6_text(config: dict[str, Any]) -> str:
-    from .routing import lan_ipv6_address
-
-    address = lan_ipv6_address(config)
-    return str(address) if address is not None else ""
-
-
-def _lan_ipv6_text(config: dict[str, Any]) -> str:
-    from .routing import lan_ipv6_address
-
-    address = lan_ipv6_address(config)
-    return str(address) if address is not None else ""
-
-
 def render_ppp_network() -> str:
     """ppp0 is created by pppd; networkd only runs the DHCPv6 client on it.
 
