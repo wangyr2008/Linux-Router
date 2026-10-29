@@ -176,6 +176,24 @@ def register_routing_routes(app, login_required, is_async_request) -> None:
             return redirect(url_for("clients_page"))
         return queued(operation, "静态地址正在保存", "clients_page")
 
+    @app.route("/clients/device", methods=["POST"])
+    @login_required
+    def client_device_save():
+        params = {
+            "mac": request.form.get("mac", "").strip(),
+            "label": request.form.get("label", "").strip(),
+            "ip": request.form.get("ip", "").strip(),
+            "hostname": request.form.get("hostname", "").strip(),
+        }
+        try:
+            operation = submit_operation("device_save", params, scope="system")
+        except AgentError as exc:
+            if is_async_request():
+                return {"ok": False, "pending": False, "message": str(exc)}, 503
+            flash(str(exc), "error")
+            return redirect(url_for("clients_page"))
+        return queued(operation, "设备信息正在保存", "clients_page")
+
     @app.route("/clients/static/delete", methods=["POST"])
     @login_required
     def client_static_delete():
@@ -203,6 +221,7 @@ def register_routing_routes(app, login_required, is_async_request) -> None:
             prefill={
                 "mac": request.args.get("mac", "").strip(),
                 "ip": request.args.get("ip", "").strip(),
+                "label": request.args.get("label", "").strip(),
             },
         )
 

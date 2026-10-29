@@ -27,6 +27,8 @@ from .routing import (
     apply_router_config,
     apply_static_leases,
     remove_static_lease,
+    save_router_config,
+    set_device_label,
     set_static_lease,
     gather_client_status,
     gather_router_status,
@@ -251,6 +253,35 @@ def _execute_static_lease_set(params: dict[str, Any]) -> dict[str, Any]:
     return _result(result, f"{mac} 已固定到 {ip}", "保存静态地址失败")
 
 
+def _execute_device_save(params: dict[str, Any]) -> dict[str, Any]:
+    """Save a device label and, when an IP is given, the static binding too."""
+    mac = _require_string(params, "mac", maximum=32)
+    label = str(params.get("label", "") or "").strip()
+    ip = str(params.get("ip", "") or "").strip()
+    hostname = str(params.get("hostname", "") or "").strip()[:63]
+
+    config = load_router_config()
+    updated, error = set_device_label(config, mac, label)
+    if error:
+        raise ValidationError(error)
+
+    if ip:
+        updated, error = set_static_lease(updated, mac, ip, hostname)
+        if error:
+            raise ValidationError(error)
+        result = apply_static_leases(updated)
+        detail = f"{mac} → {ip}" + (f"（{label}）" if label else "")
+        return _result(result, f"已保存 {detail}", "保存静态地址失败")
+
+    # Label-only edit: dnsmasq does not need a reload for this.
+    save_router_config(updated)
+    if not label and not any(
+        lease.get("mac") == mac for lease in updated.get("static_leases") or []
+    ):
+        return {"ok": True, "message": f"已清除 {mac} 的备注"}
+    return {"ok": True, "message": f"已保存备注：{label or '（空）'}"}
+
+
 def _execute_static_lease_delete(params: dict[str, Any]) -> dict[str, Any]:
     mac = _require_string(params, "mac", maximum=32)
     config = load_router_config()
@@ -320,6 +351,7 @@ OPERATIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "cake_apply": _execute_cake_apply,
     "backup_restore": _execute_backup_restore,
     "static_lease_set": _execute_static_lease_set,
+    "device_save": _execute_device_save,
     "static_lease_delete": _execute_static_lease_delete,
     "dependency_fix": _execute_dependency,
     "system_reboot": _execute_reboot,

@@ -91,6 +91,8 @@ DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "cake_download_mbit": 0,
     # [{"mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.50.10", "hostname": "nas"}]
     "static_leases": [],
+    # {"AA:BB:CC:DD:EE:FF": "客厅电视"} - panel-side only, for recognising devices
+    "device_labels": {},
 }
 
 
@@ -346,6 +348,9 @@ def normalize_router_config(
         [item for item in raw_leases if isinstance(item, dict)]
         if isinstance(raw_leases, list)
         else []
+    )
+    config["device_labels"] = normalize_device_labels(
+        payload.get("device_labels", base.get("device_labels", {}))
     )
 
     if config["dhcp_enabled"]:
@@ -791,6 +796,43 @@ def gather_router_status() -> dict[str, Any]:
     }
 
 
+LABEL_MAX_LENGTH = 32
+
+
+def normalize_device_labels(raw: Any) -> dict[str, str]:
+    """MAC -> 备注. Keys are normalised so lookups match the lease table."""
+    if not isinstance(raw, dict):
+        return {}
+    labels: dict[str, str] = {}
+    for key, value in raw.items():
+        mac = normalize_mac_address(str(key or ""))
+        text = str(value or "").strip()[:LABEL_MAX_LENGTH]
+        if mac and text:
+            labels[mac] = text
+    return labels
+
+
+def set_device_label(
+    config: dict[str, Any], mac: str, label: str
+) -> tuple[dict[str, Any], str | None]:
+    normalized_mac = normalize_mac_address(str(mac or ""))
+    if not normalized_mac:
+        return config, "MAC 地址格式无效（应形如 aa:bb:cc:dd:ee:ff）"
+
+    text = str(label or "").strip()
+    if len(text) > LABEL_MAX_LENGTH:
+        return config, f"备注最多 {LABEL_MAX_LENGTH} 个字符"
+
+    updated = dict(config)
+    labels = dict(normalize_device_labels(config.get("device_labels")))
+    if text:
+        labels[normalized_mac] = text
+    else:
+        labels.pop(normalized_mac, None)
+    updated["device_labels"] = labels
+    return updated, None
+
+
 HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
@@ -954,39 +996,55 @@ def gather_client_status() -> dict[str, Any]:
         if neighbor.get("online") == "1":
             client["online"] = "1"
 
+    labels = normalize_device_labels(config.get("device_labels"))
+    by_mac = {lease["mac"]: lease for lease in _static_leases(config)}
+
     items = []
     for client in clients.values():
         client["ipv6"] = sorted(client["ipv6"])
         client["ipv6_label"] = ", ".join(client["ipv6"]) if client["ipv6"] else ""
-        client["name"] = client["hostname"] or client["mac_address"] or client["ipv4"] or "未知设备"
+        client["label"] = labels.get(client["mac_address"], "")
+        # A label the user typed beats a hostname the device reports.
+        client["name"] = (
+            client["label"]
+            or client["hostname"]
+            or client["mac_address"]
+            or client["ipv4"]
+            or "未知设备"
+        )
+        lease = by_mac.get(client["mac_address"])
+        client["static_ip"] = str(lease.get("ip", "")) if lease else ""
+        client["reserved"] = "1" if lease else "0"
         items.append(client)
     items.sort(key=lambda item: (item["ipv4"] == "", item["ipv4"] or item["ipv6_label"], item["name"]))
 
-    by_mac = {lease["mac"]: lease for lease in _static_leases(config)}
-    for item in items:
-        lease = by_mac.get(item["mac_address"])
-        item["static_ip"] = str(lease.get("ip", "")) if lease else ""
-        item["reserved"] = "1" if lease else "0"
-
-    bindings = []
-    for lease in _static_leases(config):
-        match = next((item for item in items if item["mac_address"] == lease.get("mac")), None)
-        bindings.append(
+    # One row per known MAC: a label without a binding still needs to be editable,
+    # and so does a binding whose device is offline.
+    known = list(labels) + [lease.get("mac", "") for lease in _static_leases(config)]
+    devices = []
+    for mac in dict.fromkeys(known):
+        if not mac:
+            continue
+        lease = by_mac.get(mac)
+        match = next((item for item in items if item["mac_address"] == mac), None)
+        devices.append(
             {
-                "mac": lease.get("mac", ""),
-                "ip": lease.get("ip", ""),
-                "hostname": lease.get("hostname", ""),
+                "mac": mac,
+                "label": labels.get(mac, ""),
+                "ip": str(lease.get("ip", "")) if lease else "",
+                "hostname": str(lease.get("hostname", "")) if lease else "",
                 "current_ip": (match or {}).get("ipv4", ""),
                 "online": (match or {}).get("online", "0"),
             }
         )
+    devices.sort(key=lambda item: (ipaddress.IPv4Address(item["ip"] or "255.255.255.255"), item["mac"]))
 
     return {
         "clients": items,
         "total": len(items),
         "online": len([item for item in items if item["online"] == "1"]),
         "lan_interface": lan_interface,
-        "static_leases": bindings,
+        "devices": devices,
         "errors": errors,
     }
 
@@ -1014,6 +1072,8 @@ __all__ = [
     "load_router_config",
     "normalize_router_config",
     "save_router_config",
+    "normalize_device_labels",
+    "set_device_label",
     "validate_static_lease",
     "set_static_lease",
     "remove_static_lease",
