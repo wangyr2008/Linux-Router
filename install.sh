@@ -25,8 +25,7 @@ DNSMASQ_DIR="/etc/dnsmasq.d"
 DNSMASQ_FILE="$DNSMASQ_DIR/linux-router.conf"
 DNSMASQ_CONF="/etc/dnsmasq.conf"
 SYSCTL_FILE="/etc/sysctl.d/90-router-panel.conf"
-CONFIGURE_NETWORK=1
-NETWORK_APPLY_MODE="auto"
+MIRROR="${LINUX_ROUTER_MIRROR:-}"
 REMOTE_SOURCE_REQUESTED=0
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]:-$0}")" && pwd)"
 ACTION=""
@@ -44,13 +43,9 @@ INSTALL_SWAP_STARTED=0
 DATA_DIR_EXISTED=0
 SERVICE_USER_CREATED=0
 SERVICE_GROUP_CREATED=0
-NETWORK_APPLIED=0
-NETPLAN_GENERATED=0
 DATA_TOUCHED=0
 ORIGINAL_IP_FORWARD=""
 ORIGINAL_IPV6_FORWARD=""
-NETWORKMANAGER_WAS_ACTIVE=0
-NETWORKMANAGER_WAS_ENABLED=0
 DHCPCD_WAS_ACTIVE=0
 DHCPCD_WAS_ENABLED=0
 RESOLVED_WAS_ACTIVE=0
@@ -113,7 +108,7 @@ persist_install_state() {
     "$RESOLVED_WAS_ACTIVE" "$RESOLVED_WAS_ENABLED" \
     "$ORIGINAL_IP_FORWARD" "$ORIGINAL_IPV6_FORWARD" \
     > "$state_tmp/state.base"
-  for name in networkmanager.conf netplan.yaml sysctl.conf nftables.conf dnsmasq.conf; do
+  for name in sysctl.conf nftables.conf dnsmasq.conf; do
     if [[ -e "$ROLLBACK_DIR/$name" ]]; then
       cp -a "$ROLLBACK_DIR/$name" "$state_tmp/$name"
     else
@@ -212,8 +207,6 @@ rollback_install() {
   restore_file "/etc/systemd/system/$AGENT_SERVICE_NAME" "agent.service"
   if [[ "$ACTION" == "install" ]]; then
     restore_file "$SYSCTL_FILE" "sysctl.conf"
-    restore_file "/etc/NetworkManager/conf.d/90-linux-router.conf" "networkmanager.conf"
-    restore_file "/etc/netplan/90-linux-router.yaml" "netplan.yaml"
     restore_file "$NFTABLES_CONF" "nftables.conf"
     restore_file "$DNSMASQ_CONF" "dnsmasq.conf"
     remove_router_rule_files
@@ -221,19 +214,12 @@ rollback_install() {
 
   systemctl daemon-reload >/dev/null 2>&1 || true
   if [[ "$ACTION" == "install" ]]; then
-    if [[ "$NETPLAN_GENERATED" -eq 1 ]]; then
-      command -v netplan >/dev/null 2>&1 && netplan generate >/dev/null 2>&1 || true
-    fi
-    if [[ "$NETWORK_APPLIED" -eq 1 ]]; then
-      command -v netplan >/dev/null 2>&1 && netplan apply >/dev/null 2>&1 || true
-    fi
     if [[ -n "$ORIGINAL_IP_FORWARD" ]]; then
       sysctl -w "net.ipv4.ip_forward=$ORIGINAL_IP_FORWARD" >/dev/null 2>&1 || true
     fi
     if [[ -n "$ORIGINAL_IPV6_FORWARD" ]]; then
       sysctl -w "net.ipv6.conf.all.forwarding=$ORIGINAL_IPV6_FORWARD" >/dev/null 2>&1 || true
     fi
-    restore_service_state "NetworkManager.service" "$NETWORKMANAGER_WAS_ENABLED" "$NETWORKMANAGER_WAS_ACTIVE"
     restore_service_state "dhcpcd.service" "$DHCPCD_WAS_ENABLED" "$DHCPCD_WAS_ACTIVE"
     restore_service_state "systemd-resolved.service" "$RESOLVED_WAS_ENABLED" "$RESOLVED_WAS_ACTIVE"
     restore_service_state "dnsmasq.service" "$DNSMASQ_WAS_ENABLED" "$DNSMASQ_WAS_ACTIVE"
@@ -285,19 +271,6 @@ install_service_units() {
   fi
 }
 
-should_apply_network_now() {
-  if [[ "$NETWORK_APPLY_MODE" == "now" ]]; then
-    return 0
-  fi
-  if [[ "$NETWORK_APPLY_MODE" == "defer" ]]; then
-    return 1
-  fi
-  [[ -z "${SSH_CONNECTION:-}" ]]
-}
-
-# Bootstrap nftables: our rules live in /etc/nftables.d and are pulled in from
-# /etc/nftables.conf. Until the panel writes the real WAN/LAN rules the file only
-# contains a forwarding chain, so nothing is blocked.
 write_nftables_bootstrap() {
   install -d -m 0755 "$NFTABLES_DIR"
   if [[ ! -e "$NFTABLES_CONF" ]]; then
@@ -363,8 +336,6 @@ EOF
 }
 
 uninstall_router_panel() {
-  local netplan_changed=0
-  local networkmanager_changed=0
   local has_install_state=0
   local original_dhcpcd_active=0
   local original_dhcpcd_enabled=0
@@ -391,28 +362,32 @@ uninstall_router_panel() {
     [[ "$original_resolved_enabled" =~ ^[01]$ ]] || original_resolved_enabled=0
   fi
 
-  systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-  systemctl disable --now "$AGENT_SERVICE_NAME" >/dev/null 2>&1 || true
-  rm -f "/etc/systemd/system/$SERVICE_NAME"
-  rm -f "/etc/systemd/system/$AGENT_SERVICE_NAME"
+  # Panel services first, so nothing keeps rewriting files we are about to remove.
+  for unit in \
+    "$SERVICE_NAME" \
+    "$AGENT_SERVICE_NAME" \
+    linux-router-cake.service \
+    linux-router-cake.timer \
+    linux-router-dns.service \
+    linux-router-dns.timer \
+    linux-router-pppoe.service \
+    linux-router-pd.service; do
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/$unit"
+  done
   systemctl daemon-reload
   systemctl reset-failed "$SERVICE_NAME" "$AGENT_SERVICE_NAME" >/dev/null 2>&1 || true
 
-  systemctl disable --now linux-router-pd.service >/dev/null 2>&1 || true
-  rm -f /etc/systemd/system/linux-router-pd.service
+  rm -rf /etc/linux-router /run/linux-router
+  rm -f /etc/systemd/network/10-linux-router-wan.network \
+        /etc/systemd/network/20-linux-router-lan.network \
+        /etc/systemd/network/30-linux-router-ppp.network
+  rm -f /etc/ppp/peers/linux-router /etc/ppp/ip-up.d/90-linux-router
+  rm -f /etc/ppp/chap-secrets /etc/ppp/pap-secrets
   rm -f /usr/lib/dhcpcd/dhcpcd-hooks/99-linux-router
-  rm -rf /etc/linux-router
-  systemctl daemon-reload >/dev/null 2>&1 || true
 
   rm -f "$SYSCTL_FILE"
   if [[ "$has_install_state" -eq 1 ]]; then
-    if restore_persisted_file "/etc/NetworkManager/conf.d/90-linux-router.conf" "networkmanager.conf"; then
-      networkmanager_changed=1
-    fi
-    if restore_persisted_file "/etc/netplan/90-linux-router.yaml" "netplan.yaml"; then
-      netplan_changed=1
-      networkmanager_changed=1
-    fi
     if ! restore_persisted_file "$SYSCTL_FILE" "sysctl.conf"; then
       log "WARNING: original sysctl configuration backup is missing"
     fi
@@ -422,37 +397,22 @@ uninstall_router_panel() {
     if ! restore_persisted_file "$DNSMASQ_CONF" "dnsmasq.conf"; then
       log "WARNING: original dnsmasq.conf backup is missing"
     fi
-  else
-    if [[ -e /etc/NetworkManager/conf.d/90-linux-router.conf ]]; then
-      rm -f /etc/NetworkManager/conf.d/90-linux-router.conf
-      networkmanager_changed=1
-    fi
-    if [[ -e /etc/netplan/90-linux-router.yaml ]]; then
-      rm -f /etc/netplan/90-linux-router.yaml
-      netplan_changed=1
-      networkmanager_changed=1
-    fi
+  fi
+
+  # Applying the router config commented these out; give them back.
+  if [[ -f /etc/network/interfaces.linux-router.bak ]]; then
+    mv -f /etc/network/interfaces.linux-router.bak /etc/network/interfaces
+    log "Restored /etc/network/interfaces"
   fi
 
   remove_router_rule_files
   if command -v nft >/dev/null 2>&1; then
-    nft delete table inet lr_forward >/dev/null 2>&1 || true
-    nft delete table ip lr_nat >/dev/null 2>&1 || true
-    nft delete table ip6 lr_nat6 >/dev/null 2>&1 || true
+    for table in "inet lr_forward" "ip lr_nat" "ip6 lr_nat6" "inet lr_input"; do
+      nft delete table $table >/dev/null 2>&1 || true
+    done
   fi
 
-  if [[ "$networkmanager_changed" -eq 1 ]] && should_apply_network_now; then
-    if [[ "$netplan_changed" -eq 1 ]] && command -v netplan >/dev/null 2>&1; then
-      if ! netplan generate || ! netplan apply; then
-        log "WARNING: netplan configuration removal could not be applied automatically"
-      fi
-    fi
-    systemctl restart NetworkManager.service >/dev/null 2>&1 || true
-  elif [[ "$networkmanager_changed" -eq 1 ]]; then
-    log "Network configuration removal was not applied; apply netplan and restart NetworkManager during a maintenance window"
-  fi
-
-  if [[ "$has_install_state" -eq 1 ]] && should_apply_network_now; then
+  if [[ "$has_install_state" -eq 1 ]]; then
     if [[ -n "$original_ip_forward" ]]; then
       sysctl -w "net.ipv4.ip_forward=$original_ip_forward" >/dev/null 2>&1 || \
         log "WARNING: could not restore net.ipv4.ip_forward"
@@ -466,12 +426,9 @@ uninstall_router_panel() {
     systemctl disable --now dnsmasq.service >/dev/null 2>&1 || true
     systemctl restart nftables.service >/dev/null 2>&1 || true
     rm -rf "$DATA_DIR/.linux-router-installer" "$DATA_DIR/.linux-router-installer.previous"
-  elif [[ "$has_install_state" -eq 1 ]]; then
-    log "dhcpcd, resolved and forwarding restoration was deferred; rerun uninstall with --apply-network-now"
   fi
 
   rm -rf "$INSTALL_DIR"
-  rm -rf /run/linux-router
 
   if [[ "$PURGE_DATA" -eq 1 ]]; then
     rm -rf "$DATA_DIR"
@@ -491,7 +448,7 @@ uninstall_router_panel() {
   fi
 
   log "Linux Router has been uninstalled"
-  log "Installed apt packages and the current runtime forwarding values were left unchanged"
+  log "Installed apt packages were left unchanged"
 }
 
 cleanup() {
@@ -530,15 +487,16 @@ Options:
   --branch NAME              GitHub branch (default: main)
   --archive-url URL          Download a specific source archive instead
   --source-dir PATH          Install from a local source directory (no download)
+  --mirror PREFIX            Download through a GitHub mirror, e.g.
+                             https://ghfast.top/ (prefix + full GitHub URL)
   --install-dir PATH         Application directory (default: /opt/linux-router)
   --data-dir PATH            Persistent data directory (default: /var/lib/linux-router)
-  --no-network-config        Do not write NetworkManager or netplan configuration
-  --apply-network-now        Apply network configuration even over SSH
-  --defer-network-restart    Write network configuration without applying it now
   -h, --help                 Show this help
 
 Environment variables with the LINUX_ROUTER_ prefix can also set repo, branch,
-install directory, and data directory. The installer never reboots the system.
+mirror, install directory, and data directory. The installer never reboots the
+system and never touches your NIC configuration: the panel takes the interfaces
+over when you apply the router settings.
 EOF
 }
 
@@ -586,17 +544,11 @@ while [[ $# -gt 0 ]]; do
       DATA_DIR="${2%/}"
       shift 2
       ;;
-    --no-network-config)
-      CONFIGURE_NETWORK=0
-      shift
-      ;;
-    --apply-network-now)
-      NETWORK_APPLY_MODE="now"
-      shift
-      ;;
-    --defer-network-restart)
-      NETWORK_APPLY_MODE="defer"
-      shift
+    --mirror)
+      [[ $# -ge 2 ]] || die "--mirror requires a value"
+      MIRROR="${2%/}"
+      REMOTE_SOURCE_REQUESTED=1
+      shift 2
       ;;
     -h|--help)
       usage
@@ -610,7 +562,7 @@ done
 
 [[ -n "$ACTION" ]] || die "specify one command: install, upgrade, or uninstall"
 [[ "$PURGE_DATA" -eq 0 || "$ACTION" == "uninstall" ]] || die "--purge-data requires the uninstall command"
-[[ "$CONFIGURE_NETWORK" -eq 1 || "$ACTION" == "install" ]] || die "--no-network-config is only valid with install"
+[[ -z "$MIRROR" || "$MIRROR" =~ ^https?://[^[:space:]]+$ ]] || die "invalid mirror URL: $MIRROR"
 [[ "$BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || die "invalid GitHub branch: $BRANCH"
 [[ "$REPO_URL" =~ ^https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+(\.git)?$ ]] || die "invalid GitHub repository URL"
 
@@ -652,10 +604,6 @@ fi
 [[ -d /run/systemd/system ]] || die "systemd is required"
 command -v apt-get >/dev/null 2>&1 || die "only apt-based Debian systems are supported"
 
-if [[ "$ACTION" == "uninstall" && "$PURGE_DATA" -eq 1 ]] && ! should_apply_network_now; then
-  die "--purge-data requires --apply-network-now when network changes are deferred"
-fi
-
 if [[ "$ACTION" == "uninstall" ]]; then
   uninstall_router_panel
   INSTALL_COMMITTED=1
@@ -675,8 +623,9 @@ if [[ -n "$SOURCE_DIR" ]]; then
   BUILD_ID="local"
   log "Using local source directory $SOURCE_DIR"
 else
+  DEFAULT_ARCHIVE_URL="${REPO_URL%.git}/archive/refs/heads/$BRANCH.tar.gz"
   if [[ -z "$ARCHIVE_URL" ]]; then
-    ARCHIVE_URL="${REPO_URL%.git}/archive/refs/heads/$BRANCH.tar.gz"
+    ARCHIVE_URL="$DEFAULT_ARCHIVE_URL"
   fi
   [[ "$ARCHIVE_URL" =~ ^https:// ]] || die "archive URL must use HTTPS"
 fi
@@ -719,17 +668,28 @@ if [[ -n "$SOURCE_DIR" ]]; then
   cp -a "$SOURCE_DIR/." "$WORK_DIR/source/"
   rm -rf "$WORK_DIR/source/.git"
 else
-  log "Resolving $BRANCH branch build"
-  REPO_PATH="${REPO_URL#https://github.com/}"
-  REPO_PATH="${REPO_PATH%.git}"
-  REF_JSON="$(curl --fail --location --silent --show-error --retry 3 \
-    "https://api.github.com/repos/$REPO_PATH/git/ref/heads/$BRANCH")" || \
-    die "could not resolve branch: $BRANCH"
-  REMOTE_COMMIT="$(REF_JSON="$REF_JSON" python3 -c 'import json, os; print(json.loads(os.environ["REF_JSON"])["object"]["sha"])')" || \
-    die "could not parse branch metadata: $BRANCH"
-  [[ -n "$REMOTE_COMMIT" ]] || die "could not resolve branch: $BRANCH"
-  BUILD_ID="${REMOTE_COMMIT:0:7}"
+  if [[ -n "$MIRROR" ]]; then
+    # Mirrors only proxy file downloads, so skip the GitHub API and tag the build
+    # with the branch name instead of a commit id.
+    BUILD_ID="${BRANCH}-mirror"
+    log "Using mirror $MIRROR"
+  else
+    log "Resolving $BRANCH branch build"
+    REPO_PATH="${REPO_URL#https://github.com/}"
+    REPO_PATH="${REPO_PATH%.git}"
+    REF_JSON="$(curl --fail --location --silent --show-error --retry 3 \
+      "https://api.github.com/repos/$REPO_PATH/git/ref/heads/$BRANCH")" || \
+      die "could not resolve branch: $BRANCH"
+    REMOTE_COMMIT="$(REF_JSON="$REF_JSON" python3 -c 'import json, os; print(json.loads(os.environ["REF_JSON"])["object"]["sha"])')" || \
+      die "could not parse branch metadata: $BRANCH"
+    [[ -n "$REMOTE_COMMIT" ]] || die "could not resolve branch: $BRANCH"
+    BUILD_ID="${REMOTE_COMMIT:0:7}"
+  fi
 
+  # Prefix the plain GitHub URL with the mirror; an explicit --archive-url wins.
+  if [[ -n "$MIRROR" && "$ARCHIVE_URL" == "$DEFAULT_ARCHIVE_URL" ]]; then
+    ARCHIVE_URL="${MIRROR}${ARCHIVE_URL}"
+  fi
   log "Downloading application archive"
   WORK_DIR="$(mktemp -d /tmp/linux-router-install.XXXXXX)"
   install -d -m 0755 "$WORK_DIR/source"
@@ -868,9 +828,7 @@ systemctl restart systemd-networkd.service
 # The old stack keeps running for now: it still provides connectivity until the
 # panel writes its own .network files. Applying the router config takes the
 # interfaces over (stops NetworkManager/dhcpcd/ifupdown for those NICs).
-if [[ "$CONFIGURE_NETWORK" -eq 1 ]]; then
-  log "networkd is ready; the panel will take the NICs over when you apply"
-fi
+log "networkd is ready; the panel will take the NICs over when you apply"
 
 log "Installing systemd services"
 install_service_units
@@ -884,7 +842,7 @@ fi
 printf '\nNext step: open the panel -> 路由, pick the WAN and LAN NICs, then apply.\n'
 printf 'That writes /etc/systemd/network/*.network, /etc/dnsmasq.d/linux-router.conf\n'
 printf 'and /etc/nftables.d/90-linux-router.nft (NAT + forwarding, IPv4 and IPv6).\n'
-if [[ "$CONFIGURE_NETWORK" -eq 1 && "$NETWORK_APPLY_MODE" != "now" && -n "${SSH_CONNECTION:-}" ]]; then
+if [[ -n "${SSH_CONNECTION:-}" ]]; then
   printf '\nNetwork changes were deferred because the installer detected an SSH session.\n'
   printf 'Apply the WAN/LAN settings from the panel during a maintenance window.\n'
 fi

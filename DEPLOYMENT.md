@@ -456,18 +456,22 @@ sudo bash install.sh uninstall \
   --data-dir /home/router-panel/data
 ```
 
-默认卸载保留账号、密钥和路由配置，删除 `/etc/nftables.d/90-linux-router.nft` 与 `/etc/dnsmasq.d/linux-router.conf`，并恢复安装器记录的 `nftables.conf`、`dnsmasq.conf`、NetworkManager、netplan、sysctl、IPv4/IPv6 转发以及 `dhcpcd`、`systemd-resolved` 状态。使用 `--purge-data` 会删除全部运行数据，且不可恢复。
+默认卸载保留账号、密钥和路由配置，同时清理：
 
-通过 SSH 卸载时，网络运行状态可能被延迟恢复。确认维护窗口后，使用：
+- `router-panel` / `router-panel-agent` 及 `linux-router-cake|dns|pppoe` 的 unit
+- `/etc/systemd/network/{10,20,30}-linux-router-*.network`
+- `/etc/ppp/peers/linux-router`、`/etc/ppp/ip-up.d/90-linux-router`、`chap-secrets`、`pap-secrets`
+- `/etc/linux-router`、`/run/linux-router`
+- `nftables.d/90-linux-router.nft`、`dnsmasq.d/linux-router.conf` 与四张 `lr_*` nft 表
 
-```bash
-sudo bash install.sh uninstall \
-  --install-dir /home/router-panel \
-  --data-dir /home/router-panel/data \
-  --apply-network-now
-```
+并从安装时记录的状态恢复 `nftables.conf`、`dnsmasq.conf`、sysctl、IPv4/IPv6 转发以及
+`dhcpcd`、`systemd-resolved` 的启停状态；如果面板曾注释过 `/etc/network/interfaces`，
+会从 `interfaces.linux-router.bak` 还原。
 
-如果安装或升级在健康检查前失败，安装器会尝试恢复应用目录、数据目录、项目网络配置和服务状态。恢复后仍应检查 `systemctl`、`nmcli` 和默认路由。
+使用 `--purge-data` 会删除全部运行数据，且不可恢复。
+
+如果安装或升级在健康检查前失败，安装器会尝试恢复应用目录、数据目录、项目网络配置和服务状态。
+恢复后仍应检查 `systemctl` 与默认路由。
 
 ## 12. 开发验证
 

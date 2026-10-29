@@ -1,328 +1,268 @@
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | **简体中文**
 
 <h1>
   <img src="static/favicon.ico" alt="" width="32" height="32" align="center">
-  Linux Router（Debian 13 · 有线双栈 · nftables 版）
+  Linux Router
 </h1>
 
-把一台 x86 工控机变成纯有线双栈路由器：WAN 接光猫/上级路由，LAN 接交换机或终端，Web 控制台负责看状态、配 LAN、管 DHCP 和 IPv6。
+**把一台 x86 小主机变成纯有线、IPv4/IPv6 双栈的 Debian 路由器，带一个能用的 Web 控制台。**
 
-本分支基于 [Jaksay/Linux-Router](https://github.com/Jaksay/Linux-Router) 改造，面向 **Debian 13 最小化安装（debian-13.x.x-amd64-netinst）** 的 x86 设备，只使用系统自带或一个 `apt install` 就能装上的组件。
+面向 Debian 13 最小化安装（trixie），只用系统自带或 `apt install` 一个包就能装上的组件：
+没有无线、没有 iptables、没有 NetworkManager，转发与 NAT 全部由 nftables 承担。
 
-![Linux Router Web 管理界面](docs/assets/linux-router-web-console.png)
+![Web 控制台](docs/assets/linux-router-web-console.png)
 
-## 与上游的差异
-
-| 项目 | 上游 | 本分支 |
-| --- | --- | --- |
-| 无线 | Wi-Fi 连接、热点、AP+STA 并发、热点保活 | **全部移除**，只保留有线 |
-| 转发后端 | `iptables` + NetworkManager `ipv4.method shared` | **nftables**（Debian 13 默认），规则由面板生成 |
-| IPv6 | 无 | **双栈**：WAN 自动 SLAAC/DHCPv6，LAN 支持 **运营商 PD 自动**、ULA+NAT66 或全局前缀 |
-| DHCP/DNS | dnsmasq-base（仅热点用） | `dnsmasq` 独立服务，提供 DHCPv4、RA、DHCPv6 与 LAN DNS |
-| 依赖 | `iptables`、`iw`、`wpasupplicant`、`hostapd` 相关 | 去掉以上全部，仅保留 Flask/Gunicorn/systemd-networkd/dnsmasq/nftables/ppp |
-| 页面 | 概览 / 依赖 / 有线 / 无线 / 热点 / 工具 / 设备 / 设置 | 概览 / 依赖 / 有线 / **路由** / 设备 / 工具 / 设置 |
+> 本项目是 [Jaksay/Linux-Router](https://github.com/Jaksay/Linux-Router) 的改造分支，
+> 去掉了 Wi-Fi / 热点，换成 Debian 13 自带的 `systemd-networkd` + `nftables` + `dnsmasq`，
+> 并补齐双栈、限速、访问控制、备份等家用路由真正需要的功能。
 
 ## 功能
 
-- **系统概览**：主机、CPU、内存、磁盘、活动连接（含 IPv4/IPv6 地址）、网卡硬件信息
-- **路由页**：选择 WAN/LAN 网口，设置 LAN IPv4 网段、DHCP 地址池与租期、上游 DNS、MTU、IPv6 模式与前缀，一键应用
-- **有线页**：每块网卡的链路状态、协商速率、接口角色、IPv4/IPv6 地址、网关、DNS、配置方式
-- **设备页**：dnsmasq 租约 + 邻居表合并展示，能看到 IPv4、IPv6、MAC、租约剩余时间、在线状态
-- **依赖页**：组件、服务、网卡接管、转发与 NAT 规则的分项体检，并提供一键修复动作
-- **工具页**：Tailscale 登录辅助、服务监控、重启等
+| 页面 | 内容 |
+| --- | --- |
+| 概览 | 主机 / CPU / 内存 / 磁盘 / 运行时间、活动连接（含 IPv6）、网卡硬件信息 |
+| 路由 | WAN 连接方式（DHCP / PPPoE）、LAN 网段、DHCP 池与租期、上游 DNS、MTU、IPv6 四种模式、访问控制、一键应用 |
+| 有线 | 每块网卡的角色、链路状态、速率、IPv4/IPv6 地址、网关、DNS |
+| 设备 | DHCP 租约 + 邻居表合并；**设备备注名**、**静态地址绑定**（按 MAC 固定 IP） |
+| 依赖 | 组件 / 服务 / 转发 / NAT / DNS 体检，一键修复，可安装缺失包 |
+| 工具 | 服务监控（运行状态 + **开机自启**）、Tailscale、重启 |
+| 设置 | 管理员密码、CAKE 限速、**备份与恢复** |
+
+其他要点：
+
+- **IPv6 双栈**：WAN 自动 SLAAC/DHCPv6；LAN 支持运营商前缀委派（PD）、ULA + NAT66、静态全局前缀、关闭
+- **CAKE 限速**：按 Mbit/s 填带宽，上行直接整形、下行经 `ifb-lr` 镜像整形，抑制 bufferbloat
+- **访问控制**：开放 / 保护两档；保护模式丢弃 WAN 新入站，放行 DHCP、ICMPv6、LAN 与 Tailscale
+- **备份恢复**：导出单个 JSON（配置 + 包名清单，不含 .deb），恢复时校验白名单并按需装包
+- **零 nmcli**：网络状态全部来自 `ip -j` 与 `/sys`，面板不依赖 NetworkManager
+
+## 与上游的差异
+
+| 方面 | 上游 | 本分支 |
+| --- | --- | --- |
+| 无线 | Wi-Fi 客户端、热点、AP+STA、热点保活 | **全部移除**，仅有线 |
+| 转发 | `iptables` + NetworkManager `shared` | **nftables**，规则由面板生成 |
+| IPv6 | 不支持 | **双栈**：PD / ULA+NAT66 / 静态前缀 / 关闭 |
+| 网络栈 | NetworkManager | **systemd-networkd** + `pppd`（仅 PPPoE 拨号） |
+| DHCP/DNS | `dnsmasq-base` 仅供热点 | `dnsmasq` 作为服务：DHCPv4 + LAN DNS（IPv6 由 networkd 发 RA） |
+| 依赖 | `iptables`、`iw`、`wpasupplicant` | 以上全部去掉 |
 
 ## 系统要求
 
-- x86_64 工控机，至少两块有线网卡（WAN / LAN）
-- Debian 13（trixie）最小化安装 + systemd + apt
-- 网卡由 **systemd-networkd** 管理（Debian 自带，安装器会启用；不再需要 NetworkManager）
+- x86_64 设备，至少两个有线网口（WAN / LAN）
+- Debian 13 最小化安装（systemd + apt）
+- 建议 1 GB 内存、4 GB 磁盘
 
-安装器只会安装这些包，其余全部使用 Debian 自带组件：
+安装器会装这些包，其余全部来自系统自带：
 
 ```text
-python3 python3-flask gunicorn dnsmasq nftables iproute2 udev ppp curl tar ca-certificates
+python3 python3-flask gunicorn systemd dnsmasq nftables iproute2 udev ppp curl tar ca-certificates
 ```
 
-> 内核侧的 `nf_tables`、`nf_nat`、`nft_chain_nat` 是 Debian 内核自带模块，不需要额外安装或编译。
+内核侧的 `nf_tables`、`nf_nat`、`sch_cake`、`ifb` 都是 Debian 内核自带模块，无需编译。
 
 ## 安装
 
-方式一：从本机源码目录安装（把仓库拷到设备上，最省事）：
+### 方式一：加速脚本（国内网络推荐）
+
+`get.sh` 会依次尝试 GitHub 直连和几个公共镜像，拿到 `install.sh` 后自动用同一个镜像下载源码包：
 
 ```bash
-# 在设备上，源码目录例如 /root/Linux-Router
-sudo bash /root/Linux-Router/install.sh install --source-dir /root/Linux-Router
-
-# PPPoE 拨号所需的 ppp 包会一起装上
+curl -fsSL https://raw.githubusercontent.com/wangyr2008/Linux-Router/main/get.sh -o /tmp/lr.sh
+sudo bash /tmp/lr.sh install
 ```
 
-方式二：从 GitHub 分支安装（先把本分支推到你自己的仓库/分支）：
+如果连 `get.sh` 都拉不下来，可以手动指定镜像（或先想办法把 `get.sh` 拷进去）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你的账号>/Linux-Router/<分支>/install.sh \
-  -o /tmp/linux-router-install.sh
-sudo bash /tmp/linux-router-install.sh install
+sudo bash /tmp/lr.sh install --mirror https://ghfast.top/
+sudo bash /tmp/lr.sh --list-mirrors          # 查看内置镜像列表
 ```
 
-也可以用 `--archive-url https://.../source.tar.gz` 指定任意 HTTPS 源码包。
+### 方式二：本地源码（最稳，不依赖网络）
 
-安装器会：
+把仓库压缩包拷到设备上解开，然后：
 
-1. 安装上面列出的软件包；
-2. 部署程序到 `/opt/linux-router`，数据放在 `/var/lib/linux-router`；
-3. 创建 `router-panel` 服务账号并生成初始密码；
-4. 写入 `net.ipv4.ip_forward=1` 与 `net.ipv6.conf.all.forwarding=1`；
-5. 准备 `/etc/nftables.d/90-linux-router.nft` 与 `/etc/dnsmasq.d/linux-router.conf` 的占位文件，并确保
-   `/etc/nftables.conf`、`/etc/dnsmasq.conf` 引入了对应目录；
-6. 启用 `nftables.service`、`dnsmasq.service`、`systemd-networkd`、`systemd-resolved` 和两个面板服务；
-7. 如检测到 `systemd-resolved` 占用 53 端口，会停用并禁用（卸载时恢复）。
+```bash
+cd /root/Linux-Router
+sudo bash install.sh install --source-dir /root/Linux-Router
+```
 
-默认位置：
+安装器会自己识别脚本所在目录就是源码树，`--source-dir` 可以省略。
 
-- 程序：`/opt/linux-router`
-- 数据：`/var/lib/linux-router`
-- Web 服务：`router-panel.service`（Gunicorn，80 端口）
-- root Agent：`router-panel-agent.service`（Unix Socket `/run/linux-router/agent.sock`）
+### 方式三：指定仓库 / 分支
 
-安装完成后打开 `http://<LAN口IP或临时IP>/`，用 `admin` 和安装结束输出的密码登录。
+```bash
+sudo bash install.sh install --repo https://github.com/<你>/Linux-Router.git --branch main
+```
 
-## 首次配置：路由页
+### 安装器做了什么
 
-安装器不会猜你的网口用途，进面板后到 **路由** 页面完成一次性配置：
+- 安装依赖包，部署到 `/opt/linux-router`（数据在 `/var/lib/linux-router`），创建 `router-panel` 服务账号
+- 写入 `/etc/nftables.d/90-linux-router.nft` 与 `/etc/dnsmasq.d/linux-router.conf` 的引导配置，并确保两个 include 目录已接入主配置
+- 开启 IPv4 / IPv6 转发，启用 `nftables`、`dnsmasq`、`systemd-networkd` 和两个面板服务
+- **不碰你的网卡**：网口由面板在你点击「应用路由配置」时才接管（会停掉 NetworkManager / dhcpcd / ifupdown 对这些网口的管理）
 
-1. **WAN 连接方式**：DHCP（选接光猫/上级路由的网口）或 PPPoE（选桥接光猫的网口并填宽带账号）
-2. **LAN 局域网接口**：接交换机的网口，面板会为它创建 `linux-router-lan` 连接，地址固定为网段第一个可用地址
-3. **LAN IPv4 网段**：默认 `192.168.50.0/24`
-4. **DHCP 地址池 / 租期**：留空自动取网段后半段
-5. **IPv6 模式**：见下一节
-6. 点击 **应用路由配置**
+## 首次配置
 
-应用时会依次写入 dnsmasq 配置 → 配置 LAN 地址 → 加载 nftables 规则 → 启用转发 → 重启 dnsmasq。
-**如果改了 LAN 地址，当前页面需要用新地址重新打开。**
+浏览器打开 `http://<设备IP>/`，用安装结束打印的 `admin` 密码登录，然后进 **路由** 页：
+
+1. **WAN 连接方式**：光猫桥接选 PPPoE（填宽带账号 + 物理网口）；光猫拨号或上级路由选 DHCP
+2. **LAN 接口**：接交换机/终端的那块网卡
+3. **LAN IPv4 网段**（默认 `192.168.50.0/24`）、DHCP 池、租期
+4. **IPv6 模式**（见下）
+5. **访问控制**：见「安全」一节，从 WAN 侧管理面板时务必先填放行端口
+6. 点「应用路由配置」
+
+应用会写入 `.network`、dnsmasq 与 nftables 规则并重启相关服务。**如果改了 LAN 地址，当前页面会掉线，用新地址重开即可。**
+
+## 网络架构
+
+| 组件 | 负责 |
+| --- | --- |
+| `systemd-networkd` | WAN 的 DHCP/SLAAC、LAN 静态地址、IPv6 RA/RDNSS、DHCPv6 前缀委派 |
+| `pppd`（`linux-router-pppoe.service`） | 只做 PPPoE 会话，把 `ppp0` 建出来 |
+| `dnsmasq` | LAN 的 DHCPv4 与 DNS，只绑定 LAN 地址 |
+| `nftables` | NAT、转发、入站过滤（四张 `lr_*` 表） |
+| CAKE / `ifb-lr` | 上行整形 + 下行镜像整形 |
+
+NetworkManager、dhcpcd、ifupdown 都不再使用。
 
 ## IPv6 四种模式
 
-| 模式 | 适用场景 | LAN 前缀 | NAT66 | 说明 |
-| --- | --- | --- | --- | --- |
-| `运营商 PD 自动` | 光猫桥接、工控机自己 PPPoE 拨号 | 运营商委派的前缀里取第一个 /64 | 关 | 内网设备拿到**公网 IPv6**，可被外部访问；前缀变化自动跟随 |
-| `ULA + NAT66`（默认） | 运营商没给 IPv6，或光猫是路由模式 | 自动生成 `fdxx:xxxx:xxxx::/64` | 开 | 内网设备能出不能进 |
-| `全局前缀（纯路由）` | 已知道固定 /64，或 PD 由别处代劳 | 你填写的 `2408:...::/64` | 关 | 标准路由，前缀变了要手改 |
-| `关闭` | 只要 IPv4 | 无 | 关 | dnsmasq 不发 RA |
+| 模式 | 适用场景 | LAN 前缀 | NAT66 |
+| --- | --- | --- | --- |
+| 运营商 PD 自动 | 光猫桥接、本机 PPPoE 拨号 | 委派前缀里的第一个 /64 | 关 |
+| ULA + NAT66（默认） | 运营商不给 IPv6，或光猫是路由模式 | 自动生成 `fdxx:xxxx:xxxx::/64` | 开 |
+| 静态全局前缀 | 已有固定 /64，或 PD 由别处代劳 | 你填写的 `2408:...::/64` | 关 |
+| 关闭 | 只要 IPv4 | 无 | 关 |
 
-WAN 侧默认勾选“WAN 自动获取 IPv6”，面板会把 WAN 连接的 `ipv6.method` 设为 `auto`（SLAAC + DHCPv6）。
-PPPoE 拨号时 WAN 要选 **ppp0**（逻辑接口），不是物理网卡。
+PD 由 networkd 的 `DHCPPrefixDelegation=` 完成（systemd ≥ 250），不需要额外守护进程：
+LAN 的 `.network` 上开 `DHCPPrefixDelegation=yes` + `IPv6SendRA=yes`，前缀变化时地址和 RA 自动跟随。
+`ppp0` 上不会收到 RA，所以额外写了 `[DHCPv6] WithoutRA=solicit`。
 
-### PD 模式怎么工作
+> PD 只在光猫桥接、本机拨号时才有用。光猫路由模式下前缀在光猫手里，只能用 ULA + NAT66。
 
-前缀委派由 **systemd-networkd 自己完成**，不需要额外守护进程：
+## 安全（访问控制）
 
-```text
-WAN(ppp0) --DHCPv6-PD--> networkd --IA_PD--> 拿到 2408:...:2f00::/60
-                                              └─ LAN 的 .network 上开 DHCPPrefixDelegation=yes
-                                                 └─ 前缀内取地址 + 通过 RA 通告给内网
-```
+默认 **开放**：只做 NAT，不拦任何入站。
 
-- LAN 的 `.network` 里 `DHCPPrefixDelegation=yes` + `IPv6SendRA=yes`：networkd 在委派前缀里取一个地址，
-  并把前缀通过 RA 下发，内网设备用 SLAAC 自动生成地址
-- PPPoE 上不会收到 RA，所以 `ppp0` 的 `.network` 写了 `[DHCPv6] WithoutRA=solicit`，
-  否则 DHCPv6 客户端会一直等 RA 而不发 SOLICIT
-- **前缀变化**：运营商换前缀时 networkd 直接换地址和 RA，没有 hook、没有重启服务
-- 前缀丢了：地址随租约过期移除，RA 随之停发
+一旦 LAN 使用公网前缀（PD 或静态），**必须切到「保护」**，否则内网设备直接暴露在公网。
+保护模式新增 `inet lr_input`（`policy drop`），并把 forward 链也改成 `policy drop`，只放行：
 
-验证：
+已建立连接、ICMP/ICMPv6、`lo`、WAN 的 DHCP 应答、LAN 的 22/53/80（可加自定义）、
+`tailscale0`、以及你显式填写的 WAN TCP/UDP 端口。
 
-```bash
-networkctl status <LAN> --no-pager        # 看 Address 里有没有 2408:...::1/64
-ip -6 addr show dev <LAN> scope global
-networkctl status <WAN> --no-pager        # 看有没有 Delegated Prefix
-```
+> ⚠️ **从 WAN 侧管理面板时，先把面板端口（80）和 SSH（22）填进「WAN 放行 TCP 端口」再切保护**，
+> 否则会立刻失联。面板会拦截这种操作并提示，但请务必确认。
+>
+> 真被锁住了，用设备本地控制台执行 `nft delete table inet lr_input` 立即恢复，
+> 然后进面板改正配置（详见 DEPLOYMENT.md）。
 
-> PD 只在前缀真的能到达这台机器时才有用：光猫必须是桥接、由本机拨号。
-> 光猫路由模式下前缀在光猫手里，只能用 ULA + NAT66。
+> ⚠️ 目前**没有端口转发（DNAT）**。要让外网访问内网某台机器，需要手写 dnat 规则。
 
-#### 网络栈由谁负责
+## CAKE 限速
 
-| 组件 | 职责 |
+设置页填运营商带宽（Mbit/s），上行必填、下行可留空：
+
+| 方向 | 实现 |
 | --- | --- |
-| `systemd-networkd` | WAN 的 DHCP/SLAAC、LAN 的静态地址、IPv6 RA/RDNSS、PD |
-| `pppd`（`linux-router-pppoe.service`） | 只负责 PPPoE 会话，把 `ppp0` 建出来 |
-| `dnsmasq` | LAN 的 DHCPv4 与 DNS，只绑定 LAN 地址 |
-| `systemd-resolved` | 把 WAN 侧下发的 DNS 变成 `/etc/resolv.conf` |
-| `nftables` / CAKE | NAT、转发、入站过滤、限速 |
+| 上行 | WAN 出口 `tc qdisc ... root cake bandwidth <n>mbit` |
+| 下行 | 镜像到专用 `ifb-lr` 设备后整形 |
 
-NetworkManager、dhcpcd、ifupdown **都不再使用**。应用路由配置时会停掉它们，并把
-`/etc/network/interfaces` 里对应的网口注释掉（备份为 `interfaces.linux-router.bak`），
-否则开机时 ifup 会先一步抢走网卡。
-
-## CAKE 限速（按带宽整形）
-
-设置页可开启 CAKE，按 Mbit/s 填运营商带宽即可，用于压制缓冲膨胀（bufferbloat）：
-
-| 方向 | 实现 | 说明 |
-| --- | --- | --- |
-| 上行 | WAN 出方向 `tc qdisc ... root cake bandwidth <n>mbit` | 必填 |
-| 下行 | 专用 `ifb-lr` 设备镜像 WAN 入方向后再整形 | 可留空，留空则只处理上行 |
-
-- 生效方式：写入 `/etc/linux-router/cake.sh` + `linux-router-cake.service`，开机自动加载
-- 自愈：`linux-router-cake.timer` 每 5 分钟跑一次 `ensure`，PPPoE 重连导致设备重建后会自动补挂；
-  `ensure` 是幂等的（队列已存在就不动），不会重置统计
-- 填带宽建议为标称值的 85%~95%，填满反而容易排队
-- 修改 WAN 接口后无需单独操作，应用路由配置时会同步刷新限速
-
-手工核对：
-
-```bash
-tc qdisc show dev <WAN>        # 期望 qdisc cake ... bandwidth <上行>Mbit
-tc qdisc show dev ifb-lr       # 有下行时才有，bandwidth <下行>Mbit
-systemctl status linux-router-cake --no-pager
-```
-
-> 想临时关掉：`sh /etc/linux-router/cake.sh clear`，或在设置页取消勾选后应用。
+- 写 `/etc/linux-router/cake.sh` + `linux-router-cake.service`，开机生效
+- `linux-router-cake.timer` 每 5 分钟跑一次 `ensure`，接口重建（PPPoE 重拨、网卡重置）后自动补挂；幂等，不重置统计
+- 建议填标称带宽的 85%~95%，填满反而容易排队
 
 ## 备份与恢复
 
-设置页的「备份与恢复」可以导出一份 JSON，包含**配置**和**软件包名清单**，不含任何 .deb：
+设置页「备份与恢复」导出单个 JSON：面板配置（路由/DHCP/IPv6/防火墙/CAKE/账号/备注/绑定）、
+`/etc/systemd/network/*.network`、ppp 配置、nftables 与 dnsmasq 配置、sysctl、CAKE 与 DNS 同步脚本及其 unit，
+外加**软件包名清单**（不含 .deb）。
 
-| 内容 | 说明 |
-| --- | --- |
-| 面板配置 | 路由/DHCP/IPv6/防火墙/CAKE、账号与密码哈希、服务监控列表、Tailscale 设置 |
-| 系统配置 | `/etc/systemd/network/*.network`、`/etc/ppp/peers/linux-router`、`chap-secrets`、`pap-secrets`、`/etc/nftables.d/90-linux-router.nft`、`/etc/dnsmasq.d/linux-router.conf`、`/etc/sysctl.d/90-router-panel.conf`、`/etc/linux-router/cake.sh`、`dns.sh` 及其 unit |
-| 软件包 | 仅包名（`dnsmasq`、`nftables`、`ppp` 等） |
+恢复时会校验格式与版本、**只允许写入清单内的路径**、按原权限写回、把数据目录属主交还面板账号、
+按包名 `apt-get install` 缺失项，并按影响范围重载服务。
 
-恢复时会：
-
-1. 校验文件格式与版本，并**只允许写入备份清单内的路径**（手工改过的备份文件无法写到别处）
-2. 逐个文件按原权限写回（`chap-secrets` 等保持 0600）
-3. 把数据目录里的文件属主交还面板账号（agent 以 root 运行，不这么做面板重启会读不到 `secret_key`）
-4. 按包名清单 `apt-get install` 缺失的软件包
-5. `daemon-reload`，并按受影响范围重载 networkd / dnsmasq / nftables / CAKE / DNS 同步任务
-
-> ⚠️ 备份里有宽带账号密码和面板密码哈希，别随手丢在公共位置。
-> ⚠️ 恢复会覆盖当前配置并重载网络，建议在本地控制台或 LAN 侧操作。
-
-## 工具页
-
-- **服务监控**：除了运行状态，还会显示 `systemctl is-enabled` 的结果（开机自启 / 未自启 / 静态 / 已屏蔽），
-  未自启标黄、已屏蔽标红，一眼能看出重启后哪些服务不会自己起来。
-  - 支持 `service` / `timer` / `socket` / `target` 等 unit，省略后缀时按 `.service` 处理
-  - 默认监控 `dnsmasq`、`nftables`、`systemd-networkd`；多个服务用英文逗号分隔
-  - 面板自身的 `router-panel.service` 不允许加入（避免误操作把自己停掉）
-
-## 访问控制（入站防护）
-
-默认是「开放」：只做 NAT，不拦截任何入站连接。**在 PD / 全局前缀模式下，LAN 设备持有公网 IPv6，
-这时必须切到「保护」**，否则内网设备等于直接挂在公网上。
-
-「保护」模式会额外生成 `inet lr_input`（`policy drop`），并把 forward 链改成 `policy drop`：
-
-| 放行项 | 用途 |
-| --- | --- |
-| 已建立/相关连接、ICMP、ICMPv6 | 必须，PMTU 与邻居发现依赖它 |
-| `lo` | 本机回环（健康检查走这里） |
-| WAN `udp 68/546` | DHCPv4 / DHCPv6 客户端应答 |
-| LAN `tcp 22/53/80` + 自定义 | SSH、DNS、面板 |
-| LAN `udp 53/67/547` | DNS、DHCPv4 服务、DHCPv6 服务 |
-| `tailscale0` | Tailscale 远程管理与子网路由 |
-| WAN 自定义 TCP/UDP | 需要从外网直连本机时才填 |
-
-forward 链在保护模式下只放行 `iifname <LAN>` 与 `tailscale0`：LAN 可以出去，外部不能主动进来。
-
-> ⚠️ 如果你从 WAN 侧 SSH 管理这台机器，**先把 22 填进「WAN 放行 TCP 端口」**再切保护模式，否则会把自己关在门外。
-> ⚠️ 目前没有做端口转发（DNAT）。要让外网访问内网某台机器，需要手写 dnat 规则——需要的话可以让我加进面板。
+> 备份里有宽带账号密码和面板密码哈希，别随手丢在公共位置。
 
 ## 与 sing-box / 透明代理共存
 
-能用。这套规则与 sing-box 的 TUN / `auto_redirect` 不冲突（sing-box 只动自己创建的表），
-但下面四件事不处理，会出现“看着通了其实绕过了代理”：
+规则层面不冲突（sing-box 只动自己的表），但四点要注意，否则流量会静默绕过代理：
 
-1. **路由回环**：TUN 的 `auto_route` 会把默认路由指到 tun0，路由器自己的出站也会被卷进隧道。
-   给 outbound 加 `bind_interface: "ppp0"`（或 `inet4_bind_address`），让出站从 WAN 直接走。
-2. **IPv6 泄漏**：PD 模式下 LAN 有公网 IPv6，tun 只配 `inet4_address` 的话 IPv6 会绕过代理直连。
-   要全量代理就给 tun 加 `inet6_address` + `auto_route`；只代理 IPv4 的话，至少把访问控制留在「保护」。
-3. **DNS 归属**：LAN 设备的 DNS 是本机 dnsmasq。想让 sing-box 的分流规则生效，把面板「上游 DNS」填
-   `127.0.0.1#5353`（sing-box 的 dns listen 配 `127.0.0.1:5353`）。填了之后面板会写 `no-resolv`，
-   dnsmasq 不再叠加 `/etc/resolv.conf`，避免查询漏到运营商 DNS。
-4. **不要 `nft flush ruleset`**：sing-box 自己的规则没问题，但启动脚本里若有 `flush ruleset`，
-   会把 `lr_forward`/`lr_nat`/`lr_nat6`/`lr_input` 一起清掉，NAT 和防护立刻失效。
-   改完规则用 `systemctl reload nftables`。
+1. **路由回环**：TUN 的 `auto_route` 会把默认路由指到 tun0，路由器自身流量也被卷进去。
+   给 outbound 加 `bind_interface: "ppp0"`（或 `inet4_bind_address`）。
+2. **IPv6 泄漏**：公网前缀下，只配 `inet4_address` 的 TUN 会让 IPv6 直连。要全量代理就给 tun 加 `inet6_address`。
+3. **DNS 归属**：把面板「上游 DNS」填 `127.0.0.1#5353`（sing-box 的 dns 监听地址），
+   面板会写 `no-resolv`，dnsmasq 不再叠加 `/etc/resolv.conf`，查询不会漏到运营商。
+4. **别 `nft flush ruleset`**：会把 `lr_*` 四张表一起清掉。改完规则用 `systemctl reload nftables`。
 
-另外 sing-box 的 Clash API（默认 9090）属于 input 服务，保护模式下要访问就把它填进「LAN 放行 TCP 端口」。
+sing-box 的 Clash API（默认 9090）属于 input 服务，保护模式下要访问就填进「LAN 放行 TCP 端口」。
 
-## nftables 规则
-
-面板生成 `/etc/nftables.d/90-linux-router.nft`，由 `/etc/nftables.conf` 的
-`include "/etc/nftables.d/*.nft"` 引入，开机由 `nftables.service` 加载。内容只做两件事：
-
-```nft
-table inet lr_forward { ... }   # forward 链：放行 LAN↔WAN、LAN↔LAN、IPv6 ND/PMTU
-table ip   lr_nat    { ... }    # IPv4 masquerade（带 counter，面板可读匹配包数）
-table ip6  lr_nat6   { ... }    # IPv6 masquerade，仅 ULA 模式生成
-```
-
-- **不动 `input` 链**，避免把自己锁在门外；需要防火墙策略请自行在 `nftables.conf` 里加表
-- 表名固定为 `lr_forward` / `lr_nat` / `lr_nat6`，每次加载先 `delete` 再重建，可反复 `nft -f` 或 `systemctl reload nftables`
-- 查看当前规则：`sudo nft list ruleset`
-- 查看 NAT 计数：`sudo nft list chain ip lr_nat postrouting`
-
-## 常用排查
+## 常见问题
 
 ```bash
-# 服务
-systemctl status router-panel router-panel-agent dnsmasq nftables --no-pager
-
-# 地址与路由
-ip -br addr
-ip -6 route show default
-nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status
-nmcli connection show linux-router-lan
-
-# 转发与规则
-sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding
-nft list ruleset
+systemctl status router-panel router-panel-agent systemd-networkd dnsmasq nftables --no-pager
+networkctl list && networkctl status <网卡> --no-pager
+ip -br addr; ip -6 route show default
+cat /etc/resolv.conf
 nft list chain ip lr_nat postrouting
-
-# DHCP 租约
 cat /var/lib/misc/dnsmasq.leases
-
-# 日志
-journalctl -u dnsmasq -n 50 --no-pager
-journalctl -u router-panel-agent -n 50 --no-pager
+journalctl -u systemd-networkd -n 50 --no-pager
 ```
 
-常见问题：
+| 现象 | 排查方向 |
+| --- | --- |
+| 面板打不开 | `ss -ltnp \| grep :80`；保护模式是否放行了面板端口 |
+| 设备拿不到地址 | dnsmasq 是否运行；`linux-router.conf` 里的 LAN 接口是否正确 |
+| 有地址但上不了网 | `ip_forward`、`lr_nat` 是否有 masquerade、WAN 是否有默认路由 |
+| IPv6 不通 | IPv6 转发是否开；ULA 模式下 `lr_nat6` 是否存在 |
+| PD 拿不到前缀 | 光猫是否桥接；`networkctl status <WAN>` 有没有 Delegated Prefix |
+| 本机 DNS 失效 | `linux-router-dns.timer` 是否在跑；`systemctl start linux-router-dns.service` 手动同步 |
 
-- **LAN 设备拿不到地址**：`dnsmasq` 是否运行、`/etc/dnsmasq.d/linux-router.conf` 里的 `interface=` 是否是 LAN 网口、53 端口是否被 `systemd-resolved` 占用
-- **能拿地址但不能上网**：`ip_forward` 是否为 1、`nft list chain ip lr_nat postrouting` 是否有 masquerade 规则、WAN 是否有默认路由
-- **IPv6 不通**：确认 IPv6 转发为 1、`nft list chain ip6 lr_nat6 postrouting` 是否有规则（ULA 模式）、LAN 网卡是否拿到 `fdxx::1/64`
+更细的排障步骤见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
-## 卸载
+## 升级与卸载
 
 ```bash
-sudo bash /tmp/linux-router-install.sh uninstall            # 保留账号与路由配置
-sudo bash /tmp/linux-router-install.sh uninstall --purge-data  # 一并删除
+# 升级（只更新程序与 unit，不动网络配置和数据）
+sudo bash install.sh upgrade --source-dir /root/Linux-Router
+
+# 卸载（保留账号与路由配置）
+sudo bash install.sh uninstall
+
+# 连数据一起删
+sudo bash install.sh uninstall --purge-data
 ```
 
-卸载会删除两个服务、`/etc/nftables.d/90-linux-router.nft`、`/etc/dnsmasq.d/linux-router.conf`，
-恢复安装前的 `nftables.conf`、`dnsmasq.conf`、sysctl 配置以及
-`NetworkManager`、`dhcpcd`、`systemd-resolved` 的启停状态。
+卸载会清理面板与 `linux-router-*` 的 unit、networkd/ppp/nftables/dnsmasq 配置，
+并从安装时记录的状态恢复转发与 `dhcpcd`、`systemd-resolved` 的启停。
 
 ## 开发与测试
 
 ```bash
-# 终端一：root Agent
-sudo env LINUX_ROUTER_DATA_DIR=/var/lib/linux-router \
-  LINUX_ROUTER_AGENT_SOCKET=/run/linux-router/agent.sock python3 agent.py
-
-# 终端二：Web
-python3 app.py
-
-# 测试（不需要 root，也不依赖 nmcli/nft/dnsmasq）
-python3 -m unittest tests.test_application
+python3 -m unittest tests.test_application      # 138 个用例，不需要 root，也不需要 nft/nmcli/dnsmasq
 ```
 
-改代码后：Web/模板改动重启 `router-panel.service`；Agent/路由逻辑改动重启 `router-panel-agent.service`；
-改了 `static/style.css` 记得递增 `templates/base.html` 里的 CSS `v` 参数。
+目录结构：
 
-## 开源协议
+```text
+app.py                  Web 入口（gunicorn）
+agent.py                特权 Agent 入口（root）
+install.sh              安装 / 升级 / 卸载
+get.sh                  GitHub 加速获取脚本
+router_panel/
+  web*.py               各页面路由
+  agent_server.py       特权操作（改配置、装包、重启服务）
+  networkd.py           .network / PPPoE / DNS 同步 / 状态读取
+  routing.py            路由配置模型、dnsmasq 生成、设备与绑定
+  firewall.py           nftables 规则生成与加载
+  cake.py               CAKE 整形脚本与 unit
+  backup.py             备份与恢复
+  dependencies.py       体检项与修复动作
+templates/ static/      页面与前端资源
+tests/                  单元测试
+```
 
-GNU General Public License v3.0 or later，详见 [LICENSE](LICENSE)。本分支同样以 GPLv3 发布，修改版分发时请保留同样的授权。
+## 许可
+
+GNU General Public License v3.0 or later，见 [LICENSE](LICENSE)。
