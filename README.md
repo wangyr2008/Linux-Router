@@ -162,6 +162,22 @@ Written to `/etc/linux-router/cake.sh` plus `linux-router-cake.service` (loads a
 `linux-router-cake.timer` re-runs `ensure` every 5 minutes so a PPPoE redial that recreates the
 device re-attaches the qdisc; `ensure` is idempotent and never resets counters.
 
+## Tools page
+
+The service monitor shows both the runtime state and `systemctl is-enabled`
+(enabled / disabled / static / masked), so a unit that will not come back after a
+reboot is obvious at a glance. It accepts `service`, `timer`, `socket`, `target`
+and similar units; a bare name means `.service`. The panel's own unit cannot be
+added, to avoid stopping the page you are using.
+
+## Backup and restore
+
+Settings → 备份与恢复 exports a single JSON with the configuration and a list of
+package **names** (no `.deb` files). Restore validates the format, refuses any path
+outside the known list, writes files back with their original modes, hands the data
+directory back to the panel account, installs missing packages by name, and reloads
+only the services that were affected.
+
 ## Access control (inbound filtering)
 
 The default is **open**: NAT only, nothing is filtered. **With a delegated or static global prefix the LAN holds

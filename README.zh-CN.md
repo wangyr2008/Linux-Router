@@ -186,15 +186,16 @@ systemctl status linux-router-cake --no-pager
 | 内容 | 说明 |
 | --- | --- |
 | 面板配置 | 路由/DHCP/IPv6/防火墙/CAKE、账号与密码哈希、服务监控列表、Tailscale 设置 |
-| 系统配置 | `/etc/systemd/network/*.network`、`/etc/ppp/peers/linux-router`、`chap-secrets`、`pap-secrets`、`/etc/nftables.d/90-linux-router.nft`、`/etc/dnsmasq.d/linux-router.conf`、`/etc/sysctl.d/90-router-panel.conf`、`/etc/linux-router/cake.sh` 及其 unit |
+| 系统配置 | `/etc/systemd/network/*.network`、`/etc/ppp/peers/linux-router`、`chap-secrets`、`pap-secrets`、`/etc/nftables.d/90-linux-router.nft`、`/etc/dnsmasq.d/linux-router.conf`、`/etc/sysctl.d/90-router-panel.conf`、`/etc/linux-router/cake.sh`、`dns.sh` 及其 unit |
 | 软件包 | 仅包名（`dnsmasq`、`nftables`、`ppp` 等） |
 
 恢复时会：
 
 1. 校验文件格式与版本，并**只允许写入备份清单内的路径**（手工改过的备份文件无法写到别处）
 2. 逐个文件按原权限写回（`chap-secrets` 等保持 0600）
-3. 按包名清单 `apt-get install` 缺失的软件包
-4. `daemon-reload`，并按受影响范围重载 networkd / dnsmasq / nftables / CAKE
+3. 把数据目录里的文件属主交还面板账号（agent 以 root 运行，不这么做面板重启会读不到 `secret_key`）
+4. 按包名清单 `apt-get install` 缺失的软件包
+5. `daemon-reload`，并按受影响范围重载 networkd / dnsmasq / nftables / CAKE / DNS 同步任务
 
 > ⚠️ 备份里有宽带账号密码和面板密码哈希，别随手丢在公共位置。
 > ⚠️ 恢复会覆盖当前配置并重载网络，建议在本地控制台或 LAN 侧操作。
@@ -203,6 +204,9 @@ systemctl status linux-router-cake --no-pager
 
 - **服务监控**：除了运行状态，还会显示 `systemctl is-enabled` 的结果（开机自启 / 未自启 / 静态 / 已屏蔽），
   未自启标黄、已屏蔽标红，一眼能看出重启后哪些服务不会自己起来。
+  - 支持 `service` / `timer` / `socket` / `target` 等 unit，省略后缀时按 `.service` 处理
+  - 默认监控 `dnsmasq`、`nftables`、`systemd-networkd`；多个服务用英文逗号分隔
+  - 面板自身的 `router-panel.service` 不允许加入（避免误操作把自己停掉）
 
 ## 访问控制（入站防护）
 
