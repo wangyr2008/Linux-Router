@@ -224,7 +224,7 @@ journalctl -u systemd-networkd -n 50 --no-pager
 ## 升级与卸载
 
 ```bash
-# 升级（只更新程序与 unit，不动网络配置和数据）
+# 升级：更新程序文件与 unit，补装缺失依赖
 sudo bash install.sh upgrade --source-dir /root/Linux-Router
 
 # 卸载（保留账号与路由配置）
@@ -234,8 +234,14 @@ sudo bash install.sh uninstall
 sudo bash install.sh uninstall --purge-data
 ```
 
-卸载会清理面板与 `linux-router-*` 的 unit、networkd/ppp/nftables/dnsmasq 配置，
-并从安装时记录的状态恢复转发与 `dhcpcd`、`systemd-resolved` 的启停。
+**升级**不会碰网络配置、运行数据、`/etc/nftables.d` 与 `/etc/dnsmasq.d`：它只替换
+`/opt/linux-router` 和两个 unit，按 `dpkg` 实际状态补装缺失的依赖（都装了就连 `apt-get update` 都跳过），
+并清掉早期 dhcpcd 版本留下的 `linux-router-pd.service`、dhcpcd hook 与 `pd.json`。
+升级后如果同时更新了 networkd / PPPoE 相关代码，建议在面板里再应用一次路由配置。
+
+**卸载**会清理面板与 `linux-router-*` 的 unit、networkd / ppp / nftables / dnsmasq 配置与四张 `lr_*` 表，
+从 `interfaces.linux-router.bak` 还原 `/etc/network/interfaces`，
+并按安装时记录的状态恢复转发与 `dhcpcd`、`systemd-resolved` 的启停。
 
 ## 开发与测试
 

@@ -235,7 +235,7 @@ Detailed steps are in [DEPLOYMENT.md](DEPLOYMENT.md).
 ## Upgrade and uninstall
 
 ```bash
-# upgrade (program and units only, network config and data untouched)
+# upgrade: replace program files and units, install any missing package
 sudo bash install.sh upgrade --source-dir /root/Linux-Router
 
 # uninstall (keeps credentials and router config)
@@ -245,9 +245,17 @@ sudo bash install.sh uninstall
 sudo bash install.sh uninstall --purge-data
 ```
 
-Uninstall removes the panel and `linux-router-*` units, the networkd/ppp/nftables/dnsmasq
-configuration, and restores forwarding plus the `dhcpcd` / `systemd-resolved` states recorded
-at install time.
+**Upgrade** leaves the network configuration, runtime data, `/etc/nftables.d` and
+`/etc/dnsmasq.d` untouched: it swaps `/opt/linux-router` and the two units, installs
+whatever the package list is missing according to `dpkg` (skipping `apt-get update`
+entirely when nothing is), and removes the `linux-router-pd.service`, dhcpcd hook and
+`pd.json` left behind by the earlier dhcpcd-based build. If the upgrade also changed
+networkd or PPPoE code, re-apply the router config from the panel once.
+
+**Uninstall** removes the panel and `linux-router-*` units, the networkd / ppp / nftables /
+dnsmasq configuration and the four `lr_*` tables, restores `/etc/network/interfaces` from
+`interfaces.linux-router.bak`, and puts back forwarding plus the `dhcpcd` /
+`systemd-resolved` states recorded at install time.
 
 ## Development
 
