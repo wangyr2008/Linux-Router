@@ -1637,3 +1637,14 @@ code {
   color: var(--accent-dark);
   text-decoration: underline;
 }
+
+/* Brand mark: sized in em so it always matches the title's font size, and drawn
+   as a mask so it stays vector-sharp at any zoom / device pixel ratio. */
+.brand-title .brand-logo {
+  width: 1.1em;
+  height: 1.1em;
+}
+
+.brand-title {
+  gap: 8px;
+}

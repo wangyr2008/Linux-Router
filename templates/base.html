@@ -1,12 +1,12 @@
-{% from "macros.html" import icon %}
+{% from "macros.html" import icon, icon_scaled %}
 <!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title or app_name }}</title>
-    <link rel="icon" href="{{ url_for('static', filename='favicon.ico', v='20260720-1') }}" sizes="any">
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261029-5') }}">
+    <link rel="icon" href="{{ url_for('static', filename='favicon.ico', v='20261030-1') }}" sizes="any">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261030-1') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='responsive.css', v='20261028-1') }}">
   </head>
   <body>
@@ -23,12 +23,12 @@
     <div class="app-shell">
       <header class="mobile-topbar">
         <button type="button" class="mobile-menu-button" id="mobile-menu-button" aria-label="打开菜单" aria-controls="app-sidebar" aria-expanded="false">{{ icon("menu", 20) }}</button>
-        <a href="{{ url_for('system_info') }}" class="brand-title"><span>{{ app_name }}</span></a>
+        <a href="{{ url_for('system_info') }}" class="brand-title">{{ icon_scaled("router-logo", "brand-logo") }}<span>{{ app_name }}</span></a>
       </header>
       <aside class="sidebar" id="app-sidebar">
         <div class="sidebar-main">
           <div class="sidebar-brand-row">
-            <h1><a href="{{ url_for('system_info') }}" class="brand-title"><span>{{ app_name }}</span></a></h1>
+            <h1><a href="{{ url_for('system_info') }}" class="brand-title">{{ icon_scaled("router-logo", "brand-logo") }}<span>{{ app_name }}</span></a></h1>
             <button type="button" class="modal-close-button drawer-close-button" id="drawer-close-button" aria-label="关闭菜单">{{ icon("x", 18) }}</button>
           </div>
           <nav class="nav-links">

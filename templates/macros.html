@@ -5,3 +5,13 @@
     aria-hidden="true"
   ></span>
 {%- endmacro %}
+
+{# Same mask icon, but the size comes from CSS (e.g. 1.1em) so it scales with
+   the font size instead of being pinned to a pixel value. #}
+{% macro icon_scaled(name, class_name="") -%}
+  <span
+    class="ui-icon{% if class_name %} {{ class_name }}{% endif %}"
+    style="--icon-url: url('{{ url_for('static', filename='icons/' ~ name ~ '.svg') }}');"
+    aria-hidden="true"
+  ></span>
+{%- endmacro %}
