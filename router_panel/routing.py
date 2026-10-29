@@ -444,8 +444,8 @@ def build_dnsmasq_config(config: dict[str, Any]) -> str:
         for server in str(config["dns_upstream"]).split():
             lines.append(f"server={server}")
     else:
-        lines.append("# 上游 DNS 来自 systemd-resolved 的存根（WAN 侧 DHCP 下发）")
-        lines.append("server=127.0.0.53")
+        # 面板会把 WAN 下发的 DNS 写进 /etc/resolv.conf，dnsmasq 直接读它。
+        lines.append("# 上游 DNS 取自 /etc/resolv.conf（面板按 WAN 下发的 DNS 维护）")
 
     if config.get("dhcp_enabled"):
         lines.extend(
@@ -556,6 +556,9 @@ def apply_router_config(
     if not backend_result.ok:
         return backend_result
 
+    report("同步上游 DNS")
+    dns_result = networkd.write_resolv_conf(config)
+
     report("写入 nftables 规则")
     firewall_result = apply_ruleset(render_nftables_ruleset(config))
     if not firewall_result.ok:
@@ -588,6 +591,8 @@ def apply_router_config(
         message += f"；PD 前缀 {prefix}" if prefix else "；PD 前缀尚未下发，networkd 会自动跟随"
     if backend_result.output:
         message += f"；{backend_result.output}"
+    if dns_result.ok and dns_result.output and not dns_result.output.startswith("未获取"):
+        message += f"；{dns_result.output}"
     if not cake_result.ok:
         message += f"；CAKE 未应用：{cake_result.output}"
     elif cake_enabled(config):

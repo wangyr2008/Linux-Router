@@ -474,6 +474,8 @@ def get_dependency_rows() -> list[dict[str, Any]]:
     legacy_active = bool(legacy_services or legacy_ifupdown or instances)
     wan_legacy = wan_name in ifupdown_map or (wan_name and wan_name in instances)
     backend = networkd.get_networkd_status(config)
+    wan_dns = networkd.get_link_dns(wan_name)
+    upstream_dns = networkd.get_dns_servers()
     package_details = {
         "python3-flask": "提供网页运行框架",
         "gunicorn": "运行网页服务",
@@ -576,12 +578,20 @@ def get_dependency_rows() -> list[dict[str, Any]]:
             },
             {
                 "group": "网络接管",
-                "name": "systemd-resolved",
-                "status": "无异常" if active_resolved else "未运行",
-                "level": "ok" if active_resolved else "warning",
-                "detail": "为 WAN 侧提供 DNS；dnsmasq 只绑定 LAN 地址，不会争用 53 端口",
-                "action": "enable_resolved" if not active_resolved else "",
-                "action_label": "启用服务",
+                "name": "上游 DNS",
+                "status": "已配置" if upstream_dns else "缺失",
+                "level": "ok" if upstream_dns else "warning",
+                "detail": "面板按 WAN 下发的 DNS 维护 /etc/resolv.conf，dnsmasq 读它做上游",
+                "extra_details": (
+                    [f"/etc/resolv.conf: {', '.join(upstream_dns)}"]
+                    + (
+                        [f"WAN 学习到: {', '.join(wan_dns)}"]
+                        if wan_dns and wan_dns != upstream_dns
+                        else []
+                    )
+                ),
+                "action": "refresh_dns" if not upstream_dns else "",
+                "action_label": "重新获取",
             },
             {
                 "group": "路由转发",
@@ -767,9 +777,9 @@ def _run_dependency_action(action: str) -> CommandResult:
             return CommandResult(False, "请先在「路由」页面选择 WAN 和 LAN 接口")
         enable_service(networkd.NETWORKD_SERVICE)
         return networkd.apply_networkd(config)
-    if action == "enable_resolved":
-        enable_service("systemd-resolved.service")
-        return restart_service("systemd-resolved.service")
+    if action == "refresh_dns":
+        config = load_router_config()
+        return networkd.write_resolv_conf(config)
     if action == "apply_firewall":
         config = load_router_config()
         if not config.get("wan_interface") or not config.get("lan_interface"):

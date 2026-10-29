@@ -849,12 +849,8 @@ write_dnsmasq_bootstrap
 systemctl enable nftables.service >/dev/null
 systemctl restart nftables.service
 
-# systemd-resolved answers on 127.0.0.53 only; dnsmasq binds the LAN addresses,
-# so both can run. resolved is what turns the WAN DHCP DNS into /etc/resolv.conf.
-systemctl enable systemd-resolved.service >/dev/null 2>&1 || true
-systemctl start systemd-resolved.service >/dev/null 2>&1 || \
-  log "WARNING: systemd-resolved failed to start; DNS upstream may be missing"
-
+# /etc/resolv.conf is maintained by the panel from the WAN link's DHCP DNS, so
+# systemd-resolved is not required (a minimal Debian install does not ship it).
 systemctl enable dnsmasq.service >/dev/null
 systemctl restart dnsmasq.service || log "WARNING: dnsmasq failed to start; check journalctl -u dnsmasq"
 
