@@ -33,6 +33,8 @@ from router_panel.core import CommandResult
 EXPECTED_ROUTES = {
     "/",
     "/clients",
+    "/clients/static",
+    "/clients/static/delete",
     "/dependencies",
     "/dependencies/fix",
     "/healthz",
@@ -385,6 +387,182 @@ class ClientStatusTests(unittest.TestCase):
         unknown = next(item for item in status["clients"] if item["mac_address"] == "22:33:44:55:66:77")
         self.assertEqual(unknown["source"], "neighbor")
         self.assertEqual(unknown["ipv4"], "192.168.50.77")
+
+
+class StaticLeaseTests(unittest.TestCase):
+    def config(self, **overrides):
+        payload = {
+            "wan_interface": "ens3",
+            "lan_interface": "ens4",
+            "lan_network": "192.168.50.0/24",
+            "ipv6_mode": "off",
+        }
+        payload.update(overrides)
+        config, error = routing.normalize_router_config(payload)
+        assert error is None, error
+        return config
+
+    def test_binding_is_written_as_dhcp_host(self):
+        config, error = routing.set_static_lease(
+            self.config(), "3C:7C:3F:1A:2B:3C", "192.168.50.10", "nas"
+        )
+        self.assertIsNone(error)
+        text = routing.build_dnsmasq_config(config)
+        self.assertIn("dhcp-host=3C:7C:3F:1A:2B:3C,192.168.50.10,nas", text)
+
+    def test_binding_without_hostname_has_two_fields(self):
+        config, _ = routing.set_static_lease(self.config(), "3C:7C:3F:1A:2B:3C", "192.168.50.10")
+        self.assertIn("dhcp-host=3C:7C:3F:1A:2B:3C,192.168.50.10\n", routing.build_dnsmasq_config(config))
+
+    def test_invalid_bindings_are_rejected(self):
+        config = self.config()
+        cases = [
+            ("not-a-mac", "192.168.50.10", "MAC"),
+            ("11:22:33:44:55:66", "192.168.50.10", "MAC"),  # multicast bit set
+            ("3c:7c:3f:1a:2b:3c", "192.168.60.5", "LAN 网段"),
+            ("3c:7c:3f:1a:2b:3c", "192.168.50.1", "网关"),
+            ("3c:7c:3f:1a:2b:3c", "192.168.50.0", "网段地址"),
+            ("3c:7c:3f:1a:2b:3c", "192.168.50.255", "广播"),
+            ("3c:7c:3f:1a:2b:3c", "192.168.50.10", None),
+        ]
+        for mac, ip, expected in cases:
+            _, error = routing.validate_static_lease(config, mac, ip)
+            if expected is None:
+                self.assertIsNone(error, f"{mac} {ip}")
+            else:
+                self.assertIn(expected, error, f"{mac} {ip}")
+
+    def test_bad_hostname_is_rejected(self):
+        _, error = routing.validate_static_lease(
+            self.config(), "3c:7c:3f:1a:2b:3c", "192.168.50.10", "bad host!"
+        )
+        self.assertIn("主机名", error)
+
+    def test_same_mac_replaces_the_previous_address(self):
+        config, _ = routing.set_static_lease(self.config(), "3c:7c:3f:1a:2b:3c", "192.168.50.10")
+        config, error = routing.set_static_lease(config, "3C:7C:3F:1A:2B:3C", "192.168.50.20")
+        self.assertIsNone(error)
+        self.assertEqual(len(config["static_leases"]), 1)
+        self.assertEqual(config["static_leases"][0]["ip"], "192.168.50.20")
+
+    def test_two_macs_cannot_share_one_address(self):
+        config, _ = routing.set_static_lease(self.config(), "3c:7c:3f:1a:2b:3c", "192.168.50.10")
+        _, error = routing.set_static_lease(config, "22:33:44:55:66:77", "192.168.50.10")
+        self.assertIn("已绑定给", error)
+
+    def test_remove_binding(self):
+        config, _ = routing.set_static_lease(self.config(), "3c:7c:3f:1a:2b:3c", "192.168.50.10")
+        config, error = routing.remove_static_lease(config, "3C:7C:3F:1A:2B:3C")
+        self.assertIsNone(error)
+        self.assertEqual(config["static_leases"], [])
+        self.assertNotIn("dhcp-host", routing.build_dnsmasq_config(config))
+
+        _, error = routing.remove_static_lease(config, "3c:7c:3f:1a:2b:3c")
+        self.assertIn("没有找到", error)
+
+    def test_bindings_survive_a_router_form_round_trip(self):
+        """The router form must not wipe the list it never submits."""
+        config, _ = routing.set_static_lease(self.config(), "3c:7c:3f:1a:2b:3c", "192.168.50.10")
+        again, error = routing.normalize_router_config(
+            {"wan_interface": "ens3", "lan_interface": "ens4", "lan_network": "192.168.50.0/24"},
+            existing=config,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(again["static_leases"], config["static_leases"])
+
+    def test_client_status_marks_reserved_devices(self):
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "static-lease-status"
+        workdir.mkdir(exist_ok=True)
+        lease_file = workdir / "dnsmasq.leases"
+        lease_file.write_text("1750000000 3c:7c:3f:1a:2b:3c 192.168.50.10 nas *\n", encoding="utf-8")
+        config_file = workdir / "router.json"
+        config_file.write_text(
+            json.dumps(
+                {
+                    "wan_interface": "ens3",
+                    "lan_interface": "ens4",
+                    "lan_network": "192.168.50.0/24",
+                    "ipv6_mode": "off",
+                    "static_leases": [
+                        {"mac": "3C:7C:3F:1A:2B:3C", "ip": "192.168.50.10", "hostname": "nas"},
+                        {"mac": "22:33:44:55:66:77", "ip": "192.168.50.11", "hostname": ""},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with patch.object(routing, "DNSMASQ_LEASE_PATH", lease_file), patch.object(
+            routing, "ROUTER_CONFIG_PATH", config_file
+        ), patch.object(routing, "get_interface_neighbors", return_value=[]):
+            status = routing.gather_client_status()
+
+        nas = next(item for item in status["clients"] if item["mac_address"] == "3C:7C:3F:1A:2B:3C")
+        self.assertEqual(nas["reserved"], "1")
+        self.assertEqual(nas["static_ip"], "192.168.50.10")
+        # Offline bindings are still listed so they can be removed.
+        self.assertEqual(len(status["static_leases"]), 2)
+        offline = next(item for item in status["static_leases"] if item["mac"] == "22:33:44:55:66:77")
+        self.assertEqual(offline["current_ip"], "")
+        self.assertEqual(offline["online"], "0")
+
+    def test_apply_writes_dnsmasq_and_restarts_it(self):
+        calls = []
+
+        def fake_run(command, timeout=8, env=None):
+            calls.append(command)
+            return ok()
+
+        config, _ = routing.set_static_lease(self.config(), "3c:7c:3f:1a:2b:3c", "192.168.50.10")
+        with patch.object(routing, "command_exists", return_value=True), patch.object(
+            routing, "ensure_dnsmasq_include", return_value=ok()
+        ), patch.object(routing, "atomic_write_text"), patch.object(
+            routing, "save_router_config"
+        ) as saver, patch.object(routing, "run_command", side_effect=fake_run):
+            result = routing.apply_static_leases(config)
+
+        self.assertTrue(result.ok, result.output)
+        saver.assert_called_once()
+        flat = [" ".join(call) for call in calls]
+        self.assertTrue(any("dnsmasq --test" in item for item in flat))
+        self.assertTrue(any("restart dnsmasq.service" in item for item in flat))
+
+    def test_clients_page_renders_binding_controls(self):
+        application.app.config["TESTING"] = True
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        status = {
+            "clients": [
+                {
+                    "name": "nas", "hostname": "nas", "mac_address": "3C:7C:3F:1A:2B:3C", "duid": "",
+                    "ipv4": "192.168.50.10", "ipv6": [], "ipv6_label": "", "lease": "11h", "online": "1",
+                    "static_ip": "192.168.50.10", "reserved": "1",
+                },
+                {
+                    "name": "phone", "hostname": "", "mac_address": "22:33:44:55:66:77", "duid": "",
+                    "ipv4": "192.168.50.130", "ipv6": [], "ipv6_label": "", "lease": "5h", "online": "1",
+                    "static_ip": "", "reserved": "0",
+                },
+            ],
+            "total": 2, "online": 2, "lan_interface": "ens4",
+            "static_leases": [
+                {"mac": "3C:7C:3F:1A:2B:3C", "ip": "192.168.50.10", "hostname": "nas",
+                 "current_ip": "192.168.50.10", "online": "1"},
+            ],
+            "errors": [],
+        }
+        with patch.object(web_routing, "query_agent", return_value=status):
+            body = client.get("/clients").get_data(as_text=True)
+
+        self.assertIn("静态地址绑定", body)
+        self.assertIn('action="/clients/static"', body)
+        self.assertIn('action="/clients/static/delete"', body)
+        # Bound device shows its address, the free one gets a pre-filling link.
+        self.assertIn("固定 192.168.50.10", body)
+        self.assertIn("mac=22:33:44:55:66:77", body)
+        self.assertIn("ip=192.168.50.130", body)
 
 
 class ForwardingTests(unittest.TestCase):

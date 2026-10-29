@@ -1454,6 +1454,12 @@ code {
   min-width: 0;
 }
 
+/* `[hidden]` loses to `.login-form .field { display: grid }` on specificity, so
+   fields toggled by the WAN-mode script would stay visible without this. */
+.login-form .field[hidden] {
+  display: none;
+}
+
 .login-form .field-label {
   display: flex;
   align-items: flex-end;
@@ -1566,4 +1572,68 @@ code {
   background: var(--panel);
   color: var(--text);
   font-size: 14px;
+}
+
+/* Compact forms inside table cells (static address binding). */
+.inline-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.inline-form input[type="text"] {
+  box-sizing: border-box;
+  width: 132px;
+  height: 36px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.button-small {
+  height: 36px;
+  padding: 0 14px;
+  font-size: 13px;
+}
+
+.button-quiet {
+  background: transparent;
+  color: var(--muted);
+}
+
+.button-quiet:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.static-lease-form {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
+}
+
+/* Row-level action under the device name (static address binding). */
+.device-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.link-button:hover {
+  color: var(--accent-dark);
+  text-decoration: underline;
 }

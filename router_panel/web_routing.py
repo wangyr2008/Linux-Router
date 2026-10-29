@@ -79,7 +79,7 @@ def register_routing_routes(app, login_required, is_async_request) -> None:
     def form_flag(name: str) -> str:
         return "1" if request.form.get(name, "").strip() in {"1", "on", "true", "yes"} else "0"
 
-    def queued(operation, message: str):
+    def queued(operation, message: str, endpoint: str = "router_page"):
         if is_async_request():
             return {
                 "ok": True,
@@ -89,7 +89,7 @@ def register_routing_routes(app, login_required, is_async_request) -> None:
                 "operation_url": url_for("operation_status", operation_id=operation["id"]),
             }, 202
         flash(message, "success")
-        return redirect(url_for("router_page"))
+        return redirect(url_for(endpoint))
 
     @app.route("/router")
     @login_required
@@ -159,6 +159,36 @@ def register_routing_routes(app, login_required, is_async_request) -> None:
             return redirect(url_for("router_page"))
         return queued(operation, "路由配置正在应用")
 
+    @app.route("/clients/static", methods=["POST"])
+    @login_required
+    def client_static_set():
+        params = {
+            "mac": request.form.get("mac", "").strip(),
+            "ip": request.form.get("ip", "").strip(),
+            "hostname": request.form.get("hostname", "").strip(),
+        }
+        try:
+            operation = submit_operation("static_lease_set", params, scope="system")
+        except AgentError as exc:
+            if is_async_request():
+                return {"ok": False, "pending": False, "message": str(exc)}, 503
+            flash(str(exc), "error")
+            return redirect(url_for("clients_page"))
+        return queued(operation, "静态地址正在保存", "clients_page")
+
+    @app.route("/clients/static/delete", methods=["POST"])
+    @login_required
+    def client_static_delete():
+        params = {"mac": request.form.get("mac", "").strip()}
+        try:
+            operation = submit_operation("static_lease_delete", params, scope="system")
+        except AgentError as exc:
+            if is_async_request():
+                return {"ok": False, "pending": False, "message": str(exc)}, 503
+            flash(str(exc), "error")
+            return redirect(url_for("clients_page"))
+        return queued(operation, "正在取消固定地址", "clients_page")
+
     @app.route("/clients")
     @login_required
     def clients_page():
@@ -166,7 +196,15 @@ def register_routing_routes(app, login_required, is_async_request) -> None:
             status = client_status()
         except AgentError as exc:
             status = {"clients": [], "total": 0, "online": 0, "lan_interface": "", "errors": [str(exc)]}
-        return render_template("clients.html", status=status)
+        return render_template(
+            "clients.html",
+            status=status,
+            # The per-row "固定 IP" link pre-fills the form below the table.
+            prefill={
+                "mac": request.args.get("mac", "").strip(),
+                "ip": request.args.get("ip", "").strip(),
+            },
+        )
 
 
 __all__ = ["register_routing_routes"]

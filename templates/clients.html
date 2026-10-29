@@ -37,6 +37,18 @@
                 <td data-label="设备">
                   <strong>{{ client.name }}</strong>
                   {% if client.hostname %}<span class="client-cell-detail mono-value">{{ client.mac_address or client.duid }}</span>{% endif %}
+                  <div class="device-actions">
+                    {% if client.reserved == '1' %}
+                    <span class="status-badge status-ok mono-value">固定 {{ client.static_ip }}</span>
+                    <form action="{{ url_for('client_static_delete') }}" method="post" class="inline-form">
+                      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                      <input type="hidden" name="mac" value="{{ client.mac_address }}">
+                      <button type="submit" class="link-button">取消</button>
+                    </form>
+                    {% elif client.mac_address %}
+                    <a class="link-button" href="{{ url_for('clients_page', mac=client.mac_address, ip=client.ipv4 or '') }}">固定 IP</a>
+                    {% endif %}
+                  </div>
                 </td>
                 <td class="mono-value" data-label="IPv4">{{ client.ipv4 or '无' }}</td>
                 <td class="mono-value" data-label="IPv6">{{ client.ipv6_label or '无' }}</td>
@@ -58,6 +70,74 @@
       <p class="muted">LAN 接口上没有读取到 DHCP 租约或邻居表记录。设备接入并获取地址后会显示在这里。</p>
     </article>
     {% endif %}
+
+    <article class="card card-wide">
+      <h3 class="card-title">{{ icon("link") }}<span>静态地址绑定</span></h3>
+      <p class="muted form-hint">
+        按 MAC 固定 IP，写入 dnsmasq 的 <code>dhcp-host</code>。设备下次续租或重新连接后生效；
+        建议选在 DHCP 动态范围之外的地址，便于识别。
+      </p>
+
+      {% if status.static_leases %}
+      <div class="table-scroll">
+        <table class="table responsive-detail-table">
+          <thead>
+            <tr>
+              <th>MAC</th>
+              <th>固定 IP</th>
+              <th>主机名</th>
+              <th>当前地址</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for lease in status.static_leases %}
+            <tr>
+              <td class="mono-value" data-label="MAC">{{ lease.mac }}</td>
+              <td class="mono-value" data-label="固定 IP">{{ lease.ip }}</td>
+              <td data-label="主机名">{{ lease.hostname or '—' }}</td>
+              <td class="mono-value" data-label="当前地址">{{ lease.current_ip or '未上线' }}</td>
+              <td data-label="操作">
+                <form action="{{ url_for('client_static_delete') }}" method="post" class="inline-form">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                  <input type="hidden" name="mac" value="{{ lease.mac }}">
+                  <button type="submit" class="button-small button-quiet">取消绑定</button>
+                </form>
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}
+      <p class="muted">还没有绑定。可以点上方设备行的「固定」按钮，或在下面手动添加。</p>
+      {% endif %}
+
+      <form action="{{ url_for('client_static_set') }}" method="post" class="login-form static-lease-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="form-grid">
+          <label class="field">
+            <span class="field-label">MAC 地址</span>
+            <input type="text" class="mono-value" name="mac" value="{{ prefill.mac }}" placeholder="aa:bb:cc:dd:ee:ff" required>
+            <span class="field-hint">设备当前的 MAC，可在上表复制</span>
+          </label>
+          <label class="field">
+            <span class="field-label">固定 IP</span>
+            <input type="text" class="mono-value" name="ip" value="{{ prefill.ip }}" placeholder="192.168.50.10" required>
+            <span class="field-hint">必须在 LAN 网段内，且不能是网关</span>
+          </label>
+          <label class="field">
+            <span class="field-label">主机名（可选）</span>
+            <input type="text" name="hostname" placeholder="nas">
+            <span class="field-hint">填了会同时下发给设备</span>
+          </label>
+        </div>
+        <div class="form-footer">
+          <p class="muted form-hint">离线设备也能预先绑定，接入后即按固定地址下发。</p>
+          <button type="submit">添加绑定</button>
+        </div>
+      </form>
+    </article>
   </div>
 
   <div class="card-slot">

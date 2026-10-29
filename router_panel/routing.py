@@ -89,6 +89,8 @@ DEFAULT_ROUTER_CONFIG: dict[str, Any] = {
     "cake_enabled": False,
     "cake_upload_mbit": 0,
     "cake_download_mbit": 0,
+    # [{"mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.50.10", "hostname": "nas"}]
+    "static_leases": [],
 }
 
 
@@ -337,6 +339,15 @@ def normalize_router_config(
         }
     )
 
+    # Bindings have their own endpoint instead of this form, so carry them over
+    # from the loaded config rather than falling back to the default empty list.
+    raw_leases = payload.get("static_leases", base.get("static_leases", []))
+    config["static_leases"] = (
+        [item for item in raw_leases if isinstance(item, dict)]
+        if isinstance(raw_leases, list)
+        else []
+    )
+
     if config["dhcp_enabled"]:
         start, end = _dhcp_range(config)
         try:
@@ -455,6 +466,14 @@ def build_dnsmasq_config(config: dict[str, Any]) -> str:
                 f"dhcp-option=option:dns-server,{gateway}",
             ]
         )
+        leases = config.get("static_leases") or []
+        if leases:
+            lines.append("# 静态地址绑定（MAC → 固定 IP）")
+            for lease in leases:
+                entry = f"dhcp-host={lease.get('mac', '')},{lease.get('ip', '')}"
+                if lease.get("hostname"):
+                    entry += f",{lease['hostname']}"
+                lines.append(entry)
 
     return "\n".join(lines) + "\n"
 
@@ -772,6 +791,104 @@ def gather_router_status() -> dict[str, Any]:
     }
 
 
+HOSTNAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _static_leases(config: dict[str, Any]) -> list[dict[str, str]]:
+    raw = config.get("static_leases")
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def validate_static_lease(
+    config: dict[str, Any], mac: str, ip: str, hostname: str = ""
+) -> tuple[dict[str, str] | None, str | None]:
+    """Check one binding before it reaches dnsmasq.
+
+    dnsmasq silently ignores a bad ``dhcp-host`` line, so a typo would look like
+    "the setting did nothing" instead of an error.
+    """
+    normalized_mac = normalize_mac_address(str(mac or ""))
+    if not normalized_mac:
+        return None, "MAC 地址格式无效（应形如 aa:bb:cc:dd:ee:ff）"
+
+    try:
+        address = ipaddress.IPv4Address(str(ip or "").strip())
+    except ValueError:
+        return None, "IP 地址格式无效"
+
+    network = _lan_ipv4_network(config)
+    if address not in network:
+        return None, f"IP 必须落在 LAN 网段 {network} 内"
+    if address == network.network_address:
+        return None, "不能使用网段地址"
+    if address == network.broadcast_address:
+        return None, "不能使用广播地址"
+    if address == lan_gateway_ipv4(config):
+        return None, "该地址是本机网关，请换一个"
+
+    name = str(hostname or "").strip()
+    if name and not HOSTNAME_RE.fullmatch(name):
+        return None, "主机名只能包含字母、数字和短横线，且不超过 63 个字符"
+
+    for lease in _static_leases(config):
+        if lease.get("ip") == str(address) and lease.get("mac") != normalized_mac:
+            return None, f"{address} 已绑定给 {lease.get('mac')}"
+    return {"mac": normalized_mac, "ip": str(address), "hostname": name}, None
+
+
+def set_static_lease(
+    config: dict[str, Any], mac: str, ip: str, hostname: str = ""
+) -> tuple[dict[str, Any], str | None]:
+    entry, error = validate_static_lease(config, mac, ip, hostname)
+    if error:
+        return config, error
+
+    updated = dict(config)
+    leases = [lease for lease in _static_leases(config) if lease.get("mac") != entry["mac"]]
+    leases.append(entry)
+    leases.sort(key=lambda item: ipaddress.IPv4Address(item.get("ip", "0.0.0.0")))
+    updated["static_leases"] = leases
+    return updated, None
+
+
+def remove_static_lease(config: dict[str, Any], mac: str) -> tuple[dict[str, Any], str | None]:
+    normalized_mac = normalize_mac_address(str(mac or ""))
+    if not normalized_mac:
+        return config, "MAC 地址格式无效"
+    updated = dict(config)
+    remaining = [lease for lease in _static_leases(config) if lease.get("mac") != normalized_mac]
+    if len(remaining) == len(_static_leases(config)):
+        return config, "没有找到这条绑定"
+    updated["static_leases"] = remaining
+    return updated, None
+
+
+def apply_static_leases(config: dict[str, Any]) -> CommandResult:
+    """Persist the bindings and reload dnsmasq so they take effect immediately."""
+    save_router_config(config)
+    if not command_exists("dnsmasq"):
+        return CommandResult(True, "已保存，但系统缺少 dnsmasq，配置暂未加载")
+
+    include = ensure_dnsmasq_include()
+    if not include.ok:
+        return include
+    try:
+        atomic_write_text(DNSMASQ_RULESET_PATH, build_dnsmasq_config(config), mode=0o644)
+    except OSError as exc:
+        return CommandResult(False, f"写入 dnsmasq 配置失败：{exc}")
+
+    tested = run_command(["dnsmasq", "--test", f"--conf-file={DNSMASQ_RULESET_PATH}"], timeout=15)
+    if not tested.ok:
+        return CommandResult(False, f"dnsmasq 配置校验失败：{tested.output or '未知错误'}")
+
+    restarted = run_command(["systemctl", "restart", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
+    if not restarted.ok:
+        return CommandResult(False, f"重启 dnsmasq 失败：{restarted.output or '未知错误'}")
+    return CommandResult(True, "静态地址绑定已生效")
+
+
 def gather_client_status() -> dict[str, Any]:
     config = load_router_config()
     lan_interface = str(config.get("lan_interface", "") or "")
@@ -845,11 +962,31 @@ def gather_client_status() -> dict[str, Any]:
         items.append(client)
     items.sort(key=lambda item: (item["ipv4"] == "", item["ipv4"] or item["ipv6_label"], item["name"]))
 
+    by_mac = {lease["mac"]: lease for lease in _static_leases(config)}
+    for item in items:
+        lease = by_mac.get(item["mac_address"])
+        item["static_ip"] = str(lease.get("ip", "")) if lease else ""
+        item["reserved"] = "1" if lease else "0"
+
+    bindings = []
+    for lease in _static_leases(config):
+        match = next((item for item in items if item["mac_address"] == lease.get("mac")), None)
+        bindings.append(
+            {
+                "mac": lease.get("mac", ""),
+                "ip": lease.get("ip", ""),
+                "hostname": lease.get("hostname", ""),
+                "current_ip": (match or {}).get("ipv4", ""),
+                "online": (match or {}).get("online", "0"),
+            }
+        )
+
     return {
         "clients": items,
         "total": len(items),
         "online": len([item for item in items if item["online"] == "1"]),
         "lan_interface": lan_interface,
+        "static_leases": bindings,
         "errors": errors,
     }
 
@@ -877,4 +1014,8 @@ __all__ = [
     "load_router_config",
     "normalize_router_config",
     "save_router_config",
+    "validate_static_lease",
+    "set_static_lease",
+    "remove_static_lease",
+    "apply_static_leases",
 ]

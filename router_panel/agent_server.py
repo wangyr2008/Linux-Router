@@ -25,6 +25,9 @@ from .dependencies import gather_dependency_status, run_dependency_action
 from .network import gather_wired_network_info, list_all_interfaces
 from .routing import (
     apply_router_config,
+    apply_static_leases,
+    remove_static_lease,
+    set_static_lease,
     gather_client_status,
     gather_router_status,
     load_router_config,
@@ -235,6 +238,29 @@ def _execute_cake_apply(params: dict[str, Any]) -> dict[str, Any]:
     return _result(result, result.output or "CAKE 限速已应用", "应用 CAKE 限速失败")
 
 
+def _execute_static_lease_set(params: dict[str, Any]) -> dict[str, Any]:
+    mac = _require_string(params, "mac", maximum=32)
+    ip = _require_string(params, "ip", maximum=64)
+    hostname = str(params.get("hostname", "") or "").strip()[:63]
+
+    config = load_router_config()
+    updated, error = set_static_lease(config, mac, ip, hostname)
+    if error:
+        raise ValidationError(error)
+    result = apply_static_leases(updated)
+    return _result(result, f"{mac} 已固定到 {ip}", "保存静态地址失败")
+
+
+def _execute_static_lease_delete(params: dict[str, Any]) -> dict[str, Any]:
+    mac = _require_string(params, "mac", maximum=32)
+    config = load_router_config()
+    updated, error = remove_static_lease(config, mac)
+    if error:
+        raise ValidationError(error)
+    result = apply_static_leases(updated)
+    return _result(result, f"已取消 {mac} 的固定地址", "取消静态地址失败")
+
+
 def _execute_backup_restore(params: dict[str, Any]) -> dict[str, Any]:
     raw_path = _require_string(params, "path", maximum=512)
     path = Path(raw_path).resolve()
@@ -293,6 +319,8 @@ OPERATIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "router_apply": _execute_router_apply,
     "cake_apply": _execute_cake_apply,
     "backup_restore": _execute_backup_restore,
+    "static_lease_set": _execute_static_lease_set,
+    "static_lease_delete": _execute_static_lease_delete,
     "dependency_fix": _execute_dependency,
     "system_reboot": _execute_reboot,
     "tailscale_login": _execute_tailscale_login,

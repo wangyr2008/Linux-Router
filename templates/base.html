@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title or app_name }}</title>
     <link rel="icon" href="{{ url_for('static', filename='favicon.ico', v='20260720-1') }}" sizes="any">
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261029-2') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261029-5') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='responsive.css', v='20261028-1') }}">
   </head>
   <body>
@@ -57,7 +57,7 @@
     {% else %}
       {% block auth_content %}{% endblock %}
     {% endif %}
-    <script src="{{ url_for('static', filename='router-common.js', v='20260718-3') }}"></script>
+    <script src="{{ url_for('static', filename='router-common.js', v='20261029-3') }}"></script>
     <script>
       (() => {
         const stack = document.getElementById("global-toast-stack");
