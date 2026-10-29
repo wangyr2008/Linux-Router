@@ -1645,6 +1645,20 @@ class ServiceEnabledTests(unittest.TestCase):
         self.assertEqual(state["enabled_level"], "error")
         self.assertEqual(state["level"], "error")
 
+    def test_timer_and_socket_units_are_accepted(self):
+        """Timers are exactly where is-enabled matters; they used to show 未知."""
+        self.assertEqual(
+            service_monitor.normalize_service_name("linux-router-cake.timer"),
+            ("linux-router-cake.timer", None),
+        )
+        self.assertEqual(
+            service_monitor.normalize_service_name("sshd.socket"), ("sshd.socket", None)
+        )
+        # A bare name still means .service, and the panel's own unit stays off limits.
+        self.assertEqual(service_monitor.normalize_service_name("nginx")[0], "nginx.service")
+        self.assertIn("面板自身", service_monitor.normalize_service_name("router-panel")[1])
+        self.assertIn("无效", service_monitor.normalize_service_name("bad name!")[1])
+
     def test_tools_page_renders_enabled_column(self):
         application.app.config["TESTING"] = True
         client = application.app.test_client()

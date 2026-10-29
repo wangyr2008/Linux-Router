@@ -8,7 +8,15 @@ from .core import DATA_DIR, CommandResult, atomic_write_text, run_command
 
 
 SERVICE_MONITOR_CONFIG_PATH = DATA_DIR / "service-monitor.json"
-DEFAULT_SERVICE_MONITOR_CONFIG = {"services": []}
+# Units every router needs; users can add more from the tools page.
+DEFAULT_SERVICE_MONITOR_CONFIG = {
+    "services": ["dnsmasq.service", "nftables.service", "systemd-networkd.service"]
+}
+
+
+def default_service_monitor_config() -> dict[str, Any]:
+    """A fresh copy: `.copy()` would share the services list between callers."""
+    return {"services": list(DEFAULT_SERVICE_MONITOR_CONFIG["services"])}
 SERVICE_ACTIONS = {"start", "stop", "restart"}
 # `systemctl is-enabled` answers. "static"/"indirect"/"generated" mean the unit has
 # no [Install] section, so there is nothing to enable rather than a problem.
@@ -27,7 +35,24 @@ ENABLED_LABELS = {
 }
 ENABLED_OK = {"enabled", "static", "indirect", "generated", "alias", "linked"}
 ENABLED_WARNING = {"disabled", "enabled-runtime"}
-SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,128}\.service$")
+# Timers/sockets are worth watching too: `is-enabled` is exactly what tells you
+# whether a periodic job survives a reboot.
+UNIT_SUFFIXES = (
+    "service",
+    "socket",
+    "timer",
+    "target",
+    "mount",
+    "automount",
+    "path",
+    "slice",
+    "scope",
+    "swap",
+    "device",
+)
+SERVICE_NAME_RE = re.compile(
+    r"^[A-Za-z0-9_.@-]{1,128}\.(?:" + "|".join(UNIT_SUFFIXES) + r")$"
+)
 PROTECTED_SERVICE_NAMES = {
     "router-panel.service",
     "router-panel-agent.service",
@@ -66,7 +91,7 @@ def normalize_service_list(value: str | list[Any]) -> tuple[list[str], str | Non
 def normalize_service_monitor_config(payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     services, error = normalize_service_list(payload.get("services", []))
     if error:
-        return DEFAULT_SERVICE_MONITOR_CONFIG.copy(), error
+        return default_service_monitor_config(), error
     return {"services": services}, None
 
 
@@ -74,11 +99,11 @@ def load_service_monitor_config() -> dict[str, Any]:
     try:
         payload = json.loads(SERVICE_MONITOR_CONFIG_PATH.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return DEFAULT_SERVICE_MONITOR_CONFIG.copy()
+        return default_service_monitor_config()
     if not isinstance(payload, dict):
-        return DEFAULT_SERVICE_MONITOR_CONFIG.copy()
+        return default_service_monitor_config()
     config, error = normalize_service_monitor_config(payload)
-    return DEFAULT_SERVICE_MONITOR_CONFIG.copy() if error else config
+    return default_service_monitor_config() if error else config
 
 
 def save_service_monitor_config(config: dict[str, Any]) -> None:
@@ -146,6 +171,7 @@ def run_service_action(service: str, action: str) -> CommandResult:
 
 __all__ = [
     "DEFAULT_SERVICE_MONITOR_CONFIG",
+    "default_service_monitor_config",
     "ENABLED_LABELS",
     "SERVICE_MONITOR_CONFIG_PATH",
     "gather_service_monitor_status",
