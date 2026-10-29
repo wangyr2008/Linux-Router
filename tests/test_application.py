@@ -850,6 +850,41 @@ class AccessControlTests(unittest.TestCase):
         self.assertIn("no-resolv", text)
         self.assertIn("server=127.0.0.1#5353", text)
 
+    def test_lockout_guard_blocks_wan_side_apply(self):
+        """Turning protect on from the WAN without allowing the panel port locks you out."""
+        params = {"firewall_mode": "protect", "firewall_wan_tcp": ""}
+        with application.app.test_request_context(
+            environ_base={"REMOTE_ADDR": "192.168.9.11", "SERVER_PORT": "80"}
+        ), patch.object(web_routing, "load_router_config", return_value={"lan_network": "192.168.50.0/24"}):
+            warning = web_routing.lockout_warning(params)
+
+        self.assertIn("WAN 侧", warning)
+        self.assertIn("80", warning)
+
+    def test_lockout_guard_allows_when_panel_port_is_open(self):
+        for allowed in ("22,80", "70-90"):
+            params = {"firewall_mode": "protect", "firewall_wan_tcp": allowed}
+            with application.app.test_request_context(
+                environ_base={"REMOTE_ADDR": "192.168.9.11", "SERVER_PORT": "80"}
+            ), patch.object(
+                web_routing, "load_router_config", return_value={"lan_network": "192.168.50.0/24"}
+            ):
+                self.assertEqual(web_routing.lockout_warning(params), "", allowed)
+
+    def test_lockout_guard_is_quiet_on_the_lan_side(self):
+        params = {"firewall_mode": "protect", "firewall_wan_tcp": ""}
+        with application.app.test_request_context(
+            environ_base={"REMOTE_ADDR": "192.168.50.23", "SERVER_PORT": "80"}
+        ), patch.object(web_routing, "load_router_config", return_value={"lan_network": "192.168.50.0/24"}):
+            self.assertEqual(web_routing.lockout_warning(params), "")
+
+    def test_lockout_guard_ignores_open_mode(self):
+        params = {"firewall_mode": "open", "firewall_wan_tcp": ""}
+        with application.app.test_request_context(
+            environ_base={"REMOTE_ADDR": "192.168.9.11", "SERVER_PORT": "80"}
+        ), patch.object(web_routing, "load_router_config", return_value={"lan_network": "192.168.50.0/24"}):
+            self.assertEqual(web_routing.lockout_warning(params), "")
+
     def test_dependency_row_warns_when_public_ipv6_is_unfiltered(self):
         config = self.config()  # pd + open
         with patch.object(dependencies, "load_router_config", return_value=config), patch.object(

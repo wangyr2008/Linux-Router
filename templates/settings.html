@@ -1,6 +1,6 @@
 {% from "macros.html" import icon %}
 {% extends "base.html" %}
-{% set title = "系统设置 - Linux Router" %}
+{% set title = "系统设置 - " ~ app_name %}
 {% block content %}
 <section class="page-header">
   <h2 class="section-title"><span>设置</span></h2>
@@ -150,13 +150,13 @@
     <span>Build {{ build_info.build }}</span>
     <span aria-hidden="true">·</span>
     <a
-      href="https://github.com/Jaksay/Linux-Router"
+      href="{{ project_url }}"
       target="_blank"
       rel="noopener noreferrer"
       class="settings-footer-link"
     >
       {{ icon("github", 14, "settings-footer-icon") }}
-      <span>GitHub</span>
+      <span>{{ project_url | replace("https://github.com/", "") }}</span>
     </a>
   </p>
 </footer>

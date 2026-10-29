@@ -448,30 +448,11 @@ def get_dependency_rows() -> list[dict[str, Any]]:
     native_ipv6 = str(config.get("ipv6_mode", "")) in {IPV6_MODE_PD, "static"}
     wan_mode = str(config.get("wan_mode", networkd.WAN_MODE_DHCP) or networkd.WAN_MODE_DHCP)
 
-    # Anything from the previous stack that is still running will fight networkd.
     wan_name = str(config.get("wan_interface", "") or "")
-    lan_name = str(config.get("lan_interface", "") or "")
+    # Only the WAN is checked now: a fresh Debian 13 box has no NetworkManager,
+    # dhcpcd or ifupdown at all, so a "legacy stack" row was pure noise.
     ifupdown_map = ifupdown_managed_interfaces()
     instances = dhcpcd_instances()
-    legacy_services = [
-        name
-        for name, active in (
-            ("NetworkManager.service", is_service_active("NetworkManager.service")),
-            ("dhcpcd.service", is_service_active("dhcpcd.service")),
-        )
-        if active
-    ]
-    legacy_ifupdown = sorted(
-        name for name in ifupdown_map if name in {wan_name, lan_name, str(config.get("pppoe_nic", ""))}
-    )
-    legacy_details = [f"服务仍在运行：{name}" for name in legacy_services]
-    legacy_details.extend(
-        f"/etc/network/interfaces 仍在配置 {name}（{ifupdown_map[name]}）" for name in legacy_ifupdown
-    )
-    legacy_details.extend(
-        f"{name}: dhcpcd PID {pid}" for name, pid in sorted(instances.items()) if name != "pid"
-    )
-    legacy_active = bool(legacy_services or legacy_ifupdown or instances)
     wan_legacy = wan_name in ifupdown_map or (wan_name and wan_name in instances)
     backend = networkd.get_networkd_status(config)
     wan_dns = networkd.get_link_dns(wan_name)
@@ -549,16 +530,6 @@ def get_dependency_rows() -> list[dict[str, Any]]:
                 "detail": "提供路由管理面板",
                 "action": "enable_router_panel_service" if not enabled_panel else "",
                 "action_label": "设为开机自启",
-            },
-            {
-                "group": "网络接管",
-                "name": "遗留网络栈",
-                "status": "有残留" if legacy_active else "无残留",
-                "level": "error" if legacy_active else "ok",
-                "detail": "NetworkManager / dhcpcd / ifupdown 不应再管理这些网卡",
-                "extra_details": legacy_details,
-                "action": "switch_to_networkd" if legacy_active else "",
-                "action_label": "切换到 networkd",
             },
             {
                 "group": "网络接管",

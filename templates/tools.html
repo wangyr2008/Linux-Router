@@ -1,6 +1,6 @@
 {% from "macros.html" import icon %}
 {% extends "base.html" %}
-{% set title = "工具 - Linux Router" %}
+{% set title = "工具 - " ~ app_name %}
 {% block content %}
 <section class="page-header">
   <h2 class="section-title"><span>工具</span></h2>
@@ -308,7 +308,7 @@
     const writeLoginFailurePage = (loginWindow) => {
       writeLoginStatusPage(loginWindow, {
         title: "登录请求失败",
-        message: "请回到 Linux Router 页面查看错误",
+        message: "请回到 {{ app_name }} 页面查看错误",
         variant: "failure",
       });
     };

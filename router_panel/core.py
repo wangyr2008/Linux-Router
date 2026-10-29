@@ -33,6 +33,12 @@ LAN_CONNECTION_NAME = "linux-router-lan"
 NETWORKMANAGER_CONFIG_PATH = Path("/etc/NetworkManager/NetworkManager.conf")
 NETWORKMANAGER_CONF_DIR = Path("/etc/NetworkManager/conf.d")
 NETPLAN_DIR = Path("/etc/netplan")
+# Display name and project link. Renaming the project only needs these two lines
+# changed; the service names and paths (linux-router-*) stay for upgrade safety.
+APP_NAME = "Linux Router"
+APP_TAGLINE = "Debian 13 有线路由面板"
+PROJECT_URL = "https://github.com/wangyr2008/Linux-Router"
+
 # The panel service account. Data files must stay readable by it, but the agent
 # runs as root, so anything it writes into DATA_DIR needs its owner reset.
 SERVICE_USER = "router-panel"
@@ -755,6 +761,9 @@ __all__ = [
     "NETWORKMANAGER_CONFIG_PATH",
     "NETWORKMANAGER_CONF_DIR",
     "NETPLAN_DIR",
+    "APP_NAME",
+    "APP_TAGLINE",
+    "PROJECT_URL",
     "SERVICE_USER",
     "chown_service_user",
     "IFUPDOWN_INTERFACES_PATH",

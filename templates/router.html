@@ -1,6 +1,6 @@
 {% from "macros.html" import icon %}
 {% extends "base.html" %}
-{% set title = "路由 - Linux Router" %}
+{% set title = "路由 - " ~ app_name %}
 {% block content %}
 {% set wan = status.wan or {} %}
 {% set lan = status.lan or {} %}
@@ -339,7 +339,7 @@
         <label class="field">
           <span class="field-label">WAN 放行 TCP 端口</span>
           <input type="text" class="mono-value" name="firewall_wan_tcp" value="{{ config.firewall_wan_tcp }}" placeholder="留空即全部拒绝">
-          <span class="field-hint">需要外网直连本机服务时才填</span>
+          <span class="field-hint">从 WAN 侧访问面板必须填面板端口（通常 80），用 SSH 管理再加 22</span>
         </label>
         <label class="field">
           <span class="field-label">WAN 放行 UDP 端口</span>

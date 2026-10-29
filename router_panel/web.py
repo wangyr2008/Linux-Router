@@ -7,7 +7,7 @@ from typing import Any
 from flask import abort, redirect, render_template, request, session, url_for
 
 from .agent_client import AgentError, get_operation, query_agent
-from .core import PASSWORD_HINT_PATH, get_build_info
+from .core import APP_NAME, APP_TAGLINE, PASSWORD_HINT_PATH, PROJECT_URL, get_build_info
 from .web_general import register_general_routes
 from .web_routing import register_routing_routes
 from .web_tools import register_tools_routes
@@ -87,6 +87,10 @@ def register_routes(app) -> None:
             "initial_password_file": str(PASSWORD_HINT_PATH),
             "build_info": get_build_info(),
             "csrf_token": get_csrf_token(),
+            # One place to rename the product: templates never hardcode it.
+            "app_name": APP_NAME,
+            "app_tagline": APP_TAGLINE,
+            "project_url": PROJECT_URL,
         }
 
     register_general_routes(app, login_required, is_async_request)

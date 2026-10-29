@@ -374,6 +374,38 @@ nmcli -g ipv4.addresses,ipv4.never-default connection show linux-router-lan
 
 如果面板“依赖”页提示 NAT 规则未加载，点“重新加载规则”即可（等价于 `nft -f /etc/nftables.d/90-linux-router.nft`）。
 
+### 被访问控制锁在外面（面板和 SSH 都连不上）
+
+「保护」模式会丢弃所有来自 WAN 的新入站连接。如果你从 WAN 侧访问面板、又没把面板端口
+（和 SSH 的 22）填进「WAN 放行 TCP 端口」，应用之后就会立刻失联。已经建立的连接不受影响，
+所以正在进行的 SSH 会话可能还活着。
+
+在设备本地控制台（或 iKuai/Proxmox 的 VM 控制台）执行，立即恢复访问：
+
+```bash
+nft delete table inet lr_input
+```
+
+这条只删运行时的表，`/etc/nftables.d/90-linux-router.nft` 里仍是保护模式，**重载或重启会再次生效**。
+所以恢复访问后立刻用浏览器进面板，把「访问控制」改回「开放」，或保持「保护」但把
+面板端口与 22 填进「WAN 放行 TCP 端口」，再应用一次。
+
+不想开浏览器时，也可以用面板自己的代码重写规则（改配置 + 立即加载，一次到位）：
+
+```bash
+cd /opt/linux-router && LINUX_ROUTER_DATA_DIR=/var/lib/linux-router python3 -c "
+import sys; sys.path.insert(0, '/opt/linux-router')
+from router_panel import routing, firewall
+cfg = routing.load_router_config()
+cfg['firewall_mode'] = 'open'
+routing.save_router_config(cfg)
+print(firewall.apply_ruleset(firewall.render_nftables_ruleset(cfg)).output)
+"
+```
+
+面板本身会拦下这种操作：从 LAN 以外的地址提交「保护」、而面板端口又不在放行列表时，
+表单会直接报错并提示先填端口，不会真的应用。
+
 ### PD 拿不到前缀
 
 ```bash
