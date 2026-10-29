@@ -1229,6 +1229,12 @@ class NetworkdBackendTests(unittest.TestCase):
         with patch.object(networkd, "WAN_NETWORK_PATH", wan_path), patch.object(
             networkd, "LAN_NETWORK_PATH", lan_path
         ), patch.object(
+            networkd, "DNS_SCRIPT_PATH", workdir / "dns.sh"
+        ), patch.object(
+            networkd, "DNS_SERVICE_PATH", workdir / "dns.service"
+        ), patch.object(
+            networkd, "DNS_TIMER_PATH", workdir / "dns.timer"
+        ), patch.object(
             networkd, "PPP_NETWORK_PATH", ppp_path
         ), patch.object(
             networkd, "PPPOE_PEER_PATH", peer
@@ -1269,6 +1275,12 @@ class NetworkdBackendTests(unittest.TestCase):
 
         with patch.object(networkd, "WAN_NETWORK_PATH", wan_path), patch.object(
             networkd, "LAN_NETWORK_PATH", lan_path
+        ), patch.object(
+            networkd, "DNS_SCRIPT_PATH", workdir / "dns.sh"
+        ), patch.object(
+            networkd, "DNS_SERVICE_PATH", workdir / "dns.service"
+        ), patch.object(
+            networkd, "DNS_TIMER_PATH", workdir / "dns.timer"
         ), patch.object(
             networkd, "PPP_NETWORK_PATH", ppp_path
         ), patch.object(
@@ -1461,6 +1473,12 @@ class NetworkdBackendTests(unittest.TestCase):
         with patch.object(networkd, "WAN_NETWORK_PATH", wan_path), patch.object(
             networkd, "LAN_NETWORK_PATH", lan_path
         ), patch.object(
+            networkd, "DNS_SCRIPT_PATH", workdir / "dns.sh"
+        ), patch.object(
+            networkd, "DNS_SERVICE_PATH", workdir / "dns.service"
+        ), patch.object(
+            networkd, "DNS_TIMER_PATH", workdir / "dns.timer"
+        ), patch.object(
             networkd, "PPP_NETWORK_PATH", ppp_path
         ), patch.object(
             networkd, "PPPOE_PEER_PATH", peer
@@ -1501,6 +1519,12 @@ class NetworkdBackendTests(unittest.TestCase):
 
         with patch.object(networkd, "WAN_NETWORK_PATH", wan_path), patch.object(
             networkd, "LAN_NETWORK_PATH", lan_path
+        ), patch.object(
+            networkd, "DNS_SCRIPT_PATH", workdir / "dns.sh"
+        ), patch.object(
+            networkd, "DNS_SERVICE_PATH", workdir / "dns.service"
+        ), patch.object(
+            networkd, "DNS_TIMER_PATH", workdir / "dns.timer"
         ), patch.object(
             networkd, "PPP_NETWORK_PATH", ppp_path
         ), patch.object(
@@ -1874,6 +1898,26 @@ class UpstreamDnsTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("未获取到 WAN DNS", result.output)
         self.assertIn("9.9.9.9", self.resolv.read_text(encoding="utf-8"))
+
+    def test_dns_sync_units(self):
+        import subprocess
+
+        script = networkd.render_dns_script()
+        self.assertIn("write_resolv_conf", script)
+        self.assertIn('PYTHONPATH="', script)
+        path = Path(TEST_DATA_DIRECTORY.name) / "dns-sync.sh"
+        path.write_text(script, encoding="utf-8")
+        checked = subprocess.run(["sh", "-n", str(path)], capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+
+        service = networkd.render_dns_service()
+        self.assertIn("Type=oneshot", service)
+        self.assertIn("LINUX_ROUTER_DATA_DIR=", service)
+        self.assertIn(str(networkd.DNS_SCRIPT_PATH), service)
+
+        timer = networkd.render_dns_timer()
+        self.assertIn("OnBootSec=20", timer)
+        self.assertIn("OnUnitActiveSec=5min", timer)
 
     def test_get_dns_servers_skips_comments(self):
         self.resolv.write_text(

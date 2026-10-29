@@ -557,7 +557,7 @@ def apply_router_config(
         return backend_result
 
     report("同步上游 DNS")
-    dns_result = networkd.write_resolv_conf(config)
+    dns_result = networkd.write_resolv_conf(config, retries=5)
 
     report("写入 nftables 规则")
     firewall_result = apply_ruleset(render_nftables_ruleset(config))
