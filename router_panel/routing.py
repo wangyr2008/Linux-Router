@@ -267,7 +267,9 @@ def normalize_router_config(
         if available_interfaces and pppoe_nic not in available_interfaces:
             return config, f"PPPoE 物理网口 {pppoe_nic} 不存在或不是有线网卡"
         if pppoe_nic in lan_ports:
-            return config, f"网口 {pppoe_nic} 不能同时用于 PPPoE 拨号和 LAN"
+            # The uplink was just moved onto a port that used to be a LAN port:
+            # drop it from the LAN list instead of refusing the change.
+            lan_ports = [port for port in lan_ports if port != pppoe_nic]
         wan = networkd.PPPOE_INTERFACE
     else:
         pppoe_nic = ""
@@ -276,6 +278,9 @@ def normalize_router_config(
         if available_wan_interfaces and wan and wan not in available_wan_interfaces:
             return config, f"WAN 接口 {wan} 不存在"
 
+    if wan:
+        # Same for a DHCP uplink: the port cannot be LAN and WAN at once.
+        lan_ports = [port for port in lan_ports if port != wan]
     if not lan_ports:
         return config, "请至少选择一块 LAN 网口"
     for port in lan_ports:
@@ -283,8 +288,6 @@ def normalize_router_config(
             return config, f"LAN 网口名称无效：{port}"
         if available_interfaces and port not in available_interfaces:
             return config, f"LAN 网口 {port} 不存在或不是有线网卡"
-        if wan and port == wan:
-            return config, f"LAN 网口 {port} 不能同时作为 WAN"
     # Two or more ports are bridged; the L3 name becomes br-lan.
     lan = networkd.BRIDGE_NAME if len(lan_ports) > 1 else lan_ports[0]
 

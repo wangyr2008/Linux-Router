@@ -742,6 +742,27 @@ def get_link_dns(ifname: str) -> list[str]:
     return servers
 
 
+def get_link_prefixes(ifname: str) -> list[str]:
+    """CIDR prefixes currently configured on an interface (both families)."""
+    prefixes: list[str] = []
+    if not ifname:
+        return prefixes
+    for interface in _ip_json("address", "show", "dev", ifname):
+        for address in interface.get("addr_info", []):
+            local = str(address.get("local", "") or "")
+            prefixlen = address.get("prefixlen")
+            if not local or prefixlen is None or address.get("scope") == "host":
+                continue
+            try:
+                network = ipaddress.ip_interface(f"{local}/{prefixlen}").network
+            except ValueError:
+                continue
+            text = str(network)
+            if text not in prefixes:
+                prefixes.append(text)
+    return prefixes
+
+
 def get_ppp_dns() -> list[str]:
     """Resolvers pppd learned over IPCP (written because of `usepeerdns`)."""
     servers: list[str] = []
@@ -961,6 +982,7 @@ __all__ = [
     "render_lan_port_network",
     "PPP_NETWORK_PATH",
     "PPPOE_NIC_NETWORK_PATH",
+    "get_link_prefixes",
     "NETIF_LINKS_DIR",
     "SYS_CLASS_NET",
     "RESOLV_CONF_PATH",

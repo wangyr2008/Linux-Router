@@ -6,7 +6,7 @@ from flask import flash, redirect, render_template, request, url_for
 
 from .agent_client import AgentError, query_agent, submit_operation
 from .firewall import FIREWALL_MODE_LABELS, FIREWALL_MODE_PROTECT, parse_port_list
-from .networkd import WAN_MODE_LABELS
+from .networkd import WAN_MODE_LABELS, get_link_prefixes
 from .routing import IPV6_MODE_LABELS, load_router_config
 
 
@@ -30,12 +30,29 @@ def _port_entries_cover(port: str, entries: list[str]) -> bool:
 
 
 def _client_is_on_lan(config: dict, client: str) -> bool:
+    """True when the browser is inside the LAN, IPv4 or IPv6.
+
+    Comparing only against the IPv4 LAN subnet marked every IPv6 client (the
+    panel is reachable over the delegated prefix) as "WAN side", which made the
+    lockout guard refuse perfectly safe applies from the LAN.
+    """
     try:
-        network = ip_network(str(config.get("lan_network", "")), strict=False)
-        return ip_address(client) in network
+        address = ip_address(client)
     except ValueError:
-        # Unknown LAN or unparsable client address: assume the safer case and let it through.
+        # Unparsable client address: assume the safer case and let it through.
         return True
+    candidates = [str(config.get("lan_network", "") or "")]
+    candidates.extend(get_link_prefixes(str(config.get("lan_interface", "") or "")))
+    for raw in candidates:
+        if not raw:
+            continue
+        try:
+            network = ip_network(raw, strict=False)
+        except ValueError:
+            continue
+        if address.version == network.version and address in network:
+            return True
+    return False
 
 
 def _panel_port() -> str:

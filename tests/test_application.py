@@ -108,10 +108,11 @@ class RouterConfigTests(unittest.TestCase):
         self.assertEqual(first["ipv6_prefix"], second["ipv6_prefix"])
 
     def test_wan_and_lan_must_differ(self):
+        # The same port cannot be both; with no other LAN port left it is an error.
         _, error = routing.normalize_router_config(
             {"wan_interface": "eth0", "lan_interface": "eth0"}
         )
-        self.assertIn("不能同时作为 WAN", error)
+        self.assertIn("至少选择一块 LAN 网口", error)
 
     def test_interface_must_exist(self):
         _, error = routing.normalize_router_config(
@@ -691,11 +692,14 @@ class LanBridgeTests(unittest.TestCase):
         )
         self.assertIn("至少选择一块 LAN 网口", error)
 
-    def test_wan_cannot_be_a_lan_port(self):
-        _, error = routing.normalize_router_config(
+    def test_wan_port_is_dropped_from_the_lan_list(self):
+        """Moving the uplink onto a LAN port must not need a manual untick."""
+        config, error = routing.normalize_router_config(
             {"wan_interface": "ens3", "lan_ports": ["ens3", "ens4"]}
         )
-        self.assertIn("不能同时作为 WAN", error)
+        self.assertIsNone(error)
+        self.assertEqual(config["wan_interface"], "ens3")
+        self.assertEqual(config["lan_ports"], ["ens4"])
 
     def test_unknown_port_is_rejected(self):
         _, error = routing.normalize_router_config(
@@ -1796,6 +1800,26 @@ class AccessControlTests(unittest.TestCase):
         ), patch.object(web_routing, "load_router_config", return_value={"lan_network": "192.168.50.0/24"}):
             self.assertEqual(web_routing.lockout_warning(params), "")
 
+    def test_lockout_guard_recognises_ipv6_lan_clients(self):
+        """The panel is reachable over the delegated prefix; those clients are LAN."""
+        params = {"firewall_mode": "protect", "firewall_wan_tcp": ""}
+        config = {"lan_network": "192.168.10.0/24", "lan_interface": "br-lan"}
+        prefixes = ["192.168.10.0/24", "2409:8a5e:a57:52b0::/64"]
+        with application.app.test_request_context(
+            environ_base={"REMOTE_ADDR": "2409:8a5e:a57:52b0::5", "SERVER_PORT": "80"}
+        ), patch.object(web_routing, "load_router_config", return_value=config), patch.object(
+            web_routing, "get_link_prefixes", return_value=prefixes
+        ):
+            self.assertEqual(web_routing.lockout_warning(params), "")
+
+        # A public IPv6 address outside the LAN prefix is still the WAN side.
+        with application.app.test_request_context(
+            environ_base={"REMOTE_ADDR": "2409:8a5e:ffff::5", "SERVER_PORT": "80"}
+        ), patch.object(web_routing, "load_router_config", return_value=config), patch.object(
+            web_routing, "get_link_prefixes", return_value=prefixes
+        ):
+            self.assertIn("WAN 侧", web_routing.lockout_warning(params))
+
     def test_lockout_guard_ignores_open_mode(self):
         params = {"firewall_mode": "open", "firewall_wan_tcp": ""}
         with application.app.test_request_context(
@@ -2152,7 +2176,7 @@ class NetworkdBackendTests(unittest.TestCase):
                 "pppoe_nic": "eth1",
             }
         )
-        self.assertIn("不能同时用于 PPPoE 拨号和 LAN", error)
+        self.assertIn("至少选择一块 LAN 网口", error)
 
     def test_ppp_ipup_hook_restores_cake_and_dns(self):
         """A redial recreates ppp0, so shaping and DNS must be restored at once."""
