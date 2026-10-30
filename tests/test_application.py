@@ -1617,6 +1617,43 @@ class WebTests(unittest.TestCase):
         self.assertIn("fd00:50::1/64", body)
 
 
+class LinkStatusTests(unittest.TestCase):
+    def test_bridge_lan_is_online_without_a_device_entry(self):
+        """br-lan is neither a physical NIC nor a WAN candidate."""
+        details = {"ipv4": ["192.168.10.1/24"], "ipv6": [], "gateway": "", "gateway6": "", "dns": []}
+        with patch.object(routing, "get_device_details", return_value=details), patch.object(
+            routing, "get_interface_addresses", return_value={"ipv4": ["192.168.10.1/24"], "ipv6": []}
+        ):
+            status = routing._interface_status("br-lan", [], [])
+        self.assertEqual(status["state"], "connected")
+        self.assertEqual(status["state_label"], "已连接")
+        self.assertTrue(status["online"])
+
+    def test_point_to_point_peer_is_reported_as_gateway(self):
+        addresses = [
+            {
+                "ifname": "ppp0",
+                "address": "ca:00:00:00:00:01",
+                "addr_info": [
+                    {"family": "inet", "local": "100.131.3.49", "address": "100.131.0.1", "prefixlen": 32},
+                ],
+            }
+        ]
+        with patch.object(network, "_ip_json", return_value=addresses), patch.object(
+            network, "run_command", return_value=ok('[{"dst":"default","scope":"link"}]\n')
+        ), patch.object(network, "get_dns_servers", return_value=[]):
+            details = network.get_device_details("ppp0")
+        self.assertEqual(details["gateway"], "100.131.0.1")
+
+    def test_ipv6_wan_online_follows_the_default_route(self):
+        with patch.object(
+            routing, "run_command", return_value=ok("default dev ppp0 proto static metric 1024\n")
+        ):
+            self.assertTrue(routing._has_ipv6_default_route("ppp0"))
+        with patch.object(routing, "run_command", return_value=ok("")):
+            self.assertFalse(routing._has_ipv6_default_route("ppp0"))
+
+
 class SummaryTests(unittest.TestCase):
     def test_network_status_uses_roles(self):
         connections = [
@@ -1632,6 +1669,27 @@ class SummaryTests(unittest.TestCase):
             connections, {"wan_interface": "eth2", "lan_interface": "eth1"}
         )
         self.assertFalse(status["wan"])
+
+    def test_network_status_uses_link_state_not_networkmanager(self):
+        """networkd replaced NetworkManager, so nmcli returns nothing."""
+        interfaces = {
+            "ppp0": {"ipv4": ["100.131.3.49/32"], "ipv6": [], "up": True, "kind": "ppp"},
+            "br-lan": {"ipv4": ["192.168.10.1/24"], "ipv6": [], "up": True, "kind": "bridge"},
+            "enp1s0": {"ipv4": [], "ipv6": [], "up": False, "kind": "ether"},
+            "enp3s0": {"ipv4": [], "ipv6": [], "up": True, "kind": "ether"},
+        }
+        status = system.summarize_network_status(
+            [], {"wan_interface": "ppp0", "lan_interface": "br-lan"}, interfaces
+        )
+        self.assertEqual(status, {"wan": True, "lan": True, "wired": True})
+
+        # A LAN bridge without an address is not online yet.
+        interfaces["br-lan"]["ipv4"] = []
+        status = system.summarize_network_status(
+            [], {"wan_interface": "ppp0", "lan_interface": "br-lan"}, interfaces
+        )
+        self.assertFalse(status["lan"])
+        self.assertTrue(status["wan"])
 
     def test_translate_methods(self):
         self.assertEqual(network.translate_ipv6_method("auto"), "自动 (SLAAC/DHCPv6)")

@@ -160,6 +160,13 @@ def get_device_details(ifname: str) -> dict[str, Any]:
     for interface in _ip_json("address", "show", "dev", ifname):
         details["mac"] = str(interface.get("address", "") or "")
         details["ipv4"], details["ipv6"] = _addresses(interface)
+        # On a point-to-point link (ppp0) the peer sits in `address` while
+        # `local` is our own address; that peer is the gateway.
+        for address in interface.get("addr_info", []):
+            local = str(address.get("local", "") or "")
+            peer = str(address.get("address", "") or "")
+            if address.get("family") == "inet" and peer and peer != local:
+                details["peer"] = peer
 
     for family, key in (("-4", "gateway"), ("-6", "gateway6")):
         result = run_command(["ip", family, "route", "show", "default", "dev", ifname], timeout=5)
@@ -172,6 +179,10 @@ def get_device_details(ifname: str) -> dict[str, Any]:
                 if index + 1 < len(parts):
                     details[key] = parts[index + 1]
                     break
+
+    # `default dev ppp0` has no `via`, but the peer still is the next hop.
+    if not details["gateway"] and details.get("peer"):
+        details["gateway"] = details["peer"]
 
     details["dns"] = get_dns_servers()
     return details

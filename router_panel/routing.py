@@ -728,7 +728,13 @@ def _interface_status(
     ipv4 = addresses["ipv4"] or details.get("ipv4", [])
     ipv6 = addresses["ipv6"] or details.get("ipv6", [])
     state = device.get("state") or generic.get("state", "")
-    state_label = device.get("state_label") or generic.get("state_label", "未知")
+    state_label = device.get("state_label") or generic.get("state_label", "")
+    if not state:
+        # Bridges (br-lan) are not WAN candidates and not physical devices, so
+        # neither source knows them; fall back to the link itself.
+        state = "connected" if (ipv4 or ipv6) else "disconnected"
+    if not state_label:
+        state_label = "已连接" if state == "connected" else "未连接"
     return {
         "interface": ifname,
         "state": state,
@@ -742,6 +748,13 @@ def _interface_status(
         "dns": details.get("dns", []),
         "online": state == "connected" and bool(ipv4 or ipv6),
     }
+
+
+def _has_ipv6_default_route(ifname: str) -> bool:
+    if not ifname:
+        return False
+    result = run_command(["ip", "-6", "route", "show", "default", "dev", ifname], timeout=5)
+    return result.ok and bool(result.output.strip())
 
 
 def get_lease_count() -> int:
@@ -798,6 +811,11 @@ def gather_router_status() -> dict[str, Any]:
     wan_ipv6_global = [
         address for address in wan["ipv6"] if not address.lower().startswith(("fe80:", "fd"))
     ]
+    # PPPoE has no global IPv6 on the WAN side (only link-local + a delegated
+    # prefix), so a default route is the honest signal that IPv6 works.
+    wan_ipv6_online = bool(wan_ipv6_global) or _has_ipv6_default_route(
+        str(config.get("wan_interface", "") or "")
+    )
 
     firewall = get_firewall_status()
     errors.extend(firewall.get("errors", []))
@@ -856,7 +874,7 @@ def gather_router_status() -> dict[str, Any]:
             "lan_address": f"{ipv6_address}/{ipv6_network.prefixlen}" if ipv6_network and ipv6_address else "",
             "nat": bool(config.get("ipv6_nat")) and config.get("ipv6_mode") == IPV6_MODE_ULA,
             "wan_addresses": wan_ipv6_global,
-            "wan_online": bool(wan_ipv6_global),
+            "wan_online": wan_ipv6_online,
         },
         "pd": pd_status,
         "backend": backend,

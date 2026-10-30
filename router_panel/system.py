@@ -4,6 +4,7 @@ import json
 import os
 import socket
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from .core import (
     SYSTEM_STATIC_CACHE_TTL,
@@ -26,19 +27,39 @@ from .routing import load_router_config
 def summarize_network_status(
     active_connections: list[dict[str, str]],
     router_config: dict | None = None,
+    interfaces: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, bool]:
+    """WAN / LAN / wired dots on the overview page.
+
+    NetworkManager is not used any more, so the link state comes from
+    `ip -j address show`; `active_connections` stays as a fallback for the
+    handful of installs that still report through nmcli.
+    """
     router_config = router_config or {}
+    interfaces = interfaces or {}
     wan_interface = str(router_config.get("wan_interface", "") or "")
     lan_interface = str(router_config.get("lan_interface", "") or "")
-    ethernet_devices = {
+    nm_devices = {
         connection.get("device", "")
         for connection in active_connections
         if connection.get("type") == "802-3-ethernet"
     }
+
+    def link_up(ifname: str) -> bool:
+        if not ifname:
+            return False
+        info = interfaces.get(ifname)
+        if info:
+            return bool(info.get("up")) and bool(info.get("ipv4") or info.get("ipv6"))
+        return ifname in nm_devices
+
+    wired = any(
+        info.get("up") and info.get("kind") == "ether" for info in interfaces.values()
+    ) or bool(nm_devices)
     return {
-        "wan": bool(wan_interface and wan_interface in ethernet_devices),
-        "lan": bool(lan_interface and lan_interface in ethernet_devices),
-        "wired": bool(ethernet_devices),
+        "wan": link_up(wan_interface),
+        "lan": link_up(lan_interface),
+        "wired": wired,
     }
 
 
@@ -84,11 +105,23 @@ def get_interface_addresses() -> tuple[list[str], dict[str, dict[str, list[str]]
         return [], {}
 
     ip_addresses: list[str] = []
-    addresses_by_interface: dict[str, dict[str, list[str]]] = {}
+    addresses_by_interface: dict[str, dict[str, Any]] = {}
     for interface in interfaces:
         ifname = str(interface.get("ifname", "")).strip()
         if not ifname or ifname == "lo":
             continue
+
+        # Record the link itself even without addresses: an unplugged NIC still
+        # has to show up as "not online" instead of disappearing.
+        bucket = addresses_by_interface.setdefault(
+            ifname,
+            {
+                "ipv4": [],
+                "ipv6": [],
+                "up": str(interface.get("operstate", "")).lower() in {"up", "unknown"},
+                "kind": str(interface.get("link_type", "") or ""),
+            },
+        )
 
         for address in interface.get("addr_info", []):
             local = str(address.get("local", "")).strip()
@@ -104,7 +137,6 @@ def get_interface_addresses() -> tuple[list[str], dict[str, dict[str, list[str]]
                 continue
             prefixlen = address.get("prefixlen")
             formatted = f"{local}/{prefixlen}" if prefixlen is not None else local
-            bucket = addresses_by_interface.setdefault(ifname, {"ipv4": [], "ipv6": []})
             if family == "inet":
                 bucket["ipv4"].append(formatted)
             elif family == "inet6" and not local.lower().startswith("fe80:"):
@@ -156,7 +188,9 @@ def gather_system_info() -> SystemInfo:
         "disk_free": format_bytes(disk_free),
         "ip_addresses": ip_addresses,
         "active_connections": active_connections,
-        "network_status": summarize_network_status(active_connections, router_config),
+        "network_status": summarize_network_status(
+            active_connections, router_config, addresses_by_interface
+        ),
         "network_interfaces": network_interfaces,
     }
 
