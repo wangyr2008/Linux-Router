@@ -2239,6 +2239,62 @@ class NetworkdBackendTests(unittest.TestCase):
         self.assertIn("ConfigureWithoutCarrier=yes", nic_text)
         self.assertIn("ip link set eth0 up", flat)
 
+    def test_apply_keeps_the_pppoe_session_when_nothing_changed(self):
+        """Every redial costs a new IPv6 PD prefix, so idle applies must not dial."""
+        import contextlib
+
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "pppoe-stable"
+        workdir.mkdir(exist_ok=True)
+        for stale in workdir.iterdir():
+            if stale.is_file():
+                stale.unlink()
+        commands: list[str] = []
+
+        def fake_run(command, timeout=8, env=None):
+            commands.append(" ".join(command))
+            return ok()
+
+        config = self.config(
+            wan_mode="pppoe", pppoe_nic="eth0", pppoe_username="adsl123", pppoe_password="testpass"
+        )
+        with contextlib.ExitStack() as stack:
+            for name, path in (
+                ("WAN_NETWORK_PATH", workdir / "10-wan.network"),
+                ("LAN_NETWORK_PATH", workdir / "20-lan.network"),
+                ("PPP_NETWORK_PATH", workdir / "30-ppp.network"),
+                ("PPPOE_NIC_NETWORK_PATH", workdir / "15-nic.network"),
+                ("PPPOE_PEER_PATH", workdir / "peers"),
+                ("PPPOE_CHAP_PATH", workdir / "chap-secrets"),
+                ("PPPOE_PAP_PATH", workdir / "pap-secrets"),
+                ("PPPOE_SERVICE_PATH", workdir / "pppoe.service"),
+                ("PPPOE_IPUP_PATH", workdir / "90-linux-router"),
+                ("DNS_SCRIPT_PATH", workdir / "dns.sh"),
+                ("DNS_SERVICE_PATH", workdir / "dns.service"),
+                ("DNS_TIMER_PATH", workdir / "dns.timer"),
+            ):
+                stack.enter_context(patch.object(networkd, name, path))
+            stack.enter_context(patch.object(networkd, "command_exists", return_value=True))
+            stack.enter_context(
+                patch.object(networkd, "is_service_active", side_effect=lambda name: name == networkd.PPPOE_SERVICE_NAME)
+            )
+            stack.enter_context(patch.object(networkd, "is_service_enabled", return_value=False))
+            stack.enter_context(patch.object(networkd, "run_command", side_effect=fake_run))
+            stack.enter_context(patch.object(networkd, "wait_for_lan_address", return_value=True))
+
+            self.assertTrue(networkd.apply_networkd(config).ok)
+            first = sum(1 for item in commands if "restart linux-router-pppoe" in item)
+            first_reconf = sum(1 for item in commands if "networkctl reconfigure" in item)
+            commands.clear()
+            self.assertTrue(networkd.apply_networkd(config).ok)
+            second = sum(1 for item in commands if "restart linux-router-pppoe" in item)
+            second_reconf = sum(1 for item in commands if "networkctl reconfigure" in item)
+
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
+        # A reconfigure of ppp0 re-solicits DHCPv6 and rotates the PD prefix.
+        self.assertGreater(first_reconf, 0)
+        self.assertEqual(second_reconf, 0)
+
     def test_apply_dhcp_removes_ppp_files(self):
         workdir = Path(TEST_DATA_DIRECTORY.name) / "networkd-dhcp"
         workdir.mkdir(exist_ok=True)

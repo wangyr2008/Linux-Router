@@ -479,12 +479,20 @@ def apply_networkd(
     wan = str(config.get("wan_interface", "") or "")
     lan = str(config.get("lan_interface", "") or "")
     report("写入 systemd-networkd 配置")
+    # Reconfiguring a link is not free: ppp0 re-solicits DHCPv6 and the ISP hands
+    # out a new IPv6 prefix, which deprecates every address on the LAN. Only touch
+    # links whose configuration actually changed.
+    lan_changed = wan_changed = ppp_changed = False
     try:
-        atomic_write_text(LAN_NETWORK_PATH, render_lan_network(config), mode=0o644)
+        lan_content = render_lan_network(config)
+        lan_changed = read_text(str(LAN_NETWORK_PATH)) != lan_content.strip()
+        atomic_write_text(LAN_NETWORK_PATH, lan_content, mode=0o644)
         _sync_lan_bridge_files(config)
         if wan_mode == WAN_MODE_PPPOE:
             WAN_NETWORK_PATH.unlink(missing_ok=True)
-            atomic_write_text(PPP_NETWORK_PATH, render_ppp_network(config), mode=0o644)
+            ppp_content = render_ppp_network(config)
+            ppp_changed = read_text(str(PPP_NETWORK_PATH)) != ppp_content.strip()
+            atomic_write_text(PPP_NETWORK_PATH, ppp_content, mode=0o644)
             pppoe_nic = str(config.get("pppoe_nic", "") or "")
             if pppoe_nic:
                 atomic_write_text(
@@ -492,16 +500,27 @@ def apply_networkd(
                 )
             else:
                 PPPOE_NIC_NETWORK_PATH.unlink(missing_ok=True)
-            atomic_write_text(PPPOE_PEER_PATH, render_pppoe_peers(config), mode=0o600)
-            atomic_write_text(PPPOE_CHAP_PATH, render_pppoe_secrets(config), mode=0o600)
-            atomic_write_text(PPPOE_PAP_PATH, render_pppoe_secrets(config), mode=0o600)
-            atomic_write_text(PPPOE_SERVICE_PATH, render_pppoe_service(), mode=0o644)
-            atomic_write_text(PPPOE_IPUP_PATH, render_ppp_ipup_script(), mode=0o755)
+            # A redial costs a new IPv6 PD prefix, so only touch the session
+            # when one of its files actually changed.
+            pppoe_changed = False
+            for path, content, mode in (
+                (PPPOE_PEER_PATH, render_pppoe_peers(config), 0o600),
+                (PPPOE_CHAP_PATH, render_pppoe_secrets(config), 0o600),
+                (PPPOE_PAP_PATH, render_pppoe_secrets(config), 0o600),
+                (PPPOE_SERVICE_PATH, render_pppoe_service(), 0o644),
+                (PPPOE_IPUP_PATH, render_ppp_ipup_script(), 0o755),
+            ):
+                # read_text() strips, so compare against the stripped content.
+                if read_text(str(path)) != content.strip():
+                    pppoe_changed = True
+                atomic_write_text(path, content, mode=mode)
         else:
             PPP_NETWORK_PATH.unlink(missing_ok=True)
             PPPOE_NIC_NETWORK_PATH.unlink(missing_ok=True)
             PPPOE_IPUP_PATH.unlink(missing_ok=True)
-            atomic_write_text(WAN_NETWORK_PATH, render_wan_network(config), mode=0o644)
+            wan_content = render_wan_network(config)
+            wan_changed = read_text(str(WAN_NETWORK_PATH)) != wan_content.strip()
+            atomic_write_text(WAN_NETWORK_PATH, wan_content, mode=0o644)
     except OSError as exc:
         return CommandResult(False, f"写入网络配置失败：{exc}")
 
@@ -523,16 +542,19 @@ def apply_networkd(
         return CommandResult(False, f"写入 DNS 同步任务失败：{exc}")
 
     if wan_mode == WAN_MODE_PPPOE:
-        report("启动 PPPoE 拨号")
         # The link must be UP before pppd sends its first PADI.
         pppoe_nic = str(config.get("pppoe_nic", "") or "")
         if pppoe_nic:
             run_command(["ip", "link", "set", pppoe_nic, "up"], timeout=SYSTEM_COMMAND_TIMEOUT)
         run_command(["systemctl", "daemon-reload"], timeout=SYSTEM_COMMAND_TIMEOUT)
         run_command(["systemctl", "enable", PPPOE_SERVICE_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
-        dialed = run_command(["systemctl", "restart", PPPOE_SERVICE_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
-        if not dialed.ok:
-            return CommandResult(False, f"启动 PPPoE 拨号失败：{dialed.output or '未知错误'}")
+        if pppoe_changed or not is_service_active(PPPOE_SERVICE_NAME):
+            report("启动 PPPoE 拨号")
+            dialed = run_command(["systemctl", "restart", PPPOE_SERVICE_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
+            if not dialed.ok:
+                return CommandResult(False, f"启动 PPPoE 拨号失败：{dialed.output or '未知错误'}")
+        else:
+            report("PPPoE 配置未变化，保持当前连接")
         run_command(["networkctl", "reload"], timeout=SYSTEM_COMMAND_TIMEOUT)
     else:
         report("停用 PPPoE 拨号")
@@ -543,10 +565,10 @@ def apply_networkd(
     run_command(["systemctl", "daemon-reload"], timeout=SYSTEM_COMMAND_TIMEOUT)
     run_command(["systemctl", "enable", DNS_SERVICE_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
     run_command(["systemctl", "enable", "--now", DNS_TIMER_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
-    for ifname in (lan, wan):
-        if ifname and ifname != PPPOE_INTERFACE:
+    for ifname, changed in ((lan, lan_changed), (wan, wan_changed)):
+        if ifname and ifname != PPPOE_INTERFACE and changed:
             _reconfigure(ifname)
-    if wan_mode == WAN_MODE_PPPOE:
+    if wan_mode == WAN_MODE_PPPOE and ppp_changed:
         _reconfigure(PPPOE_INTERFACE)
 
     # `networkctl reconfigure` only schedules the work. dnsmasq binds
