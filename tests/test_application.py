@@ -249,6 +249,15 @@ class DnsmasqConfigTests(unittest.TestCase):
         text = routing.build_dnsmasq_config(self.config(dhcp_enabled="0"))
         self.assertNotIn("dhcp-range=192.168", text)
 
+    def test_ipv6_off_does_not_bind_the_rdnss_address(self):
+        """networkd only adds fe80::1 when IPv6 is on; binding it kills dnsmasq."""
+        text = routing.build_dnsmasq_config(self.config(ipv6_mode="off"))
+        self.assertNotIn("listen-address=fe80::1", text)
+        self.assertIn("listen-address=192.168.50.1", text)
+        # And networkd really does not configure it in that mode.
+        self.assertNotIn("Address=fe80::1/64", networkd.render_lan_network(self.config(ipv6_mode="off")))
+        self.assertIn("Address=fe80::1/64", networkd.render_lan_network(self.config()))
+
     def test_upstream_dns(self):
         text = routing.build_dnsmasq_config(self.config(dns_upstream="223.5.5.5 1.1.1.1"))
         self.assertIn("server=223.5.5.5", text)
@@ -1130,6 +1139,43 @@ class ApplyRouterTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("dnsmasq", result.output)
         self.assertIn("Cannot assign requested address", result.output)
+
+    def test_apply_surfaces_the_journal_reason_when_restart_fails(self):
+        """systemd only says 'control process exited'; the journal says why."""
+        config, _ = routing.normalize_router_config(
+            {"wan_interface": "eth0", "lan_interface": "eth1", "ipv6_prefix": "fd00:50::/64"}
+        )
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "dnsmasq-restart-fail"
+        workdir.mkdir(exist_ok=True)
+        dnsmasq_conf = workdir / "dnsmasq.conf"
+        dnsmasq_conf.write_text("conf-dir=/etc/dnsmasq.d/,*.conf\n", encoding="utf-8")
+
+        def fake_run(command, timeout=8, env=None):
+            if command[:2] == ["systemctl", "restart"]:
+                return fail("Job for dnsmasq.service failed because the control process exited with error code.")
+            if command[:1] == ["journalctl"]:
+                return ok(
+                    "dnsmasq: failed to create listening socket for fe80::1: Invalid argument\n"
+                    "dnsmasq: FAILED to start up"
+                )
+            return ok()
+
+        with patch.object(routing, "command_exists", return_value=True), patch.object(
+            routing, "DNSMASQ_CONFIG_PATH", dnsmasq_conf
+        ), patch.object(routing, "DNSMASQ_CONF_DIR", workdir), patch.object(
+            routing, "DNSMASQ_RULESET_PATH", workdir / "linux-router.conf"
+        ), patch.object(routing, "ROUTER_PANEL_SYSCTL_PATH", workdir / "sysctl.conf"), patch.object(
+            routing, "ROUTER_CONFIG_PATH", workdir / "router.json"
+        ), patch.object(routing, "run_command", side_effect=fake_run), patch.object(
+            routing, "apply_ruleset", return_value=ok("")
+        ), patch.object(routing, "ensure_network_backend", return_value=ok("")), patch.object(
+            routing, "is_service_active", return_value=False
+        ), patch.object(routing.time, "sleep", return_value=None):
+            result = routing.apply_router_config(config)
+
+        self.assertFalse(result.ok)
+        self.assertIn("fe80::1", result.output)
+        self.assertIn("Invalid argument", result.output)
 
 
 class LanAddressWaitTests(unittest.TestCase):
@@ -2030,6 +2076,8 @@ class NetworkdBackendTests(unittest.TestCase):
         ), patch.object(
             networkd, "PPP_NETWORK_PATH", ppp_path
         ), patch.object(
+            networkd, "PPPOE_NIC_NETWORK_PATH", workdir / "15-pppoe-nic.network"
+        ), patch.object(
             networkd, "PPPOE_PEER_PATH", peer
         ), patch.object(
             networkd, "PPPOE_CHAP_PATH", chap
@@ -2062,6 +2110,13 @@ class NetworkdBackendTests(unittest.TestCase):
         flat = [" ".join(call) for call in commands]
         self.assertTrue(any("enable systemd-networkd.service" in item for item in flat))
         self.assertTrue(any("restart linux-router-pppoe.service" in item for item in flat))
+        # The physical PPPoE link must be up, otherwise pppd reports ENETDOWN.
+        nic_file = workdir / "15-pppoe-nic.network"
+        self.assertTrue(nic_file.exists(), "PPPoE 模式应保证物理网口被 networkd 管理")
+        nic_text = nic_file.read_text(encoding="utf-8")
+        self.assertIn("Name=eth0", nic_text)
+        self.assertIn("ConfigureWithoutCarrier=yes", nic_text)
+        self.assertIn("ip link set eth0 up", flat)
 
     def test_apply_dhcp_removes_ppp_files(self):
         workdir = Path(TEST_DATA_DIRECTORY.name) / "networkd-dhcp"
@@ -2082,6 +2137,8 @@ class NetworkdBackendTests(unittest.TestCase):
         ), patch.object(
             networkd, "PPP_NETWORK_PATH", ppp_path
         ), patch.object(
+            networkd, "PPPOE_NIC_NETWORK_PATH", workdir / "15-pppoe-nic.network"
+        ), patch.object(
             networkd, "command_exists", return_value=True
         ), patch.object(
             networkd, "is_service_active", return_value=False
@@ -2097,6 +2154,7 @@ class NetworkdBackendTests(unittest.TestCase):
         self.assertTrue(result.ok, result.output)
         self.assertTrue(wan_path.exists())
         self.assertFalse(ppp_path.exists())
+        self.assertFalse((workdir / "15-pppoe-nic.network").exists())
         self.assertIn("DHCP=yes", wan_path.read_text(encoding="utf-8"))
 
     def test_configured_methods_are_read_from_files(self):

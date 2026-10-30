@@ -487,8 +487,11 @@ def build_dnsmasq_config(config: dict[str, Any]) -> str:
     )
     if lan:
         lines.append(f"listen-address={gateway}")
-        # systemd-networkd assigns fe80::1 to the LAN and advertises it via RDNSS.
-        lines.append("listen-address=fe80::1")
+        # networkd only assigns fe80::1 (and advertises it via RDNSS) when IPv6
+        # is enabled. Binding to an address that does not exist makes dnsmasq
+        # exit at startup, which takes DHCP down with it.
+        if str(config.get("ipv6_mode", "")) != IPV6_MODE_OFF:
+            lines.append("listen-address=fe80::1")
         if ipv6_address is not None:
             lines.append(f"listen-address={ipv6_address}")
 
@@ -584,6 +587,18 @@ def ensure_forwarding() -> CommandResult:
     return CommandResult(True, "已启用 IPv4/IPv6 转发")
 
 
+def _dnsmasq_journal_detail(lines: int = 3) -> str:
+    """Last few journal lines: the only place that names the real reason."""
+    result = run_command(
+        ["journalctl", "-u", "dnsmasq.service", "-n", str(lines), "--no-pager", "-o", "cat"],
+        timeout=8,
+    )
+    if not result.ok:
+        return ""
+    kept = [line.strip() for line in result.output.splitlines() if line.strip()]
+    return "；".join(kept[-lines:])
+
+
 def restart_dnsmasq(attempts: int = 3) -> CommandResult:
     """Restart dnsmasq and make sure it stays up.
 
@@ -594,20 +609,19 @@ def restart_dnsmasq(attempts: int = 3) -> CommandResult:
     for _ in range(attempts):
         restarted = run_command(["systemctl", "restart", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
         if not restarted.ok:
-            return CommandResult(False, f"启动 dnsmasq 失败：{restarted.output or '未知错误'}")
+            # systemd only says "control process exited"; the journal says why.
+            detail = _dnsmasq_journal_detail() or restarted.output or "未知错误"
+            return CommandResult(False, f"启动 dnsmasq 失败：{detail}")
         # Give it a moment to bind; a dnsmasq that dies right away leaves the
         # service failed while `systemctl restart` still returned 0.
         for _ in range(6):
             time.sleep(0.4)
             if is_service_active("dnsmasq.service"):
                 return CommandResult(True, "dnsmasq 已运行")
-    detail = run_command(
-        ["journalctl", "-u", "dnsmasq.service", "-n", "3", "--no-pager", "-o", "cat"],
-        timeout=8,
-    ).output
+    detail = _dnsmasq_journal_detail()
     return CommandResult(
         False,
-        f"dnsmasq 启动后立即退出，局域网将无法获取地址：{detail.strip() or '请检查 dnsmasq 配置'}",
+        f"dnsmasq 启动后立即退出，局域网将无法获取地址：{detail or '请检查 dnsmasq 配置'}",
     )
 
 
