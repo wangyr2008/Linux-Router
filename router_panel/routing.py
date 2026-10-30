@@ -5,6 +5,7 @@ import ipaddress
 import json
 import re
 import secrets
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -583,6 +584,33 @@ def ensure_forwarding() -> CommandResult:
     return CommandResult(True, "已启用 IPv4/IPv6 转发")
 
 
+def restart_dnsmasq(attempts: int = 3) -> CommandResult:
+    """Restart dnsmasq and make sure it stays up.
+
+    `systemctl restart` returns 0 as soon as the process is spawned, so a
+    dnsmasq that dies right away (e.g. the LAN address is not on the interface
+    yet, and it is bound to listen-address) still looks like a success.
+    """
+    for _ in range(attempts):
+        restarted = run_command(["systemctl", "restart", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
+        if not restarted.ok:
+            return CommandResult(False, f"启动 dnsmasq 失败：{restarted.output or '未知错误'}")
+        # Give it a moment to bind; a dnsmasq that dies right away leaves the
+        # service failed while `systemctl restart` still returned 0.
+        for _ in range(6):
+            time.sleep(0.4)
+            if is_service_active("dnsmasq.service"):
+                return CommandResult(True, "dnsmasq 已运行")
+    detail = run_command(
+        ["journalctl", "-u", "dnsmasq.service", "-n", "3", "--no-pager", "-o", "cat"],
+        timeout=8,
+    ).output
+    return CommandResult(
+        False,
+        f"dnsmasq 启动后立即退出，局域网将无法获取地址：{detail.strip() or '请检查 dnsmasq 配置'}",
+    )
+
+
 def apply_router_config(
     config: dict[str, Any],
     progress: ProgressCallback | None = None,
@@ -617,6 +645,15 @@ def apply_router_config(
     if not backend_result.ok:
         return backend_result
 
+    # Start dnsmasq as soon as the LAN address exists: the old instance dies the
+    # moment its bound address disappears, and any later failure would otherwise
+    # leave the LAN without DHCP.
+    report("启动 dnsmasq")
+    run_command(["systemctl", "enable", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
+    dnsmasq_result = restart_dnsmasq()
+    if not dnsmasq_result.ok:
+        return dnsmasq_result
+
     report("同步上游 DNS")
     dns_result = networkd.write_resolv_conf(config, retries=5)
 
@@ -631,12 +668,6 @@ def apply_router_config(
         return forward_result
 
     save_router_config(config)
-
-    report("启动 dnsmasq")
-    run_command(["systemctl", "enable", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
-    restarted = run_command(["systemctl", "restart", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
-    if not restarted.ok:
-        return CommandResult(False, f"启动 dnsmasq 失败：{restarted.output or '未知错误'}")
 
     report("应用 CAKE 限速")
     cake_result = apply_cake(config)

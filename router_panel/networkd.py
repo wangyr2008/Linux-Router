@@ -472,10 +472,39 @@ def apply_networkd(
     if wan_mode == WAN_MODE_PPPOE:
         _reconfigure(PPPOE_INTERFACE)
 
+    # `networkctl reconfigure` only schedules the work. dnsmasq binds
+    # listen-address=<LAN IP>, so starting it before the address exists makes it
+    # exit immediately and the LAN silently loses DHCP.
+    report("等待 LAN 地址生效")
+    if not wait_for_lan_address(config):
+        notes.append("LAN 地址尚未生效，dnsmasq 可能启动失败")
+
     message = f"systemd-networkd 已接管：WAN {wan} → LAN {lan}"
     if notes:
         message += "；" + "，".join(notes)
     return CommandResult(True, message)
+
+
+def wait_for_lan_address(config: dict[str, Any], timeout: float = 15.0) -> bool:
+    """Block until the LAN interface really owns its IPv4 gateway address."""
+    from .routing import _lan_ipv4_network, lan_gateway_ipv4
+
+    lan = str(config.get("lan_interface", "") or "")
+    if not lan:
+        return False
+    try:
+        expected = f"inet {lan_gateway_ipv4(config)}/{_lan_ipv4_network(config).prefixlen}"
+    except ValueError:
+        return False
+
+    deadline = time.monotonic() + timeout
+    while True:
+        result = run_command(["ip", "-4", "-o", "addr", "show", "dev", lan], timeout=5)
+        if result.ok and expected in result.output:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
 
 
 def disable_networkd_config() -> None:

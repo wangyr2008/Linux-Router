@@ -688,6 +688,8 @@ class LanBridgeTests(unittest.TestCase):
             networkd, "is_service_enabled", return_value=False
         ), patch.object(
             networkd, "run_command", return_value=ok()
+        ), patch.object(
+            networkd, "wait_for_lan_address", return_value=True
         ):
             result = networkd.apply_networkd(config)
 
@@ -727,6 +729,8 @@ class LanBridgeTests(unittest.TestCase):
             networkd, "is_service_enabled", return_value=False
         ), patch.object(
             networkd, "run_command", return_value=ok()
+        ), patch.object(
+            networkd, "wait_for_lan_address", return_value=True
         ):
             result = networkd.apply_networkd(config)
 
@@ -1014,7 +1018,9 @@ class ApplyRouterTests(unittest.TestCase):
             routing, "ROUTER_CONFIG_PATH", router_json
         ), patch.object(routing, "run_command", side_effect=fake_run), patch.object(
             routing, "apply_ruleset", return_value=ok("rules loaded")
-        ), patch.object(routing, "ensure_network_backend", return_value=ok("networkd ready")), patch.object(routing, "apply_cake", return_value=ok("cake skipped")):
+        ), patch.object(routing, "ensure_network_backend", return_value=ok("networkd ready")), patch.object(routing, "apply_cake", return_value=ok("cake skipped")), patch.object(
+            routing, "is_service_active", return_value=True
+        ), patch.object(routing.time, "sleep", return_value=None):
             result = routing.apply_router_config(config)
 
         self.assertTrue(result.ok, result.output)
@@ -1044,6 +1050,8 @@ class ApplyRouterTests(unittest.TestCase):
             routing, "apply_ruleset", return_value=ok("rules loaded")
         ), patch.object(routing, "ensure_network_backend", return_value=ok("")), patch.object(
             routing, "apply_cake", return_value=ok("")
+        ), patch.object(routing, "is_service_active", return_value=True), patch.object(
+            routing.time, "sleep", return_value=None
         ):
             result = routing.apply_router_config(config, progress=steps.append)
 
@@ -1053,10 +1061,10 @@ class ApplyRouterTests(unittest.TestCase):
             [
                 "写入 dnsmasq 配置",
                 "写入 systemd-networkd 配置",
+                "启动 dnsmasq",
                 "同步上游 DNS",
                 "写入 nftables 规则",
                 "启用 IPv4/IPv6 转发",
-                "启动 dnsmasq",
                 "应用 CAKE 限速",
             ],
         )
@@ -1079,13 +1087,69 @@ class ApplyRouterTests(unittest.TestCase):
             routing, "run_command", return_value=ok()
         ), patch.object(routing, "apply_ruleset", return_value=fail("nft: syntax error")), patch.object(
             routing, "ensure_network_backend", return_value=ok("")
+        ), patch.object(routing, "is_service_active", return_value=True), patch.object(
+            routing.time, "sleep", return_value=None
         ):
             result = routing.apply_router_config(config, progress=steps.append)
 
         self.assertFalse(result.ok)
         self.assertIn("nft: syntax error", result.output)
         self.assertEqual(steps[-1], "写入 nftables 规则")
-        self.assertNotIn("启动 dnsmasq", steps)
+        # dnsmasq comes right after networkd, so it is already up before nft fails.
+        self.assertIn("启动 dnsmasq", steps)
+
+
+    def test_apply_reports_dnsmasq_that_dies_immediately(self):
+        """dnsmasq exits at once when its listen-address is not on the NIC yet."""
+        config, _ = routing.normalize_router_config(
+            {"wan_interface": "eth0", "lan_interface": "eth1", "ipv6_prefix": "fd00:50::/64"}
+        )
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "dnsmasq-dead"
+        workdir.mkdir(exist_ok=True)
+        dnsmasq_conf = workdir / "dnsmasq.conf"
+        dnsmasq_conf.write_text("conf-dir=/etc/dnsmasq.d/,*.conf\n", encoding="utf-8")
+
+        def fake_run(command, timeout=8, env=None):
+            if command[:1] == ["journalctl"]:
+                return ok("dnsmasq: failed to create listening socket: Cannot assign requested address")
+            return ok()
+
+        with patch.object(routing, "command_exists", return_value=True), patch.object(
+            routing, "DNSMASQ_CONFIG_PATH", dnsmasq_conf
+        ), patch.object(routing, "DNSMASQ_CONF_DIR", workdir), patch.object(
+            routing, "DNSMASQ_RULESET_PATH", workdir / "linux-router.conf"
+        ), patch.object(routing, "ROUTER_PANEL_SYSCTL_PATH", workdir / "sysctl.conf"), patch.object(
+            routing, "ROUTER_CONFIG_PATH", workdir / "router.json"
+        ), patch.object(routing, "run_command", side_effect=fake_run), patch.object(
+            routing, "apply_ruleset", return_value=ok("")
+        ), patch.object(routing, "ensure_network_backend", return_value=ok("")), patch.object(
+            routing, "is_service_active", return_value=False
+        ), patch.object(routing.time, "sleep", return_value=None):
+            result = routing.apply_router_config(config)
+
+        self.assertFalse(result.ok)
+        self.assertIn("dnsmasq", result.output)
+        self.assertIn("Cannot assign requested address", result.output)
+
+
+class LanAddressWaitTests(unittest.TestCase):
+    def test_waits_until_the_address_is_on_the_interface(self):
+        config = {"lan_interface": "eth1", "lan_network": "192.168.9.0/24"}
+        outputs = [
+            "",
+            "3: eth1    inet 192.168.9.1/24 brd 192.168.9.255 scope global eth1",
+        ]
+        with patch.object(
+            networkd, "run_command", side_effect=lambda *a, **k: ok(outputs.pop(0))
+        ), patch.object(networkd.time, "sleep", return_value=None):
+            self.assertTrue(networkd.wait_for_lan_address(config))
+
+    def test_gives_up_after_the_timeout(self):
+        config = {"lan_interface": "eth1", "lan_network": "192.168.9.0/24"}
+        with patch.object(networkd, "run_command", return_value=ok("")), patch.object(
+            networkd.time, "sleep", return_value=None
+        ), patch.object(networkd.time, "monotonic", side_effect=[0.0, 100.0]):
+            self.assertFalse(networkd.wait_for_lan_address(config))
 
 
 class AgentTests(unittest.TestCase):
@@ -1983,6 +2047,8 @@ class NetworkdBackendTests(unittest.TestCase):
             networkd, "is_service_enabled", return_value=False
         ), patch.object(
             networkd, "run_command", side_effect=fake_run
+        ), patch.object(
+            networkd, "wait_for_lan_address", return_value=True
         ):
             result = networkd.apply_networkd(config)
 
@@ -2023,6 +2089,8 @@ class NetworkdBackendTests(unittest.TestCase):
             networkd, "is_service_enabled", return_value=False
         ), patch.object(
             networkd, "run_command", return_value=ok()
+        ), patch.object(
+            networkd, "wait_for_lan_address", return_value=True
         ):
             result = networkd.apply_networkd(self.config())
 
