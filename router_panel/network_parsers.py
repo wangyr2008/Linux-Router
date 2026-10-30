@@ -51,6 +51,12 @@ def translate_connection_type(value: str) -> str:
         "wireguard": "WireGuard",
         "vpn": "VPN",
         "pppoe": "PPPoE",
+        # iproute2 link types
+        "ether": "有线",
+        "bridge": "网桥",
+        "ppp": "PPPoE",
+        "loopback": "回环",
+        "unknown": "未知",
     }
     return mapping.get(value, value or "未知")
 

@@ -1598,7 +1598,7 @@ class WebTests(unittest.TestCase):
                     "role_label": "LAN 局域网",
                     "state": "connected",
                     "state_label": "已连接",
-                    "connection": core.LAN_CONNECTION_NAME,
+                    "connection": "eth1",
                     "details": {
                         "mac": "AA:BB:CC:DD:EE:FF",
                         "carrier": "1",
@@ -1609,7 +1609,6 @@ class WebTests(unittest.TestCase):
                         "gateway6": "",
                         "dns": [],
                     },
-                    "profile": {"ipv4_method_label": "静态地址", "ipv6_method_label": "静态地址"},
                 }
             ],
             "errors": [],
@@ -1662,7 +1661,7 @@ class SummaryTests(unittest.TestCase):
     def test_network_status_uses_roles(self):
         connections = [
             {"name": "Wired connection 1", "type": "802-3-ethernet", "device": "eth0"},
-            {"name": core.LAN_CONNECTION_NAME, "type": "802-3-ethernet", "device": "eth1"},
+            {"name": "linux-router-lan", "type": "802-3-ethernet", "device": "eth1"},
         ]
         status = system.summarize_network_status(
             connections, {"wan_interface": "eth0", "lan_interface": "eth1"}
@@ -1694,10 +1693,6 @@ class SummaryTests(unittest.TestCase):
         )
         self.assertFalse(status["lan"])
         self.assertTrue(status["wan"])
-
-    def test_translate_methods(self):
-        self.assertEqual(network.translate_ipv6_method("auto"), "自动 (SLAAC/DHCPv6)")
-        self.assertEqual(network.translate_ipv4_method("manual"), "静态地址")
 
 class AccessControlTests(unittest.TestCase):
     def config(self, **overrides):

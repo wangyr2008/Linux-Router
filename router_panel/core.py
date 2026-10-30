@@ -29,7 +29,6 @@ PASSWORD_HINT_PATH = DATA_DIR / "initial_password.txt"
 SECRET_KEY_PATH = DATA_DIR / "secret_key"
 BUILD_INFO_PATH = BASE_DIR / "BUILD_INFO"
 DEFAULT_LAN_NETWORK = "192.168.50.0/24"
-LAN_CONNECTION_NAME = "linux-router-lan"
 # Display name and project link. Renaming the project only needs these two lines
 # changed; the service names and paths (linux-router-*) stay for upgrade safety.
 APP_NAME = "Linux Router"
@@ -671,8 +670,7 @@ def ifupdown_managed_interfaces() -> dict[str, str]:
     """Interfaces that ifupdown still configures, with their address method.
 
     Debian's netinst writes `iface <nic> inet dhcp` for the NIC used during
-    installation. With `[ifupdown] managed=false` NetworkManager then leaves that
-    NIC alone, so any WAN setting the panel writes through nmcli is ignored.
+    installation, and ifupdown keeps fighting systemd-networkd for it.
     """
     managed: dict[str, str] = {}
     paths = [IFUPDOWN_INTERFACES_PATH]
@@ -754,7 +752,6 @@ __all__ = [
     "SECRET_KEY_PATH",
     "BUILD_INFO_PATH",
     "DEFAULT_LAN_NETWORK",
-    "LAN_CONNECTION_NAME",
     "APP_NAME",
     "APP_TAGLINE",
     "PROJECT_URL",

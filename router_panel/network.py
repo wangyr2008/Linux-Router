@@ -27,6 +27,8 @@ def link_type(ifname: str) -> str:
         return ""
     if ifname.startswith(("ppp", "tun", "tap", "wg")):
         return PPP_TYPE if ifname.startswith("ppp") else ifname.rstrip("0123456789") or "tunnel"
+    if Path(f"/sys/class/net/{ifname}/bridge").exists():
+        return "bridge"
     if Path(f"/sys/class/net/{ifname}/device").exists():
         return ETHERNET_TYPE
     return "unknown"
@@ -244,22 +246,6 @@ def get_interface_neighbors(ifname: str) -> list[dict[str, str]]:
     return neighbors
 
 
-def default_wired_profile(ifname: str) -> dict[str, Any]:
-    return {
-        "name": ifname,
-        "active_device": ifname,
-        "interface_name": ifname,
-        "autoconnect": True,
-        "ipv4_method": "",
-        "ipv4_address": "",
-        "ipv4_gateway": "",
-        "ipv4_dns": "",
-        "ipv6_method": "",
-        "ipv6_address": "",
-        "route_metric": "-1",
-    }
-
-
 def parse_link_speed_mbps(value: str) -> int:
     raw = value.strip()
     if not raw or raw in {"--", "-1"}:
@@ -294,47 +280,6 @@ def normalize_wired_state(state: str, carrier: str) -> str:
     if state == "connected" and carrier == "0":
         return "disconnected"
     return state
-
-
-def translate_ipv4_method(value: str) -> str:
-    method = value.strip().lower()
-    if method == "manual":
-        return "静态地址"
-    if method == "auto":
-        return "DHCP"
-    if method == "shared":
-        return "共享"
-    if method == "disabled":
-        return "未启用"
-    return "未知"
-
-
-def translate_ipv6_method(value: str) -> str:
-    method = value.strip().lower()
-    if method == "manual":
-        return "静态地址"
-    if method in {"auto", "dhcp"}:
-        return "自动 (SLAAC/DHCPv6)"
-    if method == "disabled":
-        return "未启用"
-    if method == "link-local":
-        return "仅链路本地"
-    if method == "ignore":
-        return "忽略"
-    return "未知"
-
-
-def get_all_connection_methods() -> dict[str, tuple[str, str]]:
-    """Addressing method per interface, read from the systemd-networkd files."""
-    from .networkd import get_configured_methods
-
-    return get_configured_methods()
-
-
-def get_connection_methods(connection_name: str) -> tuple[str, str]:
-    if not connection_name:
-        return "", ""
-    return get_all_connection_methods().get(connection_name, ("", ""))
 
 
 def list_all_interfaces() -> list[dict[str, Any]]:
@@ -372,7 +317,6 @@ def gather_wired_network_info(router_config: dict[str, Any] | None = None) -> di
     lan_interface = str(router_config.get("lan_interface", "") or "")
     lan_ports = [str(item) for item in (router_config.get("lan_ports") or []) if str(item).strip()]
     pppoe_nic = str(router_config.get("pppoe_nic", "") or "")
-    connection_methods = get_all_connection_methods()
 
     devices: list[dict[str, Any]] = []
     for interface in _ip_json("address", "show"):
@@ -386,12 +330,6 @@ def gather_wired_network_info(router_config: dict[str, Any] | None = None) -> di
         carrier = get_wired_carrier(ifname)
         state = normalize_wired_state(_operstate(interface), carrier)
         speed = "" if carrier == "0" else get_wired_sysfs_speed(ifname)
-        profile = default_wired_profile(ifname)
-        ipv4_method, ipv6_method = connection_methods.get(ifname, ("", ""))
-        profile["ipv4_method"] = ipv4_method
-        profile["ipv6_method"] = ipv6_method
-        profile["ipv4_method_label"] = translate_ipv4_method(ipv4_method)
-        profile["ipv6_method_label"] = translate_ipv6_method(ipv6_method)
 
         if ifname and ifname == pppoe_nic:
             role, role_label = "pppoe", "PPPoE 物理口"
@@ -453,7 +391,6 @@ def gather_wired_network_info(router_config: dict[str, Any] | None = None) -> di
                     "gateway6": gateway6,
                     "dns": get_dns_servers(),
                 },
-                "profile": profile,
             }
         )
 
@@ -474,12 +411,7 @@ __all__ = [
     "get_default_route_devs",
     "is_bridge",
     "list_all_interfaces",
-    "get_all_connection_methods",
-    "get_connection_methods",
     "get_dns_servers",
-    "default_wired_profile",
     "format_link_speed",
-    "translate_ipv4_method",
-    "translate_ipv6_method",
     "gather_wired_network_info",
 ]

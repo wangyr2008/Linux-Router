@@ -258,16 +258,19 @@ $DATA_DIR/router.json
 
 WAN/LAN 角色、LAN 网段、DHCP 与 IPv6 参数保存在 `$DATA_DIR/router.json`，由面板“路由”页面写入。应用配置时面板会：
 
-1. 写 `/etc/dnsmasq.d/linux-router.conf` 并 `dnsmasq --test` 校验；
-2. 创建或修改 NetworkManager 连接 `linux-router-lan`（静态地址 + `never-default`）；
+1. 写 `/etc/dnsmasq.d/linux-router.conf` 并 `dnsmasq --test` 校验，随后启动 `dnsmasq.service`；
+2. 写 `/etc/systemd/network/` 下的 `.netdev` / `.network`（`05-` 网桥、`15-` PPPoE 物理口、
+   `20-` LAN、`30-` ppp0、`40-` 各 LAN 端口），只对内容真正变化的链路执行
+   `networkctl reconfigure`；
 3. 写 `/etc/nftables.d/90-linux-router.nft`，用 `nft -c -f` 校验后 `nft -f` 加载；
 4. 写 `/etc/sysctl.d/90-router-panel.conf` 并应用 IPv4/IPv6 转发；
-5. 启用并重启 `dnsmasq.service`，必要时把 WAN 连接的 `ipv6.method` 改为 `auto`。
+5. 重新加载 `systemd-networkd`（用 `networkctl reload`，不重启服务，否则会清掉 pppd
+   在 ppp0 上的地址和默认路由）。
 
 检查命令：
 
 ```bash
-nmcli connection show linux-router-lan
+networkctl list
 ip -br addr show <LAN接口>
 ip -6 route show default
 
@@ -376,7 +379,7 @@ cat /etc/dnsmasq.d/linux-router.conf
 ip route; ip -6 route
 sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding
 nft list ruleset | sed -n '/lr_nat/,/}/p'
-nmcli -g ipv4.addresses,ipv4.never-default connection show linux-router-lan
+cat /etc/systemd/network/20-linux-router-lan.network
 ```
 
 如果面板“依赖”页提示 NAT 规则未加载，点“重新加载规则”即可（等价于 `nft -f /etc/nftables.d/90-linux-router.nft`）。

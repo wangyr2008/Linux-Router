@@ -20,7 +20,7 @@ from .core import (
     set_timed_cache,
 )
 from .contracts import SystemInfo
-from .network import get_active_connections
+from .network import ETHERNET_TYPE, get_active_connections
 from .routing import load_router_config
 
 
@@ -31,18 +31,17 @@ def summarize_network_status(
 ) -> dict[str, bool]:
     """WAN / LAN / wired dots on the overview page.
 
-    NetworkManager is not used any more, so the link state comes from
-    `ip -j address show`; `active_connections` stays as a fallback for the
-    handful of installs that still report through nmcli.
+    Link state comes from `ip -j address show`; `active_connections` is only a
+    fallback for interfaces the address dump does not list.
     """
     router_config = router_config or {}
     interfaces = interfaces or {}
     wan_interface = str(router_config.get("wan_interface", "") or "")
     lan_interface = str(router_config.get("lan_interface", "") or "")
-    nm_devices = {
+    ethernet_devices = {
         connection.get("device", "")
         for connection in active_connections
-        if connection.get("type") == "802-3-ethernet"
+        if connection.get("type") == ETHERNET_TYPE
     }
 
     def link_up(ifname: str) -> bool:
@@ -51,11 +50,11 @@ def summarize_network_status(
         info = interfaces.get(ifname)
         if info:
             return bool(info.get("up")) and bool(info.get("ipv4") or info.get("ipv6"))
-        return ifname in nm_devices
+        return ifname in ethernet_devices
 
     wired = any(
         info.get("up") and info.get("kind") == "ether" for info in interfaces.values()
-    ) or bool(nm_devices)
+    ) or bool(ethernet_devices)
     return {
         "wan": link_up(wan_interface),
         "lan": link_up(lan_interface),
