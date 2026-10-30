@@ -529,9 +529,18 @@ def apply_networkd(
 
     report("启用 systemd-networkd")
     run_command(["systemctl", "enable", NETWORKD_SERVICE], timeout=SYSTEM_COMMAND_TIMEOUT)
-    started = run_command(["systemctl", "restart", NETWORKD_SERVICE], timeout=SYSTEM_COMMAND_TIMEOUT)
-    if not started.ok:
-        return CommandResult(False, f"启动 systemd-networkd 失败：{started.output or '未知错误'}")
+    if is_service_active(NETWORKD_SERVICE):
+        # Restarting networkd strips every address and route it does not own from
+        # the links it manages — including pppd's address and default route on
+        # ppp0, which leaves "PPPoE connected" but no IP and no internet.
+        # Reloading re-reads the files; the changed links are reconfigured below.
+        reloaded = run_command(["networkctl", "reload"], timeout=SYSTEM_COMMAND_TIMEOUT)
+        if not reloaded.ok:
+            return CommandResult(False, f"重载 systemd-networkd 失败：{reloaded.output or '未知错误'}")
+    else:
+        started = run_command(["systemctl", "restart", NETWORKD_SERVICE], timeout=SYSTEM_COMMAND_TIMEOUT)
+        if not started.ok:
+            return CommandResult(False, f"启动 systemd-networkd 失败：{started.output or '未知错误'}")
 
     report("安装 DNS 同步任务")
     try:
