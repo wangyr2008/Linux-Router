@@ -221,9 +221,28 @@ LAN 的 `.network` 上开 `DHCPPrefixDelegation=yes` + `IPv6SendRA=yes`，前缀
 2. **IPv6 泄漏**：公网前缀下，只配 `inet4_address` 的 TUN 会让 IPv6 直连。要全量代理就给 tun 加 `inet6_address`。
 3. **DNS 归属**：把面板「上游 DNS」填 `127.0.0.1#5353`（sing-box 的 dns 监听地址），
    面板会写 `no-resolv`，dnsmasq 不再叠加 `/etc/resolv.conf`，查询不会漏到运营商。
-4. **别 `nft flush ruleset`**：会把 `lr_*` 四张表一起清掉。改完规则用 `systemctl reload nftables`。
+4. **别 `nft flush ruleset`**：会把 `lr_*` 四张表（以及 sing-box/Docker 自己的表）一起清掉。
+   改完规则用 `systemctl reload nftables`——面板生成的 `/etc/nftables.conf` 里**没有** `flush ruleset`，
+   重载只重新加载 `/etc/nftables.d/*.nft`，不会碰别人的表。
 
 sing-box 的 Clash API（默认 9090）属于 input 服务，保护模式下要访问就填进「LAN 放行 TCP 端口」。
+
+## 与 Docker / Podman / Tailscale / WireGuard 共存
+
+这套规则只增删自己的四张表（`lr_forward` / `lr_nat` / `lr_nat6` / `lr_input`），
+`/etc/nftables.d/90-linux-router.nft` 每次加载都是「建表 → 删表 → 重建」，不碰其它表；
+面板应用配置时执行的是 `nft -f /etc/nftables.d/90-linux-router.nft`，而不是整份 `nftables.conf`。
+
+> 早期版本的 `/etc/nftables.conf` 里带着 `flush ruleset`，`systemctl reload nftables` 会把
+> Docker 的 `ip nat`/`ip filter`、Tailscale 的 `inet tailscale`、Podman/WireGuard 的表一起清空，
+> 且不会自动恢复（要重启对应服务）。现在这个文件已经不再 flush，升级时原内容会备份到
+> `/etc/nftables.conf.linux-router.bak`。
+
+容器出网用的 NAT 与 `lr_nat` 互不影响：面板的 masquerade 只匹配 `oifname "ppp0"`，
+Docker 的 `DOCKER` 链只匹配容器网段，两者都在 `srcnat` 优先级上，先匹配先生效。
+
+如果还要让容器流量走 sing-box，把 Docker 默认的 `iptables` 管理关掉即可（`/etc/docker/daemon.json`
+里 `"iptables": false`），再自己写规则；否则 Docker 会往 `ip nat` 里插自己的 MASQUERADE。
 
 ## 常见问题
 

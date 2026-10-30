@@ -318,23 +318,54 @@ class NftablesTests(unittest.TestCase):
                 )
                 self.assertTrue(firewall.nftables_config_includes_our_ruleset())
 
-    def test_ensure_include_inserts_after_flush(self):
+    def test_ensure_include_drops_the_global_flush(self):
+        """A global flush would delete Docker/Tailscale/Podman tables on reload."""
         with tempfile.TemporaryDirectory() as directory:
             conf = Path(directory) / "nftables.conf"
             conf_dir = Path(directory) / "nftables.d"
+            dropin = Path(directory) / "systemd" / "10-linux-router.conf"
             conf.write_text(
                 "#!/usr/sbin/nft -f\nflush ruleset\n\ntable inet filter {\n}\n",
                 encoding="utf-8",
             )
             with patch.object(firewall, "NFTABLES_CONFIG_PATH", conf), patch.object(
                 firewall, "NFTABLES_CONF_DIR", conf_dir
+            ), patch.object(firewall, "NFTABLES_DROPIN_PATH", dropin), patch.object(
+                firewall, "NFTABLES_DROPIN_DIR", dropin.parent
+            ), patch.object(
+                firewall, "run_command", return_value=ok()
             ):
                 result = firewall.ensure_nftables_include()
                 self.assertTrue(result.ok)
                 content = conf.read_text(encoding="utf-8")
                 self.assertIn('include "/etc/nftables.d/*.nft"', content)
-                self.assertLess(content.index("flush ruleset"), content.index("include"))
-                self.assertLess(content.index("include"), content.index("table inet filter"))
+                self.assertNotIn("flush ruleset", content)
+                self.assertFalse(firewall._nftables_conf_flushes())
+                # The original content (possibly hand-written rules) is kept aside.
+                backup = conf.with_name(conf.name + ".linux-router.bak")
+                self.assertTrue(backup.exists())
+                self.assertIn("flush ruleset", backup.read_text(encoding="utf-8"))
+                # Debian stops with `nft flush ruleset`; the drop-in removes that.
+                self.assertIn("ExecStop=", dropin.read_text(encoding="utf-8"))
+
+    def test_ensure_include_leaves_a_clean_file_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "nftables.conf"
+            conf_dir = Path(directory) / "nftables.d"
+            dropin = Path(directory) / "systemd" / "10-linux-router.conf"
+            conf.write_text(firewall.NFTABLES_CONF_TEMPLATE, encoding="utf-8")
+            before = conf.read_text(encoding="utf-8")
+            with patch.object(firewall, "NFTABLES_CONFIG_PATH", conf), patch.object(
+                firewall, "NFTABLES_CONF_DIR", conf_dir
+            ), patch.object(firewall, "NFTABLES_DROPIN_PATH", dropin), patch.object(
+                firewall, "NFTABLES_DROPIN_DIR", dropin.parent
+            ), patch.object(
+                firewall, "run_command", return_value=ok()
+            ):
+                result = firewall.ensure_nftables_include()
+            self.assertTrue(result.ok)
+            self.assertEqual(conf.read_text(encoding="utf-8"), before)
+            self.assertFalse(conf.with_name(conf.name + ".linux-router.bak").exists())
 
 
 class LeaseParsingTests(unittest.TestCase):

@@ -233,9 +233,28 @@ attention or traffic silently bypasses the proxy:
 1. **Routing loop** — TUN `auto_route` points the default route at tun0, capturing the router's own traffic. Set `bind_interface: "ppp0"` (or `inet4_bind_address`) on the outbound.
 2. **IPv6 leak** — with a public prefix, a TUN with only `inet4_address` lets IPv6 go direct. Add `inet6_address` for full coverage.
 3. **DNS ownership** — set “upstream DNS” to `127.0.0.1#5353` (sing-box DNS listener). The panel then writes `no-resolv`, so dnsmasq stops appending `/etc/resolv.conf` and queries cannot leak to the ISP.
-4. **Never `nft flush ruleset`** — it wipes all four `lr_*` tables. Use `systemctl reload nftables` after editing rules.
+4. **Never `nft flush ruleset`** — it wipes all four `lr_*` tables *and* sing-box's/Docker's own tables. Use `systemctl reload nftables` after editing rules: the generated `/etc/nftables.conf` has **no** `flush ruleset`, so a reload only re-reads `/etc/nftables.d/*.nft` and leaves foreign tables alone.
 
 The sing-box Clash API (default 9090) is an input service: add `9090` to “LAN open TCP ports” in protect mode.
+
+## Living with Docker / Podman / Tailscale / WireGuard
+
+The ruleset only creates and deletes its own four tables (`lr_forward`, `lr_nat`, `lr_nat6`,
+`lr_input`); `/etc/nftables.d/90-linux-router.nft` is written as “create → delete → recreate”,
+so it never touches tables it does not own. Applying from the panel runs
+`nft -f /etc/nftables.d/90-linux-router.nft`, not the whole `nftables.conf`.
+
+> Older builds put `flush ruleset` in `/etc/nftables.conf`, so `systemctl reload nftables`
+> wiped Docker's `ip nat`/`ip filter`, Tailscale's `inet tailscale` and any Podman/WireGuard
+> tables — and nothing re-adds them until the owning service restarts. That line is gone now;
+> on upgrade the previous file is kept at `/etc/nftables.conf.linux-router.bak`.
+
+Container NAT and `lr_nat` do not interfere: the panel masquerades only `oifname "ppp0"`,
+Docker's `DOCKER` chain matches container subnets, both sit at `srcnat` priority, first match wins.
+
+To route container traffic through sing-box, disable Docker's own iptables management
+(`"iptables": false` in `/etc/docker/daemon.json`) and write the rules yourself — otherwise
+Docker keeps inserting its own MASQUERADE into `ip nat`.
 
 ## Troubleshooting
 
