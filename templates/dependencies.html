@@ -45,7 +45,7 @@
             </td>
             <td class="dependency-action-cell" data-label="处置">
               {% if row.action %}
-              <form action="{{ url_for('dependency_fix') }}" method="post" class="inline-form" data-agent-operation-form>
+              <form action="{{ url_for('dependency_fix') }}" method="post" class="inline-form" data-agent-operation-form data-busy-label="正在处理…">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input type="hidden" name="action" value="{{ row.action }}">
                 <button type="submit" class="dependency-action-link">

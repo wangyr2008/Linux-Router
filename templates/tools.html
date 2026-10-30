@@ -19,7 +19,8 @@
     <p class="warning compact">未安装 Tailscale，请先自行安装</p>
     <pre class="command-snippet"><code>curl -fsSL https://tailscale.com/install.sh | sh</code></pre>
     <p class="muted compact">安装完成后刷新本页。</p>
-    {% elif tailscale.status.logged_in %}
+    {% else %}
+    {% if tailscale.status.logged_in %}
     <dl class="key-value">
       <div>
         <dt>运行状态</dt>
@@ -44,34 +45,32 @@
         </dd>
       </div>
     </dl>
-    <form action="{{ url_for('tailscale_logout') }}" method="post" class="inline-form tools-logout-form" id="tailscale-logout-form">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button type="submit" class="button-danger-outline">退出登录</button>
-    </form>
-
-    {% for error in tailscale.status.errors %}
-    <p class="alert compact">{{ error }}</p>
-    {% endfor %}
     {% else %}
-    <form action="{{ url_for('tailscale_login') }}" method="post" class="login-form" id="tailscale-login-form">
+    <div class="tailscale-login-summary">
+      <span class="status-badge status-{{ tailscale.status.state_level }}">{{ tailscale.status.state_label }}</span>
+      <span class="muted">
+        {{ "tailscaled 正在运行" if tailscale.status.service_active else "登录时会尝试启动 tailscaled" }}
+      </span>
+    </div>
+    {% endif %}
+
+    {# Settings live in their own always-visible form: logging in is optional. #}
+    <form
+      action="{{ url_for('tailscale_config_save') }}"
+      method="post"
+      class="login-form tailscale-config-form"
+      data-agent-operation-form
+      data-busy-label="正在保存 Tailscale 设置…"
+    >
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <div class="tailscale-login-summary">
-        <span class="status-badge status-{{ tailscale.status.state_level }}">{{ tailscale.status.state_label }}</span>
-        <span class="muted">
-          {{ "tailscaled 正在运行" if tailscale.status.service_active else "登录时会尝试启动 tailscaled" }}
-        </span>
-      </div>
-      <label>
-        是否接受 Tailnet 路由
-        <span class="checkbox-row">
-          <input
-            type="checkbox"
-            name="accept_routes"
-            value="1"
-            {% if tailscale.config.accept_routes %}checked{% endif %}
-          >
-          <span>接受</span>
-        </span>
+      <label class="checkbox-field">
+        <input
+          type="checkbox"
+          name="accept_routes"
+          value="1"
+          {{ 'checked' if tailscale.config.accept_routes else '' }}
+        >
+        <span>接受 Tailnet 路由（--accept-routes）</span>
       </label>
       <label>
         发布子网路由
@@ -85,12 +84,25 @@
         <span class="muted form-hint">多个网段用英文逗号分隔，留空则不发布路由</span>
       </label>
       <div class="device-actions">
-        <button type="submit" class="button-info-strong">登录 Tailscale</button>
+        <button type="submit" class="button-info-strong">保存设置</button>
       </div>
     </form>
+
+    {% if tailscale.status.logged_in %}
+    <form action="{{ url_for('tailscale_logout') }}" method="post" class="inline-form tools-logout-form" id="tailscale-logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="button-danger-outline">退出登录</button>
+    </form>
+    {% else %}
+    <form action="{{ url_for('tailscale_login') }}" method="post" class="inline-form tools-logout-form" id="tailscale-login-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="button-info">登录 Tailscale</button>
+    </form>
+    <p class="muted compact">登录使用上面已保存的设置，改完记得先保存。</p>
     <p class="muted compact hidden" id="tailscale-login-link-wrap">
       <a href="#" target="_blank" rel="noopener noreferrer" class="table-link" id="tailscale-login-link">打开 Tailscale 登录页面</a>
     </p>
+    {% endif %}
 
     {% for error in tailscale.status.errors %}
     <p class="alert compact">{{ error }}</p>

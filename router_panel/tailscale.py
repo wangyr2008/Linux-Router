@@ -244,6 +244,47 @@ def logout_tailscale() -> CommandResult:
     return run_command(["tailscale", "logout"], timeout=20)
 
 
+def apply_tailscale_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Re-run `tailscale up` so changed flags take effect without re-login.
+
+    `tailscale up` only touches the flags it is given, so an unchecked
+    accept_routes really does turn the previous `--accept-routes` off.
+    """
+    if not command_exists("tailscale"):
+        return {
+            "ok": False,
+            "message": "未安装 Tailscale，请先自行安装后再使用",
+            "login_url": "",
+        }
+    if not is_service_active("tailscaled.service"):
+        return {
+            "ok": True,
+            "message": "Tailscale 设置已保存，tailscaled 未运行，启动后自动生效",
+            "login_url": "",
+        }
+
+    result = run_command(build_tailscale_up_command(config), timeout=30)
+    if result.ok:
+        return {
+            "ok": True,
+            "message": "Tailscale 设置已保存并生效",
+            "login_url": "",
+        }
+
+    login_url = extract_login_url("\n".join([result.stdout, result.stderr, result.output]))
+    if login_url:
+        return {
+            "ok": True,
+            "message": "设置已保存，请在 Tailscale 页面完成登录",
+            "login_url": login_url,
+        }
+    return {
+        "ok": False,
+        "message": result.output or "应用 Tailscale 设置失败",
+        "login_url": "",
+    }
+
+
 __all__ = [
     "TAILSCALE_CONFIG_PATH",
     "DEFAULT_TAILSCALE_CONFIG",
@@ -255,5 +296,6 @@ __all__ = [
     "extract_login_url",
     "gather_tailscale_status",
     "start_tailscale_login",
+    "apply_tailscale_config",
     "logout_tailscale",
 ]

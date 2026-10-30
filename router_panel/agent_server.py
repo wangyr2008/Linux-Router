@@ -37,6 +37,7 @@ from .routing import (
 from .service_monitor import gather_service_monitor_status, run_service_action
 from .system import gather_system_info
 from .tailscale import (
+    apply_tailscale_config,
     gather_tailscale_status,
     logout_tailscale,
     normalize_tailscale_config,
@@ -334,6 +335,13 @@ def _execute_tailscale_logout(params: dict[str, Any]) -> dict[str, Any]:
     return _result(logout_tailscale(), "已退出 Tailscale 登录", "退出 Tailscale 登录失败")
 
 
+def _execute_tailscale_apply(params: dict[str, Any]) -> dict[str, Any]:
+    config, error = normalize_tailscale_config(params)
+    if error:
+        raise ValidationError(error)
+    return apply_tailscale_config(config)
+
+
 def _execute_service_monitor_action(params: dict[str, Any]) -> dict[str, Any]:
     service = _require_string(params, "service", maximum=128)
     action = _require_string(params, "action", maximum=16)
@@ -355,6 +363,7 @@ OPERATIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "dependency_fix": _execute_dependency,
     "system_reboot": _execute_reboot,
     "tailscale_login": _execute_tailscale_login,
+    "tailscale_apply": _execute_tailscale_apply,
     "tailscale_logout": _execute_tailscale_logout,
     "service_monitor_action": _execute_service_monitor_action,
 }

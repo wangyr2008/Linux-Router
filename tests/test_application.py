@@ -24,6 +24,7 @@ from router_panel import networkd
 from router_panel import routing
 from router_panel import service_monitor
 from router_panel import system
+from router_panel import tailscale as tailscale_client
 from router_panel import web_general
 from router_panel import web_tools
 from router_panel import web_routing
@@ -55,6 +56,7 @@ EXPECTED_ROUTES = {
     "/tools",
     "/tools/services/action",
     "/tools/services/save",
+    "/tools/tailscale/config",
     "/tools/tailscale/login",
     "/tools/tailscale/logout",
     "/tools/tailscale/status",
@@ -1214,6 +1216,58 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("boom", response.get_data(as_text=True))
 
+    def test_router_page_marks_the_uplink_port_unusable_for_lan(self):
+        """The uplink NIC must render unchecked+disabled, in both WAN modes."""
+        import re
+
+        self.login()
+        interfaces = [
+            {"name": "eth0", "link_speed": "1 Gbps"},
+            {"name": "eth1", "link_speed": "1 Gbps"},
+            {"name": "eth2", "link_speed": "1 Gbps"},
+        ]
+        base = {
+            "wan": {},
+            "lan": {},
+            "ipv6": {},
+            "dhcp": {},
+            "firewall": {},
+            "forwarding": {},
+            "services": {},
+            "wan_candidates": [],
+            "errors": [],
+        }
+
+        def port_blocks(body: str) -> dict[str, str]:
+            return {
+                match.group(1): match.group(0)
+                for match in re.finditer(
+                    r'<input\s+type="checkbox"\s+name="lan_ports"\s+value="([^"]+)"[^>]*>',
+                    body,
+                    re.S,
+                )
+            }
+
+        cases = [
+            ({"wan_mode": "pppoe", "pppoe_username": "u@isp", "pppoe_nic": "eth1"}, "eth1"),
+            ({"wan_mode": "dhcp", "wan_interface": "eth1"}, "eth1"),
+        ]
+        for payload, uplink in cases:
+            config, error = routing.normalize_router_config(
+                {**payload, "lan_ports": ["eth0", "eth2"], "lan_network": "192.168.50.0/24"},
+                existing=routing.load_router_config(),
+            )
+            self.assertIsNone(error)
+            status = {**base, "config": config, "interfaces": interfaces}
+            with patch.object(web_routing, "query_agent", return_value=status):
+                body = self.client.get("/router").get_data(as_text=True)
+            blocks = port_blocks(body)
+            self.assertEqual(set(blocks), {"eth0", "eth1", "eth2"})
+            self.assertIn("disabled", blocks[uplink], payload)
+            self.assertNotIn("checked", blocks[uplink], payload)
+            self.assertIn("checked", blocks["eth0"], payload)
+            self.assertNotIn("disabled", blocks["eth0"], payload)
+
     def test_clients_page_renders(self):
         self.login()
         status = {
@@ -2359,6 +2413,122 @@ class UpstreamDnsTests(unittest.TestCase):
         )
         with patch.object(networkd, "RESOLV_CONF_PATH", self.resolv):
             self.assertEqual(networkd.get_dns_servers(), ["1.1.1.1", "8.8.8.8"])
+
+
+class TailscaleConfigTests(unittest.TestCase):
+    def setUp(self):
+        application.app.config["TESTING"] = True
+        self.client = application.app.test_client()
+        with self.client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+
+    def tearDown(self):
+        tailscale_client.TAILSCALE_CONFIG_PATH.unlink(missing_ok=True)
+
+    def test_up_command_reflects_flags(self):
+        self.assertEqual(
+            tailscale_client.build_tailscale_up_command({"accept_routes": True}),
+            ["tailscale", "up", "--accept-routes"],
+        )
+        # Unchecking accept routes must drop the flag, not keep the old one.
+        self.assertEqual(
+            tailscale_client.build_tailscale_up_command(
+                {"accept_routes": False, "advertise_routes": "192.168.50.0/24"}
+            ),
+            ["tailscale", "up", "--advertise-routes=192.168.50.0/24"],
+        )
+
+    def test_apply_skips_when_tailscaled_is_stopped(self):
+        with patch.object(tailscale_client, "command_exists", return_value=True), patch.object(
+            tailscale_client, "is_service_active", return_value=False
+        ), patch.object(tailscale_client, "run_command") as run:
+            result = tailscale_client.apply_tailscale_config({"accept_routes": False})
+        self.assertTrue(result["ok"])
+        self.assertIn("未运行", result["message"])
+        run.assert_not_called()
+
+    def test_apply_runs_up_with_saved_flags(self):
+        with patch.object(tailscale_client, "command_exists", return_value=True), patch.object(
+            tailscale_client, "is_service_active", return_value=True
+        ), patch.object(
+            tailscale_client, "run_command", return_value=ok("")
+        ) as run:
+            result = tailscale_client.apply_tailscale_config(
+                {"accept_routes": False, "advertise_routes": ""}
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(run.call_args[0][0], ["tailscale", "up"])
+
+    def test_config_route_saves_when_logged_out(self):
+        with patch.object(
+            web_tools, "query_agent", return_value={"logged_in": False, "installed": True}
+        ), patch.object(web_tools, "submit_operation") as submit:
+            response = self.client.post(
+                "/tools/tailscale/config",
+                data={"csrf_token": "test-token", "advertise_routes": "10.0.0.0/24"},
+                headers={"X-Requested-With": "fetch"},
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["pending"])
+        self.assertIn("登录后生效", payload["message"])
+        submit.assert_not_called()
+        saved = tailscale_client.load_tailscale_config()
+        self.assertFalse(saved["accept_routes"])
+        self.assertEqual(saved["advertise_routes"], "10.0.0.0/24")
+
+    def test_config_route_queues_apply_when_logged_in(self):
+        logged_in = {"logged_in": True, "installed": True, "agent_available": True}
+        operation = {"id": "op-1", "status": "queued"}
+        with patch.object(web_tools, "query_agent", return_value=logged_in), patch.object(
+            web_tools, "submit_operation", return_value=operation
+        ) as submit:
+            response = self.client.post(
+                "/tools/tailscale/config",
+                data={"csrf_token": "test-token", "accept_routes": "1"},
+                headers={"X-Requested-With": "fetch"},
+            )
+        self.assertEqual(response.status_code, 202)
+        payload = response.get_json()
+        self.assertTrue(payload["pending"])
+        self.assertEqual(submit.call_args[0][0], "tailscale_apply")
+
+    def test_config_route_reports_agent_outage(self):
+        with patch.object(
+            web_tools, "query_agent", side_effect=web_tools.AgentError("socket down")
+        ):
+            response = self.client.post(
+                "/tools/tailscale/config",
+                data={"csrf_token": "test-token", "accept_routes": "1"},
+                headers={"X-Requested-With": "fetch"},
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertIn("系统控制服务不可用", payload["message"])
+        self.assertTrue(tailscale_client.load_tailscale_config()["accept_routes"])
+
+    def test_tools_page_offers_save_button_when_logged_in(self):
+        status = {
+            "agent_available": True,
+            "installed": True,
+            "logged_in": True,
+            "service_active": True,
+            "state_label": "已连接",
+            "state_level": "ok",
+            "tailscale_ips": ["100.64.0.1"],
+            "self_name": "router.tailnet.ts.net",
+            "user": "me@example.com",
+            "errors": [],
+        }
+        with patch.object(web_tools, "query_agent", return_value=status):
+            body = self.client.get("/tools").get_data(as_text=True)
+        self.assertIn("保存设置", body)
+        self.assertIn("accept_routes", body)
+        self.assertIn("退出登录", body)
 
 
 if __name__ == "__main__":

@@ -160,7 +160,7 @@ Notes:
 - Switching to a bridge renames the LAN interface to `br-lan`, so **the page drops once when you apply**; reopen `192.168.50.1`
 - All members share one broadcast domain — **no VLAN isolation**. Need separation? Use another subnet instead of a bridge
 - Removing a port deletes its member file; going back to a single port also removes the bridge
-- The NIC currently used as WAN is disabled in the checkbox list
+- The NIC currently carrying WAN (the DHCP uplink or the PPPoE NIC) is disabled in the checkbox list, and switching the uplink away restores the port you had ticked before
 
 ## IPv6 modes
 

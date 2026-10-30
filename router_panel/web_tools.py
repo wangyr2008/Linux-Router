@@ -66,9 +66,9 @@ def register_tools_routes(app, login_required, is_async_request) -> None:
     def tailscale_status():
         return tailscale_context()["status"]
 
-    @app.route("/tools/tailscale/login", methods=["POST"])
+    @app.route("/tools/tailscale/config", methods=["POST"])
     @login_required
-    def tailscale_login():
+    def tailscale_config_save():
         config, error = normalize_tailscale_config(
             {
                 "accept_routes": request.form.get("accept_routes", "") == "1",
@@ -81,6 +81,36 @@ def register_tools_routes(app, login_required, is_async_request) -> None:
             flash(error, "error")
             return redirect(url_for("tools_page"))
         save_tailscale_config(config)
+
+        def saved(message: str):
+            if is_async_request():
+                return {"ok": True, "pending": False, "message": message}
+            flash(message, "success")
+            return redirect(url_for("tools_page"))
+
+        # Nothing to push into tailscaled until it is logged in.
+        try:
+            status = query_agent("tailscale_status")
+        except AgentError:
+            return saved("Tailscale 设置已保存（系统控制服务不可用，暂未生效）")
+        if not status.get("logged_in"):
+            return saved("Tailscale 设置已保存，登录后生效")
+
+        try:
+            operation = submit_operation("tailscale_apply", config, scope="tools")
+        except AgentError as exc:
+            message = f"设置已保存，但立即生效失败：{exc}"
+            if is_async_request():
+                return {"ok": False, "pending": False, "message": message}, 503
+            flash(message, "error")
+            return redirect(url_for("tools_page"))
+        return queued_response(operation, "Tailscale 设置正在应用")
+
+    @app.route("/tools/tailscale/login", methods=["POST"])
+    @login_required
+    def tailscale_login():
+        # The settings form saves first, so login always uses what is on disk.
+        config = load_tailscale_config()
         try:
             operation = submit_operation("tailscale_login", config, scope="tools")
         except AgentError as exc:

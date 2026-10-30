@@ -6,7 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title or app_name }}</title>
     <link rel="icon" href="{{ url_for('static', filename='favicon.ico', v='20261030-1') }}" sizes="any">
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261030-4') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20261030-6') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='responsive.css', v='20261028-1') }}">
   </head>
   <body>
@@ -57,7 +57,7 @@
     {% else %}
       {% block auth_content %}{% endblock %}
     {% endif %}
-    <script src="{{ url_for('static', filename='router-common.js', v='20261030-2') }}"></script>
+    <script src="{{ url_for('static', filename='router-common.js', v='20261030-4') }}"></script>
     <script>
       (() => {
         const stack = document.getElementById("global-toast-stack");
@@ -99,7 +99,10 @@
             }
 
             const element = document.createElement("div");
-            element.className = `toast ${type === "success" ? "toast-success" : "toast-error"}`;
+            const typeClass = type === "success"
+              ? "toast-success"
+              : (type === "pending" ? "toast-pending" : "toast-error");
+            element.className = `toast ${typeClass}`;
             if (key) {
               element.dataset.key = key;
               activeToasts.set(key, element);
@@ -108,9 +111,16 @@
             const content = document.createElement("span");
             content.textContent = text;
             element.appendChild(content);
+            // A sticky result toast (errors) can be dismissed by hand; progress
+            // toasts are replaced by the next update, so they stay untouched.
+            if (type !== "pending") {
+              element.title = "点击关闭";
+              element.addEventListener("click", () => removeToast(element));
+            }
             stack.appendChild(element);
 
-            scheduleDismiss(element, options.autoHideMs ?? (type === "success" ? 2500 : 4000));
+            const defaultHide = type === "success" ? 2500 : (type === "pending" ? 0 : 4000);
+            scheduleDismiss(element, options.autoHideMs ?? defaultHide);
             return element;
           },
           clear(key) {

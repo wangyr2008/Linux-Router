@@ -17,7 +17,7 @@
   <article class="card">
     <h3 class="card-title">{{ icon("activity") }}<span>CAKE 限速</span></h3>
     <p class="muted">按 WAN 实际带宽整形，抑制缓冲膨胀（bufferbloat）。填运营商标称带宽的 85%~95% 效果最好。</p>
-    <form action="{{ url_for('update_cake') }}" method="post" class="login-form" data-agent-operation-form>
+    <form action="{{ url_for('update_cake') }}" method="post" class="login-form" data-agent-operation-form data-busy-label="正在应用限速…">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div class="form-grid">
         <label class="field">

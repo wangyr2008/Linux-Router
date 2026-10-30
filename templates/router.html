@@ -159,7 +159,7 @@
       <div>
         <dt>PD 客户端</dt>
         <dd>
-          <span class="status-badge status-{{ 'ok' if pd.service_active else 'error' }}">{{ '运行中' if pd.service_active else ('已安装未运行' if pd.available else '未安装 dhcpcd') }}</span>
+          <span class="status-badge status-{{ 'ok' if pd.service_active else 'error' }}">{{ '运行中' if pd.service_active else ('已安装未运行' if pd.available else '未安装 systemd-networkd') }}</span>
         </dd>
       </div>
       <div><dt>运营商委派</dt><dd class="mono-value">{{ pd.delegated or '尚未收到' }}</dd></div>
@@ -192,6 +192,7 @@
       method="post"
       class="login-form"
       data-agent-operation-form
+      data-busy-label="正在应用配置…"
     >
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 
@@ -223,7 +224,7 @@
         </label>
         <label class="field" data-wan-field="pppoe">
           <span class="field-label">PPPoE 物理网口</span>
-          <select name="pppoe_nic">
+          <select name="pppoe_nic" data-pppoe-nic>
             <option value="">请选择</option>
             {% for item in status.interfaces %}
             <option value="{{ item.name }}" {{ 'selected' if item.name == config.pppoe_nic else '' }}>{{ item.name }}（{{ item.link_speed or '未知' }}）</option>
@@ -245,14 +246,18 @@
           <span class="field-label">LAN 网口（可多选）</span>
           <div class="checkbox-grid">
             {% set active_ports = config.lan_ports or [config.lan_interface] %}
+            {# The uplink NIC is never a LAN port; router-common.js keeps this in sync. #}
+            {% set uplink_nic = config.pppoe_nic if config.wan_mode == 'pppoe' else config.wan_interface %}
             {% for item in status.interfaces %}
+            {% set is_uplink = uplink_nic and item.name == uplink_nic %}
             <label class="checkbox-option">
               <input
                 type="checkbox"
                 name="lan_ports"
                 value="{{ item.name }}"
                 data-lan-port="{{ item.name }}"
-                {{ 'checked' if item.name in active_ports else '' }}
+                {{ 'checked' if item.name in active_ports and not is_uplink else '' }}
+                {{ 'disabled' if is_uplink else '' }}
               >
               <span class="mono-value">{{ item.name }}</span>
               <span class="muted">{{ item.link_speed or '未知' }}</span>
@@ -364,7 +369,7 @@
 
       <div class="form-footer">
         <p class="muted form-hint">
-          应用配置会写入 NetworkManager 的 LAN 连接、dnsmasq 与 nftables 规则。
+          应用配置会写入 systemd-networkd 的 WAN/LAN 配置、dnsmasq 与 nftables 规则。
           若修改了 LAN 地址，当前页面需要用新地址重新访问。
         </p>
         <button type="submit">应用路由配置</button>

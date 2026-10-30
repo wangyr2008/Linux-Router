@@ -357,6 +357,54 @@ button[aria-disabled="true"] {
   border-color: var(--danger-line);
 }
 
+/* Sticky "still working" toast: stays until the operation reports back. */
+.toast-pending {
+  background: var(--info-bg);
+  color: var(--info-text);
+  border-color: var(--info-line);
+}
+
+.toast-pending::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-right: 8px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 999px;
+  animation: router-spin 0.8s linear infinite;
+}
+
+/* Inline spinner for buttons whose operation takes seconds to finish. */
+.button-spinner {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 999px;
+  animation: router-spin 0.8s linear infinite;
+}
+
+button.is-busy {
+  cursor: progress;
+  opacity: 0.85;
+}
+
+@keyframes router-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast-pending::before,
+  .button-spinner {
+    animation-duration: 2.4s;
+  }
+}
+
 .content {
   min-width: 0;
   padding: var(--desktop-header-top) 24px 24px;
@@ -452,6 +500,18 @@ button[aria-disabled="true"] {
 
 .tools-logout-form {
   margin-top: 16px;
+}
+
+/* Tailscale flags are always editable, independent of the login state. */
+.tailscale-config-form {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+/* The login/logout form is a sibling <form>, and `.inline-form` zeroes margins. */
+.tailscale-config-form + .tools-logout-form {
+  margin-top: 14px;
 }
 
 .tools-table-block {
