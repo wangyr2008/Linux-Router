@@ -34,6 +34,8 @@ SYS_CLASS_NET = Path("/sys/class/net")
 RESOLV_CONF_PATH = Path("/etc/resolv.conf")
 # pppd writes the resolvers it learned over IPCP here (`usepeerdns`).
 PPP_RESOLV_CONF_PATH = Path("/etc/ppp/resolv.conf")
+# Used only when the uplink hands out IPv4 resolvers but no IPv6 one.
+FALLBACK_IPV6_DNS = "2400:3200::1"
 DNS_SCRIPT_PATH = Path("/etc/linux-router/dns.sh")
 DNS_SERVICE_NAME = "linux-router-dns.service"
 DNS_TIMER_NAME = "linux-router-dns.timer"
@@ -735,10 +737,21 @@ def resolve_upstream_dns(config: dict[str, Any]) -> list[str]:
         return configured
     wan = str(config.get("wan_interface", "") or "")
     # A PPP link gets its IPv4 resolvers over IPCP, which networkd never sees.
-    servers = get_ppp_dns() if wan == PPPOE_INTERFACE else []
-    if servers:
-        return servers
-    return get_link_dns(wan)
+    servers = list(get_ppp_dns()) if wan == PPPOE_INTERFACE else []
+    for server in get_link_dns(wan):
+        if server not in servers:
+            servers.append(server)
+    # Most Chinese ISPs send no DHCPv6 DNS, and a PPP link has no RA to carry
+    # RDNSS, so keep IPv6 resolution alive with one public resolver.
+    if servers and not any(":" in server for server in servers) and _has_ipv6_default(wan):
+        servers.append(FALLBACK_IPV6_DNS)
+    return servers
+
+
+def _has_ipv6_default(ifname: str) -> bool:
+    from .routing import _has_ipv6_default_route
+
+    return _has_ipv6_default_route(ifname)
 
 
 def write_resolv_conf(config: dict[str, Any], retries: int = 0) -> CommandResult:
@@ -839,6 +852,30 @@ def get_dns_servers() -> list[str]:
     return servers
 
 
+def get_delegated_pool() -> str:
+    """The whole prefix the ISP delegated (e.g. /60), not just the LAN /64.
+
+    networkd parks the delegated pool as `unreachable <prefix> dev lo proto dhcp`
+    so that nothing else uses it before it is split up.
+    """
+    result = run_command(["ip", "-6", "route", "show"], timeout=8)
+    if not result.ok or not result.output:
+        return ""
+    for line in result.output.splitlines():
+        parts = line.split()
+        if not parts or parts[0] != "unreachable" or "dev" not in parts:
+            continue
+        if parts[parts.index("dev") + 1 : parts.index("dev") + 2] != ["lo"]:
+            continue
+        if "proto" in parts and parts[parts.index("proto") + 1] != "dhcp":
+            continue
+        try:
+            return str(ipaddress.ip_network(parts[1], strict=False))
+        except ValueError:
+            continue
+    return ""
+
+
 def get_delegated_prefix(lan_interface: str) -> str:
     """The global /64 currently on the LAN (that is what PD produced)."""
     if not lan_interface:
@@ -877,7 +914,8 @@ def get_networkd_status(config: dict[str, Any] | None = None) -> dict[str, Any]:
         "ppp_installed": command_exists("pppd"),
         "wan_link": links.get(wan, {}),
         "lan_link": links.get(lan, {}),
-        "delegated": get_delegated_prefix(lan),
+        "delegated": get_delegated_pool() or get_delegated_prefix(lan),
+        "delegated_lan": get_delegated_prefix(lan),
         "dns": get_dns_servers(),
         "config_files": [
             str(path.name)

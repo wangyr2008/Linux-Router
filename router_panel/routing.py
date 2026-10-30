@@ -852,7 +852,8 @@ def gather_router_status() -> dict[str, Any]:
             "service": backend["service"],
             "service_active": backend["service_active"],
             "service_enabled": backend["service_enabled"],
-            "prefix": backend["delegated"],
+            # 「运营商委派」是 ISP 给的整段（如 /60），「LAN /64」是其中分给 LAN 的那一段。
+            "prefix": backend.get("delegated_lan") or backend["delegated"],
             "delegated": backend["delegated"],
             "wan": wan_name,
             "lan": str(config.get("lan_interface", "") or ""),

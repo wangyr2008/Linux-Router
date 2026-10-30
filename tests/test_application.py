@@ -2700,6 +2700,39 @@ class UpstreamDnsTests(unittest.TestCase):
             servers = networkd.resolve_upstream_dns({"wan_interface": "ppp0"})
         self.assertEqual(servers, ["211.138.164.6", "221.176.88.95"])
 
+    def test_ipv6_fallback_only_when_the_isp_sends_none(self):
+        with patch.object(networkd, "get_ppp_dns", return_value=["211.138.164.6"]), patch.object(
+            networkd, "get_link_dns", return_value=[]
+        ), patch.object(networkd, "_has_ipv6_default", return_value=True):
+            servers = networkd.resolve_upstream_dns({"wan_interface": "ppp0"})
+        self.assertEqual(servers, ["211.138.164.6", networkd.FALLBACK_IPV6_DNS])
+
+        # The ISP did send one: do not add ours.
+        with patch.object(networkd, "get_ppp_dns", return_value=["211.138.164.6"]), patch.object(
+            networkd, "get_link_dns", return_value=["2408:8899::88"]
+        ), patch.object(networkd, "_has_ipv6_default", return_value=True):
+            servers = networkd.resolve_upstream_dns({"wan_interface": "ppp0"})
+        self.assertEqual(servers, ["211.138.164.6", "2408:8899::88"])
+
+        # No IPv6 uplink at all: nothing to fall back to.
+        with patch.object(networkd, "get_ppp_dns", return_value=["211.138.164.6"]), patch.object(
+            networkd, "get_link_dns", return_value=[]
+        ), patch.object(networkd, "_has_ipv6_default", return_value=False):
+            servers = networkd.resolve_upstream_dns({"wan_interface": "ppp0"})
+        self.assertEqual(servers, ["211.138.164.6"])
+
+    def test_delegated_pool_is_the_isp_prefix(self):
+        """networkd parks the delegated pool as an unreachable route on lo."""
+        output = (
+            "2409:8a5e:a55:cd20::/64 dev br-lan proto kernel metric 256\n"
+            "unreachable 2409:8a5e:a55:cd20::/60 dev lo proto dhcp metric 1024\n"
+            "fe80::/64 dev br-lan proto kernel metric 256\n"
+        )
+        with patch.object(networkd, "run_command", return_value=ok(output)):
+            self.assertEqual(networkd.get_delegated_pool(), "2409:8a5e:a55:cd20::/60")
+        with patch.object(networkd, "run_command", return_value=ok("")):
+            self.assertEqual(networkd.get_delegated_pool(), "")
+
     def test_pppoe_peer_asks_for_the_isp_resolvers(self):
         text = networkd.render_pppoe_peers({"pppoe_nic": "enp4s0", "pppoe_username": "u"})
         self.assertIn("usepeerdns", text)
