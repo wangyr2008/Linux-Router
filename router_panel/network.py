@@ -419,11 +419,27 @@ def gather_wired_network_info(router_config: dict[str, Any] | None = None) -> di
                         else:
                             gateway6 = parts[index + 1]
 
+        # A bridge member or the PPPoE NIC carries no address of its own: the
+        # address lives on br-lan / ppp0. Show that instead of an empty card.
+        carried_by = ""
+        if not ipv4 and not ipv6:
+            if role == "lan" and lan_interface and lan_interface != ifname:
+                carried_by = lan_interface
+            elif role == "pppoe" and wan_interface:
+                carried_by = wan_interface
+        if carried_by:
+            carried = get_device_details(carried_by)
+            ipv4 = carried["ipv4"] or ipv4
+            ipv6 = carried["ipv6"] or ipv6
+            gateway = carried["gateway"] or gateway
+            gateway6 = carried["gateway6"] or gateway6
+
         devices.append(
             {
                 "device": ifname,
                 "role": role,
                 "role_label": role_label,
+                "carried_by": carried_by,
                 "state": state,
                 "state_label": translate_device_state(state),
                 "connection": ifname if state == "connected" else "未连接",

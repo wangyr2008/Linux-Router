@@ -20,8 +20,7 @@
         <div><dt>连接</dt><dd>{{ item.connection }}</dd></div>
         <div><dt>协商速率</dt><dd class="mono-value">{{ item.details.link_speed or '未知' }}</dd></div>
         <div><dt>MAC</dt><dd class="mono-value">{{ item.details.mac or '未知' }}</dd></div>
-        <div><dt>IPv4 模式</dt><dd>{{ item.profile.ipv4_method_label or '未知' }}</dd></div>
-        <div><dt>IPv6 模式</dt><dd>{{ item.profile.ipv6_method_label or '未知' }}</dd></div>
+        <div><dt>地址归属</dt><dd class="mono-value">{{ item.carried_by if item.carried_by else '本机网口' }}</dd></div>
         <div>
           <dt>IPv4</dt>
           <dd class="mono-value">
