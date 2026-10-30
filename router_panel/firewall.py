@@ -124,6 +124,7 @@ def render_nftables_ruleset(config: dict[str, Any]) -> str:
 
     mode = str(config.get("firewall_mode", FIREWALL_MODE_OPEN))
     protect = mode == FIREWALL_MODE_PROTECT
+    wan_mode = str(config.get("wan_mode", "") or "")
     lan_tcp, _ = parse_port_list(config.get("firewall_lan_tcp"))
     wan_tcp, _ = parse_port_list(config.get("firewall_wan_tcp"))
     wan_udp, _ = parse_port_list(config.get("firewall_wan_udp"))
@@ -149,6 +150,17 @@ def render_nftables_ruleset(config: dict[str, Any]) -> str:
         "        ct state established,related accept",
         "        ct state invalid drop",
     ]
+
+    if wan_mode == "pppoe":
+        # PPPoE caps the WAN at 1492 while LAN hosts still use 1500: without
+        # clamping, every packet bigger than the path MTU is silently dropped,
+        # which shows up as "HTTPS/downloads hang, small requests work".
+        lines.extend(
+            [
+                "        # Clamp TCP MSS to the path MTU (PPPoE = 1492).",
+                "        tcp flags syn tcp option maxseg size set rt mtu",
+            ]
+        )
 
     if protect:
         if lan:

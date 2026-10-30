@@ -487,12 +487,16 @@ def build_dnsmasq_config(config: dict[str, Any]) -> str:
     )
     if lan:
         lines.append(f"listen-address={gateway}")
+        ipv6_mode = str(config.get("ipv6_mode", ""))
         # networkd only assigns fe80::1 (and advertises it via RDNSS) when IPv6
         # is enabled. Binding to an address that does not exist makes dnsmasq
         # exit at startup, which takes DHCP down with it.
-        if str(config.get("ipv6_mode", "")) != IPV6_MODE_OFF:
+        if ipv6_mode != IPV6_MODE_OFF:
             lines.append("listen-address=fe80::1")
-        if ipv6_address is not None:
+        # A delegated prefix changes on every renewal, so the global LAN address
+        # is only stable in ULA mode; binding it under PD kills dnsmasq as soon
+        # as the ISP hands out a new prefix.
+        if ipv6_address is not None and ipv6_mode != IPV6_MODE_PD:
             lines.append(f"listen-address={ipv6_address}")
 
     if config.get("dns_upstream"):
