@@ -372,7 +372,8 @@
     });
 
     const submitTailscaleForm = async (form, button, pendingText, fallbackMessage, options = {}) => {
-      if (!form) return;
+      // Enter-key submits ignore the disabled button; drop the duplicates.
+      if (!form || (button && button.disabled)) return;
       const originalText = button ? button.textContent : "";
       const loginWindow = options.preopenWindow ? window.open("about:blank", "_blank") : null;
       writeLoginWaitingPage(loginWindow);
@@ -441,7 +442,7 @@
     });
 
     const submitToolsForm = async (form, button, pendingText, fallbackMessage) => {
-      if (!form) return;
+      if (!form || (button && button.disabled)) return;
       const originalText = button ? button.textContent : "";
       if (button) {
         button.disabled = true;

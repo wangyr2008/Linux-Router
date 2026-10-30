@@ -1023,6 +1023,70 @@ class ApplyRouterTests(unittest.TestCase):
         self.assertTrue(router_json.exists())
         self.assertIn(["systemctl", "restart", "dnsmasq.service"], commands)
 
+    def test_apply_reports_progress_steps(self):
+        """The panel shows these strings while the apply is running."""
+        config, _ = routing.normalize_router_config(
+            {"wan_interface": "eth0", "lan_interface": "eth1", "ipv6_prefix": "fd00:50::/64"}
+        )
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "progress"
+        workdir.mkdir(exist_ok=True)
+        dnsmasq_conf = workdir / "dnsmasq.conf"
+        dnsmasq_conf.write_text("conf-dir=/etc/dnsmasq.d/,*.conf\n", encoding="utf-8")
+        steps: list[str] = []
+
+        with patch.object(routing, "command_exists", return_value=True), patch.object(
+            routing, "DNSMASQ_CONFIG_PATH", dnsmasq_conf
+        ), patch.object(routing, "DNSMASQ_CONF_DIR", workdir), patch.object(
+            routing, "DNSMASQ_RULESET_PATH", workdir / "linux-router.conf"
+        ), patch.object(routing, "ROUTER_PANEL_SYSCTL_PATH", workdir / "sysctl.conf"), patch.object(
+            routing, "ROUTER_CONFIG_PATH", workdir / "router.json"
+        ), patch.object(routing, "run_command", return_value=ok()), patch.object(
+            routing, "apply_ruleset", return_value=ok("rules loaded")
+        ), patch.object(routing, "ensure_network_backend", return_value=ok("")), patch.object(
+            routing, "apply_cake", return_value=ok("")
+        ):
+            result = routing.apply_router_config(config, progress=steps.append)
+
+        self.assertTrue(result.ok, result.output)
+        self.assertEqual(
+            steps,
+            [
+                "写入 dnsmasq 配置",
+                "写入 systemd-networkd 配置",
+                "同步上游 DNS",
+                "写入 nftables 规则",
+                "启用 IPv4/IPv6 转发",
+                "启动 dnsmasq",
+                "应用 CAKE 限速",
+            ],
+        )
+
+    def test_apply_stops_at_the_first_failing_step(self):
+        config, _ = routing.normalize_router_config(
+            {"wan_interface": "eth0", "lan_interface": "eth1", "ipv6_prefix": "fd00:50::/64"}
+        )
+        workdir = Path(TEST_DATA_DIRECTORY.name) / "progress-fail"
+        workdir.mkdir(exist_ok=True)
+        dnsmasq_conf = workdir / "dnsmasq.conf"
+        dnsmasq_conf.write_text("conf-dir=/etc/dnsmasq.d/,*.conf\n", encoding="utf-8")
+        steps: list[str] = []
+
+        with patch.object(routing, "command_exists", return_value=True), patch.object(
+            routing, "DNSMASQ_CONFIG_PATH", dnsmasq_conf
+        ), patch.object(routing, "DNSMASQ_CONF_DIR", workdir), patch.object(
+            routing, "DNSMASQ_RULESET_PATH", workdir / "linux-router.conf"
+        ), patch.object(routing, "ROUTER_CONFIG_PATH", workdir / "router.json"), patch.object(
+            routing, "run_command", return_value=ok()
+        ), patch.object(routing, "apply_ruleset", return_value=fail("nft: syntax error")), patch.object(
+            routing, "ensure_network_backend", return_value=ok("")
+        ):
+            result = routing.apply_router_config(config, progress=steps.append)
+
+        self.assertFalse(result.ok)
+        self.assertIn("nft: syntax error", result.output)
+        self.assertEqual(steps[-1], "写入 nftables 规则")
+        self.assertNotIn("启动 dnsmasq", steps)
+
 
 class AgentTests(unittest.TestCase):
     def test_router_apply_validates_interfaces(self):

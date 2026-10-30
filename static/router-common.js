@@ -98,6 +98,11 @@
   document.querySelectorAll("[data-agent-operation-form]").forEach((form) => {
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      // A disabled button blocks clicks but not Enter-key submits: without this
+      // guard the config would be applied twice.
+      if (form.dataset.submitting === "1") return;
+      form.dataset.submitting = "1";
+
       const button = form.querySelector('button[type="submit"]');
       const busyLabel = form.dataset.busyLabel || "正在处理…";
       const notify = (message, type, autoHideMs) => {
@@ -124,10 +129,12 @@
           window.setTimeout(() => window.location.reload(), 1400);
         } else {
           // Keep the error on screen and let the user fix the form in place.
+          delete form.dataset.submitting;
           window.routerBusy.set(button, false);
         }
       } catch (error) {
         notify(error?.serverMessage || "系统操作失败，请稍后重试", "error", 0);
+        delete form.dataset.submitting;
         window.routerBusy.set(button, false);
       } finally {
         form.removeAttribute("aria-busy");
