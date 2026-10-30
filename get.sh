@@ -150,5 +150,10 @@ if [[ -n "$USED_MIRROR" && -z "$FORCED_MIRROR" ]]; then
   FORWARD+=(--mirror "$USED_MIRROR")
 fi
 
+# install.sh fetches the source archive itself, so it has to know which repo and
+# branch this bootstrap was told to use. Without this it falls back to its own
+# default and installs a different tree than the one install.sh came from.
+FORWARD+=(--repo "https://github.com/$REPO.git" --branch "$BRANCH")
+
 chmod +x "$TARGET"
 exec bash "$TARGET" "${FORWARD[@]}"

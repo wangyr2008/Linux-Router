@@ -215,7 +215,7 @@ def get_interface_neighbors(ifname: str) -> list[dict[str, str]]:
     """Neighbour (ARP/NDP) table entries for one interface, both families."""
     neighbors: list[dict[str, str]] = []
     for family, flag in (("ipv4", "-4"), ("ipv6", "-6")):
-        result = run_command([flag, "neighbor", "show", "dev", ifname], timeout=5)
+        result = run_command(["ip", flag, "neighbor", "show", "dev", ifname], timeout=5)
         if not result.ok or not result.output:
             continue
         for line in result.output.splitlines():

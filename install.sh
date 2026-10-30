@@ -8,7 +8,7 @@
 #   * IPv4 + IPv6 dual stack, dnsmasq provides DHCPv4 / SLAAC / DHCPv6
 set -Eeuo pipefail
 
-REPO_URL="${LINUX_ROUTER_REPO_URL:-https://github.com/Jaksay/Linux-Router.git}"
+REPO_URL="${LINUX_ROUTER_REPO_URL:-https://github.com/wangyr2008/Linux-Router.git}"
 BRANCH="${LINUX_ROUTER_BRANCH:-main}"
 ARCHIVE_URL="${LINUX_ROUTER_ARCHIVE_URL:-}"
 SOURCE_DIR="${LINUX_ROUTER_SOURCE_DIR:-}"
@@ -519,6 +519,7 @@ Commands:
 Options:
   --purge-data               With uninstall, also remove credentials and LAN settings
   --repo URL                 GitHub repository URL
+                             (default: https://github.com/wangyr2008/Linux-Router.git)
   --branch NAME              GitHub branch (default: main)
   --archive-url URL          Download a specific source archive instead
   --source-dir PATH          Install from a local source directory (no download)

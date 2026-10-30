@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import unquote
 
 TEST_DATA_DIRECTORY = tempfile.TemporaryDirectory(prefix="router-panel-tests-")
 atexit.register(TEST_DATA_DIRECTORY.cleanup)
@@ -450,6 +451,41 @@ class ClientStatusTests(unittest.TestCase):
         unknown = next(item for item in status["clients"] if item["mac_address"] == "22:33:44:55:66:77")
         self.assertEqual(unknown["source"], "neighbor")
         self.assertEqual(unknown["ipv4"], "192.168.50.77")
+
+
+class NeighborLookupTests(unittest.TestCase):
+    def test_neighbor_lookup_runs_ip_for_both_families(self):
+        """`ip` used to be missing from the command line, so the table was empty."""
+        calls: list[list[str]] = []
+
+        def fake_run(command, timeout=8, env=None):
+            calls.append(list(command))
+            if "-4" in command:
+                return ok(
+                    "192.168.50.10 lladdr aa:bb:cc:dd:ee:ff REACHABLE\n"
+                    "192.168.50.11 lladdr 22:33:44:55:66:88 STALE\n"
+                )
+            return ok(
+                "fe80::1 lladdr aa:bb:cc:dd:ee:ff router REACHABLE\n"
+                "2409:8a5e:a57:52b0::5 lladdr 22:33:44:55:66:77 REACHABLE\n"
+            )
+
+        with patch.object(network, "run_command", side_effect=fake_run):
+            neighbors = network.get_interface_neighbors("br-lan")
+
+        self.assertEqual(
+            [call[:3] for call in calls],
+            [["ip", "-4", "neighbor"], ["ip", "-6", "neighbor"]],
+        )
+        self.assertTrue(all(call[:1] == ["ip"] for call in calls))
+        self.assertIn("dev", calls[0])
+        # IPv4 neighbours are online only when the state says so.
+        ipv4 = [item for item in neighbors if item["family"] == "ipv4"]
+        self.assertEqual([item["online"] for item in ipv4], ["1", "0"])
+        # Link-local IPv6 entries are the router's own addresses, not clients.
+        ipv6 = [item for item in neighbors if item["family"] == "ipv6"]
+        self.assertEqual([item["ip_address"] for item in ipv6], ["2409:8a5e:a57:52b0::5"])
+        self.assertEqual(ipv6[0]["online"], "1")
 
 
 class DeviceLabelTests(unittest.TestCase):
@@ -1018,8 +1054,10 @@ class StaticLeaseTests(unittest.TestCase):
         self.assertIn('action="/clients/static/delete"', body)
         # Bound device shows its address, the free one gets a pre-filling link.
         self.assertIn("固定 192.168.50.10", body)
-        self.assertIn("mac=22:33:44:55:66:77", body)
-        self.assertIn("ip=192.168.50.130", body)
+        # url_for decides whether ':' is percent-encoded; accept both spellings so
+        # this does not break on a Werkzeug upgrade.
+        self.assertIn("mac=22:33:44:55:66:77", unquote(body))
+        self.assertIn("ip=192.168.50.130", unquote(body))
         # Labels from device_labels show up in both the table and the device list.
         self.assertIn("客厅 NAS", body)
         self.assertIn("手机", body)
@@ -2172,6 +2210,43 @@ class NetworkdBackendTests(unittest.TestCase):
             }
         )
         self.assertIn("至少选择一块 LAN 网口", error)
+
+    def test_pppoe_credentials_cannot_escape_their_quotes(self):
+        """A quote or newline would let the value be parsed as pppd options."""
+
+        def normalize(username: str, password: str):
+            return routing.normalize_router_config(
+                {
+                    "wan_interface": "eth0",
+                    "lan_interface": "eth1",
+                    "wan_mode": "pppoe",
+                    "pppoe_nic": "eth0",
+                    "pppoe_username": username,
+                    "pppoe_password": password,
+                }
+            )
+
+        for username, password in (
+            ('adsl"123', "testpass"),
+            ("adsl123", 'test"pass'),
+            ("adsl123", "test\\pass"),
+            ("adsl123", "test\nplugin evil.so"),
+            ("adsl\nnoauth", "testpass"),
+            ("adsl123", "test\tpass"),
+        ):
+            _, error = normalize(username, password)
+            self.assertIsNotNone(error, f"{username!r} / {password!r} 应被拒绝")
+            self.assertIn("不能包含双引号、反斜杠", error)
+
+        # Legitimate values still go through untouched.
+        for username, password in (
+            ("user@isp", "p@ss word#$"),
+            ("02812345678", "abc123"),
+        ):
+            config, error = normalize(username, password)
+            self.assertIsNone(error)
+            self.assertEqual(config["pppoe_username"], username)
+            self.assertEqual(config["pppoe_password"], password)
 
     def test_ppp_ipup_hook_restores_cake_and_dns(self):
         """A redial recreates ppp0, so shaping and DNS must be restored at once."""

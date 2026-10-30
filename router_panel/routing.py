@@ -53,6 +53,11 @@ ProgressCallback = Callable[[str], None]
 
 IFNAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
 LEASE_RE = re.compile(r"^[0-9]+[smhd]?$")
+# pppd reads the credentials back out of quoted fields: `user "<name>"` in
+# /etc/ppp/peers/linux-router and `"<name>" * "<password>" *` in chap-secrets.
+# A quote, backslash or line break there would end the field early and let the
+# rest of the value be parsed as pppd options - which run as root.
+_PPPOE_FORBIDDEN_RE = re.compile(r'["\\\r\n\t]')
 IPV6_MODE_OFF = "off"
 IPV6_MODE_ULA = "ula"
 IPV6_MODE_STATIC = "static"
@@ -256,6 +261,10 @@ def normalize_router_config(
     pppoe_nic = get("pppoe_nic")
     pppoe_username = get("pppoe_username")
     pppoe_password = get("pppoe_password")
+
+    for label, value in (("账号", pppoe_username), ("密码", pppoe_password)):
+        if _PPPOE_FORBIDDEN_RE.search(value):
+            return config, f"PPPoE {label}不能包含双引号、反斜杠、制表符或换行"
 
     lan_ports = _normalize_lan_ports(payload.get("lan_ports", base.get("lan_ports", [])), lan)
 
