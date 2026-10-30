@@ -260,7 +260,10 @@ def ensure_nftables_include() -> CommandResult:
     until the owning service is restarted. Our own ruleset already recreates its
     lr_* tables on load, so the flush buys nothing.
     """
-    NFTABLES_CONF_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        NFTABLES_CONF_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return CommandResult(False, f"创建 {NFTABLES_CONF_DIR} 失败：{exc}")
     dropin_note = _ensure_nftables_stop_override()
     if nftables_config_includes_our_ruleset() and not _nftables_conf_flushes():
         return CommandResult(True, f"nftables.conf 已包含 /etc/nftables.d 且不会 flush 其它表{dropin_note}")

@@ -2359,8 +2359,33 @@ class BackupRestoreTests(unittest.TestCase):
         paths = {str(path) for path in backup_client.backup_paths()}
         self.assertIn(str(core.ROUTER_CONFIG_PATH), paths)
         self.assertIn(str(backup_client.CAKE_SCRIPT_PATH), paths)
+        # The bootstrap files matter too: without them a restore leaves the
+        # distro defaults (with `flush ruleset`) in place.
+        self.assertIn("/etc/nftables.conf", paths)
+        self.assertIn("/etc/dnsmasq.conf", paths)
+        self.assertIn(str(firewall.NFTABLES_DROPIN_PATH), paths)
         for path in paths:
             self.assertTrue(path.startswith(("/etc/", str(core.DATA_DIR))), path)
+
+    def test_restore_never_brings_back_a_flushing_nftables_conf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "nftables.conf"
+            dropin = Path(directory) / "10-linux-router.conf"
+            conf.write_text(
+                '#!/usr/sbin/nft -f\nflush ruleset\ninclude "/etc/nftables.d/*.nft"\n',
+                encoding="utf-8",
+            )
+            with patch.object(backup_client, "NFTABLES_CONFIG_PATH", conf), patch.object(
+                firewall, "NFTABLES_CONFIG_PATH", conf
+            ), patch.object(firewall, "NFTABLES_CONF_DIR", Path(directory) / "nftables.d"), patch.object(
+                firewall, "NFTABLES_DROPIN_PATH", dropin
+            ), patch.object(firewall, "NFTABLES_DROPIN_DIR", dropin.parent), patch.object(
+                backup_client, "run_command", return_value=ok()
+            ), patch.object(firewall, "run_command", return_value=ok()):
+                notes = backup_client._reload_services({str(conf)})
+
+            self.assertNotIn("flush ruleset", conf.read_text(encoding="utf-8"))
+            self.assertIn("nftables 规则已重载", notes)
 
     def test_create_backup_collects_existing_files(self):
         self.router_json.write_text('{"wan_interface": "eth0"}\n', encoding="utf-8")

@@ -12,7 +12,9 @@ from .core import (
     APT_TIMEOUT,
     AUTH_PATH,
     DATA_DIR,
+    DNSMASQ_CONFIG_PATH,
     DNSMASQ_RULESET_PATH,
+    NFTABLES_CONFIG_PATH,
     NFTABLES_RULESET_PATH,
     REQUIRED_PACKAGES,
     ROUTER_CONFIG_PATH,
@@ -26,6 +28,7 @@ from .core import (
     package_installed,
     run_command,
 )
+from .firewall import NFTABLES_DROPIN_PATH, ensure_nftables_include
 from .networkd import (
     BRIDGE_NETDEV_PATH,
     NETWORKD_DIR,
@@ -92,7 +95,10 @@ def backup_paths() -> list[Path]:
         PPPOE_PAP_PATH,
         PPPOE_IPUP_PATH,
         DNSMASQ_RULESET_PATH,
+        DNSMASQ_CONFIG_PATH,
         NFTABLES_RULESET_PATH,
+        NFTABLES_CONFIG_PATH,
+        NFTABLES_DROPIN_PATH,
         ROUTER_PANEL_SYSCTL_PATH,
         CAKE_SCRIPT_PATH,
         CAKE_SERVICE_PATH,
@@ -209,11 +215,17 @@ def _reload_services(restored: set[str]) -> list[str]:
         run_command(["networkctl", "reload"], timeout=SYSTEM_COMMAND_TIMEOUT)
         notes.append("networkd 配置已重载")
 
-    if str(DNSMASQ_RULESET_PATH) in restored:
+    if str(DNSMASQ_RULESET_PATH) in restored or str(DNSMASQ_CONFIG_PATH) in restored:
         run_command(["systemctl", "restart", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
         notes.append("dnsmasq 已重启")
 
-    if str(NFTABLES_RULESET_PATH) in restored:
+    if (
+        str(NFTABLES_RULESET_PATH) in restored
+        or str(NFTABLES_CONFIG_PATH) in restored
+        or str(NFTABLES_DROPIN_PATH) in restored
+    ):
+        # An older backup may still carry `flush ruleset`; never let it back in.
+        ensure_nftables_include()
         run_command(["systemctl", "reload", "nftables.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
         notes.append("nftables 规则已重载")
 
