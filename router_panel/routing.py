@@ -198,7 +198,13 @@ def _normalize_ipv6_prefix(raw: str, mode: str) -> tuple[str, str | None]:
     if not value:
         if mode == IPV6_MODE_ULA:
             return generate_ula_prefix(), None
-        return "", "选择全局前缀模式时必须填写 IPv6 前缀，例如 2408:8207:1234:5600::/64"
+        # PD never stores the prefix (it rotates), so switching PD -> 全局前缀
+        # always lands here with an empty field. Say that instead of just "必填".
+        return "", (
+            "选择「全局前缀（纯路由）」时必须填写 LAN 的 IPv6 前缀（/64）。"
+            "这个值不会从 PD 模式带过来——运营商每次下发的前缀都可能变，"
+            "那种情况请继续用「运营商 PD 自动」模式。"
+        )
     try:
         network = ipaddress.ip_network(value, strict=False)
     except ValueError:

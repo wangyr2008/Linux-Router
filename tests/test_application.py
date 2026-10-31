@@ -188,6 +188,20 @@ class RouterConfigTests(unittest.TestCase):
         self.assertFalse(config["ipv6_nat"])
         self.assertEqual(str(routing.lan_ipv6_address(config)), "2408:8207:1234:5600::1")
 
+    def test_static_ipv6_without_prefix_explains_the_pd_tradeoff(self):
+        """PD never stores its prefix, so switching to 全局前缀 always starts empty."""
+        _, error = routing.normalize_router_config(
+            {
+                "wan_interface": "eth0",
+                "lan_interface": "eth1",
+                "ipv6_mode": "static",
+                "ipv6_prefix": "",
+            }
+        )
+        self.assertIn("必须填写", error)
+        # The message has to point at the mode that actually works with a rotating prefix.
+        self.assertIn("PD", error)
+
     def test_ipv6_off_has_no_prefix(self):
         config, error = routing.normalize_router_config(
             {"wan_interface": "eth0", "lan_interface": "eth1", "ipv6_mode": "off"}
@@ -867,6 +881,31 @@ class LanBridgeTests(unittest.TestCase):
         checked = [line for line in body.splitlines() if "data-lan-port" in line or "checked" in line]
         self.assertTrue(any("checked" in line for line in checked))
         self.assertIn("br-lan", body)
+
+    def test_router_page_shows_the_delegated_prefix_next_to_an_empty_field(self):
+        """The field is empty in PD mode; show what the ISP currently hands out."""
+        application.app.config["TESTING"] = True
+        client = application.app.test_client()
+        with client.session_transaction() as session:
+            session["logged_in"] = True
+            session["username"] = "admin"
+            session["csrf_token"] = "test-token"
+        config = self.config(["ens4"])
+        config["ipv6_mode"] = "pd"
+        config["ipv6_prefix"] = ""
+        status = {
+            "config": config,
+            "interfaces": [{"name": "ens4", "link_speed": "1 Gbps"}],
+            "wan_candidates": [{"name": "ens3"}],
+            "backend": {"service_active": True, "delegated_lan": "2409:8a5e:a57:52b0::/64"},
+            "wan": {}, "lan": {}, "ipv6": {}, "dhcp": {}, "firewall": {},
+            "forwarding": {}, "services": {}, "pd": {}, "errors": [],
+        }
+        with patch.object(web_routing, "query_agent", return_value=status):
+            body = client.get("/router").get_data(as_text=True)
+
+        self.assertIn("运营商当前委派", body)
+        self.assertIn("2409:8a5e:a57:52b0::/64", body)
 
     def test_backup_accepts_generated_member_files(self):
         self.assertTrue(

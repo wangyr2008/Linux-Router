@@ -326,6 +326,10 @@
           <span class="field-label">LAN IPv6 前缀</span>
           <input type="text" class="mono-value" name="ipv6_prefix" value="{{ config.ipv6_prefix }}" placeholder="fd00:50::/64 或 2408:8207:1234:5600::/64">
           <span class="field-hint">ULA 留空自动生成；全局前缀必填；PD 模式忽略</span>
+          {% set delegated = (status.backend or {}).get('delegated_lan') or (status.backend or {}).get('delegated') or '' %}
+          {% if not config.ipv6_prefix and delegated %}
+          <span class="field-hint">运营商当前委派 <span class="mono-value">{{ delegated }}</span>；它随重拨变化，要用请选「运营商 PD 自动」，不要手填。</span>
+          {% endif %}
         </label>
       </div>
 
