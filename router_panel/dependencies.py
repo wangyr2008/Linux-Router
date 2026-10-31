@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 from .core import (
@@ -41,18 +42,6 @@ def get_ip_forward_status() -> dict[str, str]:
         "ipv6": read_text("/proc/sys/net/ipv6/conf/all/forwarding") or "0",
         "persistent": read_text(str(ROUTER_PANEL_SYSCTL_PATH)),
     }
-
-
-def get_default_route_interface() -> str:
-    result = run_command(["ip", "-4", "route", "show", "default"], timeout=5)
-    if not result.ok or not result.output:
-        return ""
-    for line in result.output.splitlines():
-        parts = line.split()
-        for index, part in enumerate(parts):
-            if part == "dev" and index + 1 < len(parts):
-                return parts[index + 1].strip()
-    return ""
 
 
 def get_router_nat_status() -> dict[str, Any]:
@@ -406,7 +395,11 @@ def _lan_has_address(config: dict[str, Any]) -> bool:
     if not lan:
         return False
     result = run_command(["ip", "-4", "address", "show", "dev", lan], timeout=5)
-    return result.ok and str(lan_gateway_ipv4(config)) in result.output
+    if not result.ok:
+        return False
+    # Match `inet <addr>/` exactly: a plain substring test also matches
+    # 192.168.50.1 inside 192.168.50.10/24.
+    return re.search(rf"\binet {re.escape(str(lan_gateway_ipv4(config)))}/", result.output) is not None
 
 
 def _lan_address_summary(config: dict[str, Any]) -> str:
@@ -487,7 +480,6 @@ def run_dependency_action(action: str) -> CommandResult:
 
 __all__ = [
     "get_ip_forward_status",
-    "get_default_route_interface",
     "get_router_nat_status",
     "restart_service",
     "enable_service",

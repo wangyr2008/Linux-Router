@@ -130,8 +130,10 @@ fetch() {
 }
 
 USED_MIRROR=""
+FETCHED=0
 for url in "${CANDIDATES[@]}"; do
   if fetch "$url"; then
+    FETCHED=1
     if [[ "$url" != "$RAW" ]]; then
       USED_MIRROR="${url%"$RAW"}"
       log "Fetched through $USED_MIRROR"
@@ -143,7 +145,11 @@ for url in "${CANDIDATES[@]}"; do
   log "Failed, trying the next endpoint"
 done
 
-[[ -s "$TARGET" ]] || die "could not fetch install.sh from any endpoint"
+# A failed attempt leaves whatever the server sent in $TARGET, so "the file is
+# not empty" proves nothing - only a fetch that passed the checks counts.
+[[ "$FETCHED" -eq 1 ]] || die "could not fetch install.sh from any endpoint"
+grep -q 'router-panel-agent.service' "$TARGET" && grep -q '^set -Eeuo pipefail' "$TARGET" \
+  || die "the downloaded install.sh does not look like the installer"
 
 # Let install.sh download the source archive from the same endpoint that worked.
 if [[ -n "$USED_MIRROR" && -z "$FORCED_MIRROR" ]]; then

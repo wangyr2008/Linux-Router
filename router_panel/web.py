@@ -7,7 +7,7 @@ from typing import Any
 from flask import abort, redirect, request, session, url_for
 
 from .agent_client import AgentError, get_operation, query_agent
-from .core import APP_NAME, APP_TAGLINE, PASSWORD_HINT_PATH, PROJECT_URL, get_build_info
+from .core import APP_NAME, APP_TAGLINE, PROJECT_URL, get_build_info
 from .web_general import register_general_routes
 from .web_routing import register_routing_routes
 from .web_tools import register_tools_routes
@@ -84,7 +84,6 @@ def register_routes(app) -> None:
     def inject_globals() -> dict[str, Any]:
         return {
             "current_path": request.path,
-            "initial_password_file": str(PASSWORD_HINT_PATH),
             "build_info": get_build_info(),
             "csrf_token": get_csrf_token(),
             # One place to rename the product: templates never hardcode it.

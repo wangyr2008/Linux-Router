@@ -17,4 +17,7 @@ register_routes(app)
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=80)
+    # Development only: production runs gunicorn through router-panel.service,
+    # which adds the sandboxing (NoNewPrivileges, CapabilityBoundingSet, ...).
+    # Binding 0.0.0.0:80 here would bypass all of it.
+    app.run(host="127.0.0.1", port=8080)

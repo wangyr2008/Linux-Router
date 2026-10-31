@@ -86,6 +86,11 @@ sudo bash /tmp/lr.sh install --mirror https://ghfast.top/
 sudo bash /tmp/lr.sh --list-mirrors
 ```
 
+> ⚠️ Mirrors (ghfast.top, gh-proxy.com, ...) are **third-party services**: routing through
+> one hands that operator the decision of *which code you install*. `get.sh` only checks for
+> two marker strings in `install.sh`, which does not stop a malicious mirror. If that
+> matters to you, use option 2 (local source) or verify the archive with `sha256sum`.
+
 ### 2. Local source (most reliable, no network needed)
 
 Copy the repository to the box and unpack it:
@@ -199,6 +204,42 @@ established/related, ICMP/ICMPv6, `lo`, WAN DHCP replies, LAN 22/53/80 (plus you
 
 > ⚠️ There is **no port forwarding (DNAT)** yet. Exposing a LAN host to the internet means
 > writing a dnat rule by hand.
+
+### The panel itself speaks plain HTTP
+
+gunicorn binds `0.0.0.0:80` with **no TLS**, so the login password, the session cookie and
+the PPPoE password pre-filled into the page all travel in clear text — anything on the same
+segment can read them. Treat it as a LAN management UI and do not map it straight to the
+internet. If you need remote access, pick one:
+
+```nginx
+# 1) TLS reverse proxy in front (recommended); keep the panel on the LAN and
+#    reach it through WireGuard/Tailscale
+server {
+    listen 443 ssl;
+    server_name router.example.com;
+    ssl_certificate     /etc/ssl/router.crt;
+    ssl_certificate_key /etc/ssl/router.key;
+    location / { proxy_pass http://127.0.0.1:80; proxy_set_header Host $host; }
+}
+# then drop port 80 from the WAN allow list
+```
+
+```bash
+# 2) Or bind it to loopback only and tunnel in over SSH
+# /etc/systemd/system/router-panel.service.d/bind.conf
+[Service]
+ExecStart=
+ExecStart=/usr/bin/gunicorn --workers 2 --threads 4 --bind 127.0.0.1:80 --timeout 30 --access-logfile - --error-logfile - app:app
+```
+
+Two known gaps, harden them yourself if you expose the panel:
+
+- `/login` has **no rate limiting** and accepts 4-character passwords. Before putting it on
+  the internet, point fail2ban at the 401s in `journalctl -u router-panel`, or add
+  `limit_req` in the reverse proxy.
+- The form pre-fills the saved PPPoE password so that "leave empty = keep". If that matters
+  to you, use the proxy above and keep the panel on a trusted segment.
 
 ## CAKE shaping
 

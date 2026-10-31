@@ -1007,7 +1007,9 @@ class StaticLeaseTests(unittest.TestCase):
             routing, "ensure_dnsmasq_include", return_value=ok()
         ), patch.object(routing, "atomic_write_text"), patch.object(
             routing, "save_router_config"
-        ) as saver, patch.object(routing, "run_command", side_effect=fake_run):
+        ) as saver, patch.object(routing, "run_command", side_effect=fake_run), patch.object(
+            routing, "is_service_active", return_value=True
+        ):
             result = routing.apply_static_leases(config)
 
         self.assertTrue(result.ok, result.output)
@@ -1015,6 +1017,25 @@ class StaticLeaseTests(unittest.TestCase):
         flat = [" ".join(call) for call in calls]
         self.assertTrue(any("dnsmasq --test" in item for item in flat))
         self.assertTrue(any("restart dnsmasq.service" in item for item in flat))
+
+    def test_apply_reports_a_dnsmasq_that_dies_on_start(self):
+        """A restart that exits immediately still returns 0: verify the service."""
+
+        def fake_run(command, timeout=8, env=None):
+            return ok()
+
+        config, _ = routing.set_static_lease(self.config(), "3c:7c:3f:1a:2b:3c", "192.168.50.10")
+        with patch.object(routing, "command_exists", return_value=True), patch.object(
+            routing, "ensure_dnsmasq_include", return_value=ok()
+        ), patch.object(routing, "atomic_write_text"), patch.object(
+            routing, "save_router_config"
+        ), patch.object(routing, "run_command", side_effect=fake_run), patch.object(
+            routing, "is_service_active", return_value=False
+        ), patch.object(routing.time, "sleep", return_value=None):
+            result = routing.apply_static_leases(config)
+
+        self.assertFalse(result.ok)
+        self.assertIn("dnsmasq", result.output)
 
     def test_clients_page_renders_binding_controls(self):
         application.app.config["TESTING"] = True
@@ -3188,6 +3209,259 @@ class TailscaleConfigTests(unittest.TestCase):
         self.assertIn("保存设置", body)
         self.assertIn("accept_routes", body)
         self.assertIn("退出登录", body)
+
+
+class ConfigOwnershipTests(unittest.TestCase):
+    def test_save_hands_the_file_back_to_the_panel_user(self):
+        """The agent runs as root; the panel must still be able to read the file."""
+        target = Path(TEST_DATA_DIRECTORY.name) / "owner-router.json"
+        with patch.object(routing, "ROUTER_CONFIG_PATH", target), patch.object(
+            routing, "chown_service_user"
+        ) as chown:
+            routing.save_router_config({"lan_network": "192.168.50.0/24"})
+
+        self.assertTrue(target.exists())
+        handed_back = [call.args[0].name for call in chown.call_args_list]
+        self.assertIn("owner-router.json", handed_back)
+        # The lock file is created by whichever user writes first, too.
+        self.assertIn("owner-router.json.router-panel.lock", handed_back)
+
+
+class StaticLeaseSanitisingTests(unittest.TestCase):
+    def config(self, **overrides):
+        base = {
+            "wan_interface": "eth0",
+            "lan_interface": "eth1",
+            "lan_network": "192.168.50.0/24",
+            "ipv6_mode": "off",
+        }
+        base.update(overrides)
+        return base
+
+    def test_restored_bindings_are_revalidated(self):
+        """A backup can carry anything; dhcp-host= must never see a newline."""
+        config, error = routing.normalize_router_config(
+            self.config(
+                static_leases=[
+                    {"mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.50.10", "hostname": "nas"},
+                    # Injected directive: dnsmasq would treat the second line as config.
+                    {"mac": "aa:bb:cc:dd:ee:11", "ip": "192.168.50.11",
+                     "hostname": "x\ndhcp-option=option:router,10.0.0.1"},
+                    {"mac": "not-a-mac", "ip": "192.168.50.12", "hostname": "bad"},
+                    {"mac": "aa:bb:cc:dd:ee:22", "ip": "8.8.8.8", "hostname": "outside"},
+                    {"mac": "aa:bb:cc:dd:ee:33", "ip": "192.168.50.10", "hostname": "dup"},
+                ]
+            )
+        )
+        self.assertIsNone(error)
+        self.assertEqual(
+            [lease["mac"] for lease in config["static_leases"]], ["AA:BB:CC:DD:EE:FF"]
+        )
+
+        text = routing.build_dnsmasq_config(config)
+        self.assertIn("dhcp-host=AA:BB:CC:DD:EE:FF,192.168.50.10,nas", text)
+        self.assertNotIn("dhcp-option=option:router,10.0.0.1", text)
+        self.assertNotIn("8.8.8.8", text)
+
+    def test_renderer_drops_bindings_that_bypass_normalisation(self):
+        """build_dnsmasq_config is also reached with a raw config (repair paths)."""
+        text = routing.build_dnsmasq_config(
+            {
+                **self.config(dhcp_enabled=True, dhcp_lease="12h"),
+                "static_leases": [
+                    {"mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.50.10", "hostname": "ok"},
+                    {"mac": "aa:bb:cc:dd:ee:ff", "ip": "192.168.50.11",
+                     "hostname": "x\nlog-queries"},
+                ],
+            }
+        )
+        self.assertIn("192.168.50.10", text)
+        self.assertNotIn("192.168.50.11", text)
+        self.assertNotIn("log-queries", text)
+
+
+class LanSizeTests(unittest.TestCase):
+    def test_thirty_bit_network_explains_why_dhcp_cannot_start(self):
+        _, error = routing.normalize_router_config(
+            {"wan_interface": "eth0", "lan_interface": "eth1", "lan_network": "192.168.50.0/30"}
+        )
+        self.assertIn("只有 2 个可用地址", error)
+        self.assertIn("/29", error)
+        # Without DHCP a /30 is still a valid LAN.
+        config, error = routing.normalize_router_config(
+            {
+                "wan_interface": "eth0",
+                "lan_interface": "eth1",
+                "lan_network": "192.168.50.0/30",
+                "dhcp_enabled": "",
+            }
+        )
+        self.assertIsNone(error)
+        self.assertEqual(config["lan_network"], "192.168.50.0/30")
+
+
+class PppoeMtuTests(unittest.TestCase):
+    def test_mtu_above_1492_is_refused_in_pppoe_mode(self):
+        _, error = routing.normalize_router_config(
+            {
+                "wan_mode": "pppoe",
+                "pppoe_nic": "eth0",
+                "pppoe_username": "user@isp",
+                "pppoe_password": "pass",
+                "lan_ports": ["eth1"],
+                "mtu": "1500",
+            }
+        )
+        self.assertIn("1492", error)
+
+        config, error = routing.normalize_router_config(
+            {
+                "wan_mode": "pppoe",
+                "pppoe_nic": "eth0",
+                "pppoe_username": "user@isp",
+                "pppoe_password": "pass",
+                "lan_ports": ["eth1"],
+                "mtu": "1492",
+            }
+        )
+        self.assertIsNone(error)
+        self.assertEqual(config["mtu"], "1492")
+
+
+class LinkRetirementTests(unittest.TestCase):
+    """Links that drop out of our .network files keep their old address/routes."""
+
+    def _apply(self, workdir: Path, files: dict[str, str], config: dict) -> list[str]:
+        import contextlib
+
+        workdir.mkdir(parents=True, exist_ok=True)
+        for path in workdir.iterdir():
+            if path.is_file():
+                path.unlink()
+        for name, content in files.items():
+            (workdir / name).write_text(content, encoding="utf-8")
+
+        commands: list[str] = []
+
+        def fake_run(command, timeout=8, env=None):
+            commands.append(" ".join(command))
+            return ok()
+
+        with contextlib.ExitStack() as stack:
+            for attr, filename in (
+                ("WAN_NETWORK_PATH", "10-wan.network"),
+                ("LAN_NETWORK_PATH", "20-lan.network"),
+                ("PPP_NETWORK_PATH", "30-ppp.network"),
+                ("PPPOE_NIC_NETWORK_PATH", "15-nic.network"),
+                ("BRIDGE_NETDEV_PATH", "05-br.netdev"),
+                ("PPPOE_PEER_PATH", "peers"),
+                ("PPPOE_CHAP_PATH", "chap-secrets"),
+                ("PPPOE_PAP_PATH", "pap-secrets"),
+                ("PPPOE_SERVICE_PATH", "pppoe.service"),
+                ("PPPOE_IPUP_PATH", "90-linux-router"),
+                ("DNS_SCRIPT_PATH", "dns.sh"),
+                ("DNS_SERVICE_PATH", "dns.service"),
+                ("DNS_TIMER_PATH", "dns.timer"),
+            ):
+                stack.enter_context(patch.object(networkd, attr, workdir / filename))
+            stack.enter_context(patch.object(networkd, "NETWORKD_DIR", workdir))
+            stack.enter_context(patch.object(networkd, "command_exists", return_value=True))
+            stack.enter_context(patch.object(networkd, "is_service_active", return_value=True))
+            stack.enter_context(patch.object(networkd, "is_service_enabled", return_value=True))
+            stack.enter_context(patch.object(networkd, "run_command", side_effect=fake_run))
+            stack.enter_context(patch.object(networkd, "wait_for_lan_address", return_value=True))
+            stack.enter_context(patch.object(networkd, "_take_over_interfaces", return_value=[]))
+            result = networkd.apply_networkd(config)
+        self.assertTrue(result.ok, result.output)
+        return commands
+
+    def test_old_uplink_is_flushed_after_moving_the_wan_port(self):
+        commands = self._apply(
+            Path(TEST_DATA_DIRECTORY.name) / "retire-wan",
+            {
+                "10-wan.network": "[Match]\nName=eth0\n",
+                "20-lan.network": "[Match]\nName=eth9\n",
+            },
+            {
+                "wan_mode": "dhcp",
+                "wan_interface": "eth2",
+                "lan_ports": ["eth1"],
+                "lan_network": "192.168.50.0/24",
+                "ipv6_mode": "off",
+            },
+        )
+        self.assertIn("ip -4 addr flush dev eth0", commands)
+        self.assertIn("ip -4 route flush dev eth0", commands)
+        self.assertIn("ip -6 addr flush dev eth9", commands)
+        # The links we still manage must not be touched.
+        self.assertNotIn("ip -4 addr flush dev eth1", commands)
+        self.assertNotIn("ip -4 addr flush dev eth2", commands)
+
+    def test_bridge_device_is_deleted_when_leaving_bridge_mode(self):
+        commands = self._apply(
+            Path(TEST_DATA_DIRECTORY.name) / "retire-bridge",
+            {
+                "05-br.netdev": "[NetDev]\nName=br-lan\n",
+                "20-lan.network": "[Match]\nName=br-lan\n",
+                "40-linux-router-lan-eth1.network": "[Match]\nName=eth1\n",
+                "40-linux-router-lan-eth2.network": "[Match]\nName=eth2\n",
+            },
+            {
+                "wan_mode": "dhcp",
+                "wan_interface": "eth0",
+                "lan_ports": ["eth1"],
+                "lan_network": "192.168.50.0/24",
+                "ipv6_mode": "off",
+            },
+        )
+        self.assertIn("ip link del br-lan", commands)
+        self.assertIn("ip -4 addr flush dev eth2", commands)
+        self.assertNotIn("ip link del eth1", commands)
+
+
+class IfupdownTakeoverTests(unittest.TestCase):
+    def test_fragments_in_interfaces_d_are_commented_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main = root / "interfaces"
+            fragments = root / "interfaces.d"
+            fragments.mkdir()
+            main.write_text("auto eth9\niface eth9 inet dhcp\n", encoding="utf-8")
+            fragment = fragments / "50-cloud-init"
+            fragment.write_text(
+                "auto eth1\niface eth1 inet dhcp\n", encoding="utf-8"
+            )
+            with patch.object(core, "IFUPDOWN_INTERFACES_PATH", main), patch.object(
+                core, "IFUPDOWN_INTERFACES_DIR", fragments
+            ), patch.object(networkd, "atomic_write_text", side_effect=_real_atomic_write):
+                notes = networkd._comment_out_ifupdown({"eth1"})
+
+            self.assertTrue(any("50-cloud-init" in note for note in notes))
+            self.assertIn("# iface eth1 inet dhcp", fragment.read_text(encoding="utf-8"))
+            self.assertIn("iface eth9 inet dhcp", main.read_text(encoding="utf-8"))
+            self.assertTrue((fragments / "50-cloud-init.linux-router.bak").exists())
+
+
+def _real_atomic_write(path, content, *, mode=None):
+    Path(path).write_text(content, encoding="utf-8")
+
+
+class LanAddressMatchTests(unittest.TestCase):
+    def test_substring_of_a_longer_address_does_not_count(self):
+        config = {"lan_interface": "eth1", "lan_network": "192.168.50.0/24"}
+        # 192.168.50.10/24 contains "192.168.50.1" as a substring.
+        with patch.object(
+            dependencies,
+            "run_command",
+            return_value=ok("    inet 192.168.50.10/24 brd 192.168.50.255 scope global eth1"),
+        ):
+            self.assertFalse(dependencies._lan_has_address(config))
+        with patch.object(
+            dependencies,
+            "run_command",
+            return_value=ok("    inet 192.168.50.1/24 brd 192.168.50.255 scope global eth1"),
+        ):
+            self.assertTrue(dependencies._lan_has_address(config))
 
 
 if __name__ == "__main__":

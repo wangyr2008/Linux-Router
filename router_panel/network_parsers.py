@@ -6,32 +6,6 @@ from typing import Any
 from .core import normalize_mac_address
 
 
-def split_escaped(line: str, separator: str = ":") -> list[str]:
-    values: list[str] = []
-    current: list[str] = []
-    escaped = False
-
-    for char in line:
-        if escaped:
-            current.append(char)
-            escaped = False
-            continue
-
-        if char == "\\":
-            escaped = True
-            continue
-
-        if char == separator:
-            values.append("".join(current))
-            current = []
-            continue
-
-        current.append(char)
-
-    values.append("".join(current))
-    return values
-
-
 def translate_device_state(value: str) -> str:
     mapping = {
         "connected": "已连接",
@@ -59,13 +33,6 @@ def translate_connection_type(value: str) -> str:
         "unknown": "未知",
     }
     return mapping.get(value, value or "未知")
-
-
-def parse_csv_values(raw: str) -> list[str]:
-    if not raw:
-        return []
-    values = raw.replace(";", ",").split(",")
-    return [value.strip() for value in values if value.strip()]
 
 
 def format_lease_expiry(timestamp: str) -> dict[str, str]:
@@ -120,10 +87,8 @@ def parse_dnsmasq_leases(raw: str) -> list[dict[str, Any]]:
 
 
 __all__ = [
-    "split_escaped",
     "translate_device_state",
     "translate_connection_type",
-    "parse_csv_values",
     "format_lease_expiry",
     "parse_dnsmasq_leases",
 ]

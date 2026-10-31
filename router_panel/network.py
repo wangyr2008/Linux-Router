@@ -107,27 +107,6 @@ def get_device_status_item(ifname: str) -> dict[str, str]:
     return {}
 
 
-def get_filtered_device_status(allowed_types: set[str]) -> tuple[list[dict[str, str]], list[str]]:
-    devices: list[dict[str, str]] = []
-    for interface in _ip_json("address", "show"):
-        ifname = str(interface.get("ifname", "") or "")
-        if not ifname or ifname == "lo":
-            continue
-        kind = link_type(ifname)
-        if allowed_types and kind not in allowed_types:
-            continue
-        state = _operstate(interface)
-        devices.append(
-            {
-                "device": ifname,
-                "type": kind,
-                "state": state,
-                "connection": ifname if state == "connected" else "",
-            }
-        )
-    return devices, []
-
-
 def get_default_route_devs() -> dict[str, str]:
     """Interface holding the IPv4 / IPv6 default route (ppp0 for PPPoE uplinks)."""
     devs: dict[str, str] = {}
@@ -404,7 +383,6 @@ __all__ = [
     "link_type",
     "get_active_connections",
     "get_device_status_item",
-    "get_filtered_device_status",
     "get_device_details",
     "get_interface_addresses",
     "get_interface_neighbors",

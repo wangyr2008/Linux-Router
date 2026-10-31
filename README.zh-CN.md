@@ -82,6 +82,10 @@ sudo bash /tmp/lr.sh install --mirror https://ghfast.top/
 sudo bash /tmp/lr.sh --list-mirrors          # 查看内置镜像列表
 ```
 
+> ⚠️ 镜像（ghfast.top、gh-proxy.com 等）是**第三方服务**：走镜像等于把「下载什么代码」的
+> 决定权交给它。`get.sh` 只会检查 `install.sh` 里有两个特征字符串，挡不住恶意镜像。
+> 在意供应链的话，用方式二（本地源码）或自己校验 `sha256sum`。
+
 ### 方式二：本地源码（最稳，不依赖网络）
 
 把仓库压缩包拷到设备上解开，然后：
@@ -187,6 +191,39 @@ LAN 的 `.network` 上开 `DHCPPrefixDelegation=yes` + `IPv6SendRA=yes`，前缀
 > 然后进面板改正配置（详见 DEPLOYMENT.md）。
 
 > ⚠️ 目前**没有端口转发（DNAT）**。要让外网访问内网某台机器，需要手写 dnat 规则。
+
+### 面板本身是明文 HTTP
+
+面板由 gunicorn 直接监听 `0.0.0.0:80`，**没有 TLS**。这意味着登录密码、会话 Cookie、
+以及页面上回填的 PPPoE 宽带密码在网络里都是明文——同网段的任何设备都能抓到。
+默认把它当「内网管理界面」用，不要直接映射到公网；确实需要远程访问时，二选一：
+
+```nginx
+# 1) 前面套一层 TLS 反代（推荐），只监听内网，再用 WireGuard/Tailscale 进来
+server {
+    listen 443 ssl;
+    server_name router.example.com;
+    ssl_certificate     /etc/ssl/router.crt;
+    ssl_certificate_key /etc/ssl/router.key;
+    location / { proxy_pass http://127.0.0.1:80; proxy_set_header Host $host; }
+}
+# 然后把 80 端口从 WAN 放行列表里去掉
+```
+
+```bash
+# 2) 干脆只让本机监听，外网走 SSH 隧道
+# /etc/systemd/system/router-panel.service.d/bind.conf
+[Service]
+ExecStart=
+ExecStart=/usr/bin/gunicorn --workers 2 --threads 4 --bind 127.0.0.1:80 --timeout 30 --access-logfile - --error-logfile - app:app
+```
+
+另外两点现状（尚未实现，按需自行加固）：
+
+- `/login` **没有速率限制**，密码最短 4 位。暴露在公网前建议用 fail2ban 盯
+  `journalctl -u router-panel` 里的 401，或加一层反代的 `limit_req`。
+- 页面为了「留空即不修改」会把已保存的 PPPoE 密码回填进 HTML。若在意这一点，
+  用上面的反代方案，并把面板限制在可信网段。
 
 ## CAKE 限速
 

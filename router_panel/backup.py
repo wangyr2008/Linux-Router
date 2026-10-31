@@ -141,9 +141,11 @@ def create_backup() -> dict[str, Any]:
     for path in backup_paths():
         try:
             content = path.read_text(encoding="utf-8")
+            # stat() can fail on its own if the file disappears between the two
+            # calls; keep it inside the same guard instead of 500-ing the export.
+            mode = path.stat().st_mode & 0o777
         except (OSError, UnicodeDecodeError):
             continue
-        mode = path.stat().st_mode & 0o777
         files[str(path)] = {"content": content, "mode": f"{mode:04o}"}
 
     return {

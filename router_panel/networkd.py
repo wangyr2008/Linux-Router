@@ -172,6 +172,54 @@ def render_lan_port_network(port: str) -> str:
     )
 
 
+def _managed_link_names() -> set[str]:
+    """Link names the .network/.netdev files on disk currently describe."""
+    names: set[str] = set()
+    paths: list[Path] = [
+        WAN_NETWORK_PATH,
+        LAN_NETWORK_PATH,
+        PPP_NETWORK_PATH,
+        PPPOE_NIC_NETWORK_PATH,
+        BRIDGE_NETDEV_PATH,
+    ]
+    try:
+        paths.extend(sorted(NETWORKD_DIR.glob(f"{LAN_PORT_PREFIX}*.network")))
+    except OSError:
+        pass
+
+    for path in paths:
+        for line in read_text(str(path)).splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("Name="):
+                continue
+            name = stripped.split("=", 1)[1].strip()
+            # ppp0 belongs to pppd, never flush it from here.
+            if name and name != PPPOE_INTERFACE:
+                names.add(name)
+    return names
+
+
+def _retire_stale_links(previous: set[str], current: set[str], notes: list[str]) -> None:
+    """Clean up links we stopped managing.
+
+    networkd does not touch a link once no .network matches it, so after moving
+    the WAN or LAN onto another port the old port keeps its DHCP address and its
+    default route (same metric as the new one) and traffic can keep leaving
+    through the dead uplink. Same story for br-lan: removing the .netdev file
+    does not delete the device, and it keeps holding the old gateway address.
+    """
+    for ifname in sorted(previous - current):
+        if ifname == BRIDGE_NAME:
+            deleted = run_command(["ip", "link", "del", ifname], timeout=SYSTEM_COMMAND_TIMEOUT)
+            if deleted.ok:
+                notes.append(f"已删除不再使用的网桥 {ifname}")
+            continue
+        for family in ("-4", "-6"):
+            run_command(["ip", family, "addr", "flush", "dev", ifname], timeout=5)
+            run_command(["ip", family, "route", "flush", "dev", ifname], timeout=5)
+        notes.append(f"已清理 {ifname} 上残留的地址与路由")
+
+
 def _sync_lan_bridge_files(config: dict[str, Any]) -> None:
     """Create or remove the bridge netdev and the per-port member files."""
     ports = lan_ports(config)
@@ -398,40 +446,50 @@ def _comment_out_ifupdown(interfaces: set[str]) -> list[str]:
     """Stop ifupdown from re-configuring our NICs on the next boot.
 
     Without this, `ifup` runs before networkd at boot and both stacks fight over
-    the same address. A backup is kept next to the original file.
+    the same address. Every file that ifupdown_managed_interfaces() reads is
+    handled, otherwise a stanza in /etc/network/interfaces.d keeps grabbing the
+    NIC at boot even though the panel reports it as taken over. A backup is kept
+    next to each original file.
     """
-    from .core import IFUPDOWN_INTERFACES_PATH
+    from .core import IFUPDOWN_INTERFACES_DIR, IFUPDOWN_INTERFACES_PATH
 
     notes: list[str] = []
+    paths = [IFUPDOWN_INTERFACES_PATH]
     try:
-        content = IFUPDOWN_INTERFACES_PATH.read_text(encoding="utf-8")
+        paths.extend(sorted(path for path in IFUPDOWN_INTERFACES_DIR.glob("*") if path.is_file()))
     except OSError:
-        return notes
+        pass
 
-    changed = False
-    lines: list[str] = []
-    for raw in content.splitlines():
-        stripped = raw.strip()
-        parts = stripped.split()
-        target = ""
-        if len(parts) >= 2 and parts[0] in {"iface", "allow-hotplug", "auto"}:
-            target = parts[1]
-        if target and target in interfaces and not stripped.startswith("#"):
-            lines.append(f"# {raw}")
-            changed = True
-        else:
-            lines.append(raw)
-    if not changed:
-        return notes
+    for path in paths:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
 
-    try:
-        backup = IFUPDOWN_INTERFACES_PATH.with_suffix(".linux-router.bak")
-        if not backup.exists():
-            backup.write_text(content, encoding="utf-8")
-        atomic_write_text(IFUPDOWN_INTERFACES_PATH, "\n".join(lines) + "\n", mode=0o644)
-        notes.append("已在 /etc/network/interfaces 中注释掉这些网口")
-    except OSError as exc:
-        notes.append(f"注释 ifupdown 配置失败：{exc}")
+        changed = False
+        lines: list[str] = []
+        for raw in content.splitlines():
+            stripped = raw.strip()
+            parts = stripped.split()
+            target = ""
+            if len(parts) >= 2 and parts[0] in {"iface", "allow-hotplug", "auto"}:
+                target = parts[1]
+            if target and target in interfaces and not stripped.startswith("#"):
+                lines.append(f"# {raw}")
+                changed = True
+            else:
+                lines.append(raw)
+        if not changed:
+            continue
+
+        try:
+            backup = path.with_name(path.name + ".linux-router.bak")
+            if not backup.exists():
+                backup.write_text(content, encoding="utf-8")
+            atomic_write_text(path, "\n".join(lines) + "\n", mode=0o644)
+            notes.append(f"已在 {path} 中注释掉这些网口")
+        except OSError as exc:
+            notes.append(f"注释 {path} 失败：{exc}")
     return notes
 
 
@@ -479,6 +537,9 @@ def apply_networkd(
     wan = str(config.get("wan_interface", "") or "")
     lan = str(config.get("lan_interface", "") or "")
     report("写入 systemd-networkd 配置")
+    # Which links the files described before this apply, so the ones that drop out
+    # can be cleaned up afterwards (networkd leaves them as they were).
+    links_before = _managed_link_names()
     # Reconfiguring a link is not free: ppp0 re-solicits DHCPv6 and the ISP hands
     # out a new IPv6 prefix, which deprecates every address on the LAN. Only touch
     # links whose configuration actually changed.
@@ -580,6 +641,11 @@ def apply_networkd(
     if wan_mode == WAN_MODE_PPPOE and ppp_changed:
         _reconfigure(PPPOE_INTERFACE)
 
+    links_after = _managed_link_names()
+    if links_before != links_after:
+        report("清理被撤下的网口")
+        _retire_stale_links(links_before, links_after, notes)
+
     # `networkctl reconfigure` only schedules the work. dnsmasq binds
     # listen-address=<LAN IP>, so starting it before the address exists makes it
     # exit immediately and the LAN silently loses DHCP.
@@ -616,27 +682,6 @@ def wait_for_lan_address(config: dict[str, Any], timeout: float = 15.0) -> bool:
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.5)
-
-
-def disable_networkd_config() -> None:
-    for path in (WAN_NETWORK_PATH, LAN_NETWORK_PATH, PPP_NETWORK_PATH, PPPOE_NIC_NETWORK_PATH):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-    run_command(["systemctl", "disable", "--now", PPPOE_SERVICE_NAME], timeout=SYSTEM_COMMAND_TIMEOUT)
-    for path in (PPPOE_SERVICE_PATH, PPPOE_PEER_PATH):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-    run_command(["systemctl", "daemon-reload"], timeout=SYSTEM_COMMAND_TIMEOUT)
-    run_command(["networkctl", "reload"], timeout=SYSTEM_COMMAND_TIMEOUT)
-
-
-# ---------------------------------------------------------------------------
-# Status
-# ---------------------------------------------------------------------------
 
 
 def _ip_json(*args: str) -> list[dict[str, Any]]:
@@ -1021,7 +1066,6 @@ __all__ = [
     "render_pppoe_service",
     "render_ppp_ipup_script",
     "apply_networkd",
-    "disable_networkd_config",
     "get_configured_methods",
     "get_link_status",
     "render_dns_script",

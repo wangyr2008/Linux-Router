@@ -21,6 +21,7 @@ from .core import (
     SYSTEM_COMMAND_TIMEOUT,
     CommandResult,
     atomic_write_text,
+    chown_service_user,
     command_exists,
     is_service_active,
     is_service_enabled,
@@ -327,6 +328,10 @@ def normalize_router_config(
             return config, "MTU 必须是数字"
         if not 576 <= mtu_value <= 9000:
             return config, "MTU 必须在 576 到 9000 之间"
+        if wan_mode == networkd.WAN_MODE_PPPOE and mtu_value > 1492:
+            # PPPoE carries an 8-byte header; a larger MTU on the PPP link means
+            # packets that never fit and are dropped silently upstream.
+            return config, "PPPoE 的 MTU 不能超过 1492（PPPoE 头占 8 字节），否则大包会被丢弃"
 
     firewall_mode = get("firewall_mode").lower() or FIREWALL_MODE_OPEN
     if firewall_mode not in FIREWALL_MODES:
@@ -388,17 +393,26 @@ def normalize_router_config(
 
     # Bindings have their own endpoint instead of this form, so carry them over
     # from the loaded config rather than falling back to the default empty list.
-    raw_leases = payload.get("static_leases", base.get("static_leases", []))
-    config["static_leases"] = (
-        [item for item in raw_leases if isinstance(item, dict)]
-        if isinstance(raw_leases, list)
-        else []
+    # They are re-validated on every normalize: a restored backup (or a hand
+    # edited router.json) is another way in, and build_dnsmasq_config interpolates
+    # these fields straight into `dhcp-host=`, where a newline in hostname would
+    # inject arbitrary dnsmasq directives.
+    config["static_leases"] = _normalize_static_leases(
+        config, payload.get("static_leases", base.get("static_leases", []))
     )
     config["device_labels"] = normalize_device_labels(
         payload.get("device_labels", base.get("device_labels", {}))
     )
 
     if config["dhcp_enabled"]:
+        # /30 leaves two usable addresses and no room for a pool; saying "地址池
+        # 格式无效" made the real reason impossible to guess.
+        usable = int(network.broadcast_address) - int(network.network_address) - 1
+        if usable < 4:
+            return config, (
+                f"LAN 网段 {network} 只有 {usable} 个可用地址，开启 DHCP 至少需要 4 个"
+                "（请改用 /29 或更大的网段，或关闭 DHCP）"
+            )
         start, end = _dhcp_range(config)
         try:
             start_ip = ipaddress.IPv4Address(start)
@@ -462,6 +476,12 @@ def save_router_config(config: dict[str, Any]) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         mode=0o600,
     )
+    # This runs in the root agent, and atomic_write_text replaces the file with one
+    # owned by whoever wrote it. The panel reads this file on every request: without
+    # the chown it gets PermissionError, load_router_config swallows it and returns
+    # defaults, and e.g. the lockout guard then thinks every client is on the WAN.
+    chown_service_user(ROUTER_CONFIG_PATH)
+    chown_service_user(ROUTER_CONFIG_PATH.with_name(ROUTER_CONFIG_PATH.name + ".router-panel.lock"))
 
 
 # ---------------------------------------------------------------------------
@@ -531,11 +551,11 @@ def build_dnsmasq_config(config: dict[str, Any]) -> str:
                 f"dhcp-option=option:dns-server,{gateway}",
             ]
         )
-        leases = config.get("static_leases") or []
+        leases = _normalize_static_leases(config, config.get("static_leases"))
         if leases:
             lines.append("# 静态地址绑定（MAC → 固定 IP）")
             for lease in leases:
-                entry = f"dhcp-host={lease.get('mac', '')},{lease.get('ip', '')}"
+                entry = f"dhcp-host={lease['mac']},{lease['ip']}"
                 if lease.get("hostname"):
                     entry += f",{lease['hostname']}"
                 lines.append(entry)
@@ -956,6 +976,43 @@ def _static_leases(config: dict[str, Any]) -> list[dict[str, str]]:
     return [item for item in raw if isinstance(item, dict)]
 
 
+def _normalize_static_leases(config: dict[str, Any], raw: Any) -> list[dict[str, str]]:
+    """Validate every binding, whatever path it came from.
+
+    The API validates a single binding in validate_static_lease; a restored backup
+    does not go through that path at all, so the check is repeated here for the
+    whole list. Invalid entries are dropped instead of reaching dnsmasq, which
+    silently ignores bad `dhcp-host` lines anyway.
+    """
+    if not isinstance(raw, list):
+        return []
+
+    # Validate against a probe config: the duplicate-address check inside
+    # validate_static_lease walks the raw list, whose MACs are not normalised yet.
+    probe = {**config, "static_leases": []}
+    leases: list[dict[str, str]] = []
+    seen_ips: set[str] = set()
+    seen_macs: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        entry, _error = validate_static_lease(
+            probe,
+            str(item.get("mac", "") or ""),
+            str(item.get("ip", "") or ""),
+            str(item.get("hostname", "") or ""),
+        )
+        if not entry:
+            continue
+        if entry["ip"] in seen_ips or entry["mac"] in seen_macs:
+            continue
+        seen_ips.add(entry["ip"])
+        seen_macs.add(entry["mac"])
+        leases.append(entry)
+    leases.sort(key=lambda item: ipaddress.IPv4Address(item["ip"]))
+    return leases
+
+
 def validate_static_lease(
     config: dict[str, Any], mac: str, ip: str, hostname: str = ""
 ) -> tuple[dict[str, str] | None, str | None]:
@@ -1038,9 +1095,11 @@ def apply_static_leases(config: dict[str, Any]) -> CommandResult:
     if not tested.ok:
         return CommandResult(False, f"dnsmasq 配置校验失败：{tested.output or '未知错误'}")
 
-    restarted = run_command(["systemctl", "restart", "dnsmasq.service"], timeout=SYSTEM_COMMAND_TIMEOUT)
+    # Same reason as apply_router_config: a restart that dies right away still
+    # returns 0, which would leave the LAN without DHCP while the panel says "ok".
+    restarted = restart_dnsmasq()
     if not restarted.ok:
-        return CommandResult(False, f"重启 dnsmasq 失败：{restarted.output or '未知错误'}")
+        return restarted
     return CommandResult(True, "静态地址绑定已生效")
 
 

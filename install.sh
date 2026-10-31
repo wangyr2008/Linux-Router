@@ -367,6 +367,36 @@ EOF
   chmod 0644 "$DNSMASQ_FILE"
 }
 
+remove_ppp_secrets() {
+  local file="$1" user="${2:-}"
+  [[ -f "$file" ]] || return 0
+  # The panel writes `"<user>" * "<password>" *` into these shared files, which
+  # other PPP peers on this machine may also use. Remove only the line for our
+  # own account; delete the file only when nothing else is left in it.
+  if [[ -z "$user" ]]; then
+    local foreign
+    foreign="$(grep -vE '^[[:space:]]*(#|$)' "$file" 2>/dev/null \
+      | grep -vE '^"[^"]*"[[:space:]]+\*[[:space:]]+"[^"]*"[[:space:]]+\*[[:space:]]*$' || true)"
+    if [[ -n "$foreign" ]]; then
+      log "WARNING: $file 里有无法识别的 PPP 凭据，未删除（请自行清理）"
+      return 0
+    fi
+    rm -f "$file"
+    return 0
+  fi
+
+  local tmp="${file}.linux-router.tmp"
+  awk -v u="$user" 'match($0, /^"[^"]*"/) { if (substr($0, RSTART + 1, RLENGTH - 2) == u) next } { print }' \
+    "$file" > "$tmp"
+  if grep -qvE '^[[:space:]]*(#|$)' "$tmp"; then
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+    log "已从 $file 移除本机 PPPoE 账号，其它凭据保留"
+  else
+    rm -f "$tmp" "$file"
+  fi
+}
+
 uninstall_router_panel() {
   local has_install_state=0
   local original_dhcpcd_active=0
@@ -414,10 +444,19 @@ uninstall_router_panel() {
   rm -f /etc/systemd/network/10-linux-router-wan.network \
         /etc/systemd/network/20-linux-router-lan.network \
         /etc/systemd/network/30-linux-router-ppp.network \
+        /etc/systemd/network/15-linux-router-pppoe-nic.network \
         /etc/systemd/network/05-linux-router-br.netdev
   rm -f /etc/systemd/network/40-linux-router-lan-*.network
+  # Drop-in that keeps `systemctl restart nftables` from flushing every table.
+  rm -f /etc/systemd/system/nftables.service.d/10-linux-router.conf
+  rmdir /etc/systemd/system/nftables.service.d 2>/dev/null || true
+  # Read our account name before the peers file goes away: chap-secrets is shared
+  # with any other PPP peer on this machine.
+  local pppoe_user=""
+  pppoe_user="$(sed -n 's/^user "\(.*\)"$/\1/p' /etc/ppp/peers/linux-router 2>/dev/null | head -n 1)"
   rm -f /etc/ppp/peers/linux-router /etc/ppp/ip-up.d/90-linux-router
-  rm -f /etc/ppp/chap-secrets /etc/ppp/pap-secrets
+  remove_ppp_secrets /etc/ppp/chap-secrets "$pppoe_user"
+  remove_ppp_secrets /etc/ppp/pap-secrets "$pppoe_user"
   rm -f /usr/lib/dhcpcd/dhcpcd-hooks/99-linux-router
 
   rm -f "$SYSCTL_FILE"
@@ -438,6 +477,11 @@ uninstall_router_panel() {
     mv -f /etc/network/interfaces.linux-router.bak /etc/network/interfaces
     log "Restored /etc/network/interfaces"
   fi
+  for backup in /etc/network/interfaces.d/*.linux-router.bak; do
+    [[ -e "$backup" ]] || continue
+    mv -f "$backup" "${backup%.linux-router.bak}"
+    log "Restored ${backup%.linux-router.bak}"
+  done
 
   remove_router_rule_files
   if command -v nft >/dev/null 2>&1; then
