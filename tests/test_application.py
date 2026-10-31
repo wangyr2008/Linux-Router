@@ -2248,6 +2248,58 @@ class NetworkdBackendTests(unittest.TestCase):
             self.assertEqual(config["pppoe_username"], username)
             self.assertEqual(config["pppoe_password"], password)
 
+    def test_dormant_pppoe_credentials_do_not_block_dhcp_applies(self):
+        """A password stored before validation existed must not lock the panel.
+
+        The check only matters where the value is written to pppd's files. Applying
+        it globally rejected DHCP-mode and CAKE applies (both inherit the stored
+        credentials) with an error unrelated to what the user was doing.
+        """
+        stored = {
+            **routing.DEFAULT_ROUTER_CONFIG,
+            "wan_mode": "dhcp",
+            "wan_interface": "eth0",
+            "lan_ports": ["eth1"],
+            "pppoe_username": "adsl123",
+            "pppoe_password": 'p"w',
+        }
+
+        # DHCP mode keeps the credentials dormant: they are never written.
+        config, error = routing.normalize_router_config(
+            {"wan_mode": "dhcp", "wan_interface": "eth0", "lan_ports": ["eth1"]},
+            existing=stored,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(config["wan_mode"], "dhcp")
+        self.assertEqual(config["pppoe_password"], 'p"w')
+
+        # The CAKE form does not submit any PPPoE field.
+        _, error = routing.normalize_router_config(
+            {"cake_enabled": "1", "cake_upload_mbit": "100", "cake_download_mbit": "500"},
+            existing=stored,
+        )
+        self.assertIsNone(error)
+
+        # Switching to PPPoE is exactly where they reach chap-secrets: refuse.
+        _, error = routing.normalize_router_config(
+            {"wan_mode": "pppoe", "pppoe_nic": "eth0", "pppoe_username": "adsl123"},
+            existing=stored,
+        )
+        self.assertIn("不能包含双引号、反斜杠、制表符或换行", error)
+
+        # Fixing the password unblocks the switch.
+        config, error = routing.normalize_router_config(
+            {
+                "wan_mode": "pppoe",
+                "pppoe_nic": "eth0",
+                "pppoe_username": "adsl123",
+                "pppoe_password": "goodpass",
+            },
+            existing=stored,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(config["pppoe_password"], "goodpass")
+
     def test_ppp_ipup_hook_restores_cake_and_dns(self):
         """A redial recreates ppp0, so shaping and DNS must be restored at once."""
         import subprocess

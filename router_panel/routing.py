@@ -262,15 +262,18 @@ def normalize_router_config(
     pppoe_username = get("pppoe_username")
     pppoe_password = get("pppoe_password")
 
-    for label, value in (("账号", pppoe_username), ("密码", pppoe_password)):
-        if _PPPOE_FORBIDDEN_RE.search(value):
-            return config, f"PPPoE {label}不能包含双引号、反斜杠、制表符或换行"
-
     lan_ports = _normalize_lan_ports(payload.get("lan_ports", base.get("lan_ports", [])), lan)
 
     if wan_mode == networkd.WAN_MODE_PPPOE:
         if not pppoe_username:
             return config, "PPPoE 账号不能为空"
+        # Only checked here: this is the one branch whose credentials reach
+        # /etc/ppp/peers and chap-secrets. Validating a dormant value would block
+        # DHCP and CAKE applies (both inherit the stored credentials) with an
+        # error that has nothing to do with what the user was doing.
+        for label, value in (("账号", pppoe_username), ("密码", pppoe_password)):
+            if _PPPOE_FORBIDDEN_RE.search(value):
+                return config, f"PPPoE {label}不能包含双引号、反斜杠、制表符或换行"
         if not pppoe_nic or not IFNAME_RE.fullmatch(pppoe_nic):
             return config, "请选择 PPPoE 拨号所用的物理网口"
         if available_interfaces and pppoe_nic not in available_interfaces:
